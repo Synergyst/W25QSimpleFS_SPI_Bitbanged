@@ -1,15 +1,38 @@
 // RP2040 + Winbond W25Q128, bit-banged SPI, simple FS + blob loader + console + autogen + core1 exec via mailbox.
+// Adds PIO adapter mode selectable via USE_PIO_ADAPTER (see below).
 //
 // Pins:
 //   Pin 0 -> MISO
 //   Pin 1 -> CS
 //   Pin 2 -> SCK
 //   Pin 3 -> MOSI
-#include "pico/stdlib.h"  // for tight_loop_contents()
+#include "pico/stdlib.h"  // tight_loop_contents(), etc.
+#include <Arduino.h>
 #include "W25QBitbang.h"
 #include "W25QSimpleFS.h"
 
-// Include your generated blob headers
+// ================== Mode Select ==================
+// Set to 1 to use PIO adapter mode (exec* commands run PIO programs).
+// Set to 0 to use legacy ARM blob execution on core1 (original behavior).
+#ifndef USE_PIO_ADAPTER
+#define USE_PIO_ADAPTER 0
+#endif
+
+// Run PIO adapter on which core?
+// 0 = run PIO loader on core0 (synchronous).
+// 1 = run PIO loader inside the core1 mailbox worker.
+#ifndef PIO_RUN_ON_CORE1
+#define PIO_RUN_ON_CORE1 0
+#endif
+
+#if USE_PIO_ADAPTER
+#include "hardware/pio.h"
+#include "hardware/gpio.h"
+#include "pico/time.h"  // busy_wait_ms
+struct PioBlobHdr;      // forward decl to satisfy Arduino preproc
+#endif
+
+// Include your generated blob headers (used for autogen + legacy mode)
 #include "blob_add2.h"
 #include "blob_muladd_a.h"
 #include "blob_muladd_b.h"
@@ -20,6 +43,7 @@
 #include "blob_gpio_blink_ms.h"
 #include "blob_gpio_pwm.h"
 #include "blob_gpio_pwm_cycles.h"
+#include "blob_pio_blink.h"
 
 // ================== Autowrite configuration ==================
 // Toggle which blobs should be auto-written if missing (0=off, 1=on)
@@ -33,6 +57,7 @@
 #define AUTO_BLOB_GPIOMS 1
 #define AUTO_BLOB_GPIOPWM 1
 #define AUTO_BLOB_GPIOPWMC 1
+#define AUTO_BLOB_PIOBLINK 1
 
 // Optional: run autogenBlobWrites() automatically in setup()
 #define AUTO_RUN_AUTOGEN_ON_BOOT 1
@@ -48,9 +73,11 @@
 #define FILE_GPIOMS "gpioms.bin"
 #define FILE_GPIOPWM "pwm.bin"
 #define FILE_GPIOPWMC "pwmc.bin"
+#define FILE_PIOBLINK "pio_blink.bin"
 
 // Slot reserve size for newly created blob files (bytes, multiple of 4096 recommended)
 #define DEFAULT_SLOT_RESERVE 4096
+
 // =============================================================
 const uint8_t PIN_MISO = 0;
 const uint8_t PIN_CS = 1;
@@ -60,12 +87,13 @@ const uint8_t PIN_MOSI = 3;
 W25QBitbang flash(PIN_MISO, PIN_CS, PIN_SCK, PIN_MOSI);
 W25QSimpleFS fs(flash);
 
-// ================== Blob registry ==================
+// ================== Blob registry (compiled-in arrays) ==================
 struct BlobReg {
   const char* id;       // console id (e.g., "ret42")
   const uint8_t* data;  // array from header
   unsigned int len;     // length from header
 };
+
 static const BlobReg g_blobs[] = {
   { "ret42", blob_ret42, blob_ret42_len },
   { "add2", blob_add2, blob_add2_len },
@@ -76,7 +104,8 @@ static const BlobReg g_blobs[] = {
   { "gpio_blink1s", blob_gpio_blink1s, blob_gpio_blink1s_len },
   { "gpio_blink_ms", blob_gpio_blink_ms, blob_gpio_blink_ms_len },
   { "gpio_pwm", blob_gpio_pwm, blob_gpio_pwm_len },
-  { "gpio_pwm_cycles", blob_gpio_pwm_cycles, blob_gpio_pwm_cycles_len }
+  { "gpio_pwm_cycles", blob_gpio_pwm_cycles, blob_gpio_pwm_cycles_len },
+  { "pio_blink", blob_pio_blink, blob_pio_blink_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
 
@@ -96,17 +125,20 @@ static inline uint32_t getTimeout(uint32_t defMs) {
 
 // ================== Core1 execution plumbing (mailbox) ==================
 enum ExecType : uint8_t {
-  EX0 = 0,  // int(void)
-  EX1 = 1,  // int(int)
-  EX2 = 2,  // int(int,int)
-  EX3 = 3,  // int(int,int,int)
-  EX4 = 4   // int(int,int,int,int)
+  EX0 = 0,      // int(void)
+  EX1 = 1,      // int(int)
+  EX2 = 2,      // int(int,int)
+  EX3 = 3,      // int(int,int,int)
+  EX4 = 4,      // int(int,int,int,int)
+  EX_PIO = 100  // PIO adapter job (interprets blob as PIO program)
 };
+
 typedef int (*fn0_t)(void);
 typedef int (*fn1_t)(int);
 typedef int (*fn2_t)(int, int);
 typedef int (*fn3_t)(int, int, int);
 typedef int (*fn4_t)(int, int, int, int);
+
 struct ExecJob {
   uint8_t type;  // ExecType
   uint8_t rsv0;
@@ -119,6 +151,7 @@ struct ExecJob {
   int32_t c;
   int32_t d;
 };
+
 // Shared mailbox
 static volatile ExecJob g_job;
 static volatile int32_t g_result = 0;
@@ -126,18 +159,152 @@ static volatile int32_t g_status = 0;
 // Job flag: 0=idle, 1=ready, 2=running, 3=done
 static volatile uint32_t g_job_flag = 0;
 
+#if USE_PIO_ADAPTER
+// PIO blob header (packed, even-sized = 26 bytes)
+struct __attribute__((packed)) PioBlobHdr {
+  uint32_t magic;         // 'PIO0' = 0x50494F30
+  uint8_t version;        // 1
+  uint8_t pio_index;      // 0 or 1
+  uint8_t sm;             // 0..3
+  uint8_t pin_base;       // GPIO base for OUT/SET
+  uint8_t pin_count;      // number of pins to drive as outputs
+  uint8_t sideset_base;   // 255=no sideset
+  uint8_t sideset_count;  // 0..5
+  uint8_t wrap_top;
+  uint8_t wrap_bottom;
+  float clkdiv;          // pio SM clock divider
+  uint16_t instr_count;  // number of 16-bit instructions
+  uint16_t reserved;     // 0
+  uint32_t run_ms;       // duration to run (>0), or 0 to start and return
+  uint8_t pad0;          // pad to make header size even (26 bytes)
+};
+
+static inline bool pio_header_valid(const PioBlobHdr* h, uint32_t sz) {
+  if (!h) return false;
+  if (sz < sizeof(PioBlobHdr)) return false;
+  if (h->magic != 0x50494F30u) return false;  // 'PIO0'
+  if (h->version != 1) return false;
+  uint32_t need = sizeof(PioBlobHdr) + (uint32_t)h->instr_count * 2u;
+  if (sz < need) return false;
+  if (h->pio_index > 1) return false;
+  if (h->sm > 3) return false;
+  return true;
+}
+
+// Clear SDK bookkeeping and hardware IMEM so pio_can_add_program() succeeds.
+static inline void pio_reset_and_clear(PIO pio) {
+  for (uint smi = 0; smi < 4; ++smi) {
+    pio_sm_set_enabled(pio, smi, false);
+    pio_sm_clear_fifos(pio, smi);
+    pio_sm_restart(pio, smi);
+  }
+  // This clears both hardware IMEM and the SDK's internal allocation map.
+  pio_clear_instruction_memory(pio);
+}
+
+// Core-agnostic PIO run helper: run entirely on the calling core.
+static bool runPIOOnThisCore(const uint8_t* base, uint32_t sz,
+                             int32_t a, int32_t b, int32_t c, int32_t d,
+                             int& retVal) {
+  if (sz < sizeof(PioBlobHdr)) {
+    Serial.println("PIO: header too small");
+    return false;
+  }
+  const PioBlobHdr* hdr = (const PioBlobHdr*)base;
+  if (!pio_header_valid(hdr, sz)) {
+    Serial.println("PIO: bad header");
+    return false;
+  }
+
+  // Optional overrides via a,b,c,d
+  uint8_t pio_index = hdr->pio_index;
+  uint8_t sm = hdr->sm;
+  uint8_t pin_base = hdr->pin_base;
+  uint32_t run_ms = hdr->run_ms;
+
+  if (a >= 0) pin_base = (uint8_t)a;
+  if (b > 0) run_ms = (uint32_t)b;
+  if (c >= 0 && c <= 3) sm = (uint8_t)c;
+  if (d >= 0 && d <= 1) pio_index = (uint8_t)d;
+
+  PIO pio = (pio_index == 0) ? pio0 : pio1;
+
+  const uint16_t* instr = (const uint16_t*)(base + sizeof(PioBlobHdr));
+  uint instr_count = hdr->instr_count;
+
+  // Build program pointing to RAM buffer; IMEM will get a copy
+  pio_program_t program;
+  program.instructions = instr;
+  program.length = instr_count;
+  program.origin = -1;
+
+  // Fully clear this PIO instance so IMEM has room and SDK state is clean
+  pio_reset_and_clear(pio);
+
+  if (!pio_can_add_program(pio, &program)) {
+    Serial.println("PIO: no IMEM space");
+    return false;
+  }
+
+  uint offset = pio_add_program(pio, &program);
+
+  // Select PIO function for driven pins
+  const gpio_function_t func = pio_index ? GPIO_FUNC_PIO1 : GPIO_FUNC_PIO0;
+
+  if (hdr->pin_count > 0) {
+    for (uint i = 0; i < hdr->pin_count; ++i) {
+      gpio_set_function(pin_base + i, func);  // data/set pins
+    }
+  }
+  if (hdr->sideset_count > 0 && hdr->sideset_base != 255) {
+    for (uint i = 0; i < hdr->sideset_count; ++i) {
+      gpio_set_function(hdr->sideset_base + i, func);  // sideset pins
+    }
+  }
+
+  // Configure SM
+  pio_sm_config c2 = pio_get_default_sm_config();
+  sm_config_set_wrap(&c2, offset + hdr->wrap_bottom, offset + hdr->wrap_top);
+
+  if (hdr->pin_count > 0) {
+    sm_config_set_out_pins(&c2, pin_base, hdr->pin_count);
+    sm_config_set_set_pins(&c2, pin_base, hdr->pin_count);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_base, hdr->pin_count, true);
+  }
+  if (hdr->sideset_count > 0 && hdr->sideset_base != 255) {
+    sm_config_set_sideset_pins(&c2, hdr->sideset_base);
+  }
+  if (hdr->clkdiv > 0.0f) {
+    sm_config_set_clkdiv(&c2, hdr->clkdiv);
+  }
+
+  pio_sm_init(pio, sm, offset, &c2);
+  pio_sm_set_enabled(pio, sm, true);
+
+  if (run_ms > 0) {
+    busy_wait_ms(run_ms);  // deterministic wait on any core
+    pio_sm_set_enabled(pio, sm, false);
+    pio_remove_program(pio, &program, offset);
+  } else {
+    // Leave running and return immediately.
+  }
+
+  retVal = 0;
+  return true;
+}
+#endif  // USE_PIO_ADAPTER
+
 // Core1 worker poll (called from loop1())
 static void core1WorkerPoll() {
-  // Fast path: nothing to do
   if (g_job_flag != 1u) return;
-  // Acquire: ensure we see the published job
-  __asm__ volatile("dsb 0" ::
-                     : "memory");
-  __asm__ volatile("isb 0" ::
-                     : "memory");
-  // Mark running
+
+  __asm volatile("dsb" ::
+                   : "memory");
+  __asm volatile("isb" ::
+                   : "memory");
+
   g_job_flag = 2u;
-  // Snapshot job locally
+
   ExecJob job;
   job.type = g_job.type;
   job.code = g_job.code;
@@ -146,8 +313,10 @@ static void core1WorkerPoll() {
   job.b = g_job.b;
   job.c = g_job.c;
   job.d = g_job.d;
+
   int32_t rv = 0;
   int32_t st = 0;
+
   if (job.code == 0 || (job.size & 1u)) {
     st = -1;  // invalid entry
   } else {
@@ -183,32 +352,52 @@ static void core1WorkerPoll() {
           rv = fn(job.a, job.b, job.c, job.d);
         }
         break;
+
+#if USE_PIO_ADAPTER
+#if PIO_RUN_ON_CORE1
+      case EX_PIO:
+        {
+          int retv = 0;
+          if (!runPIOOnThisCore((const uint8_t*)job.code, job.size, job.a, job.b, job.c, job.d, retv)) {
+            st = -20;  // PIO adapter failed on core1
+          } else {
+            rv = retv;
+          }
+        }
+        break;
+#else
+      case EX_PIO:
+        {
+          st = -21;  // should not be hit when running PIO on core0
+        }
+        break;
+#endif
+#endif
       default:
         st = -2;
         break;
     }
   }
+
   g_result = rv;
   g_status = st;
-  // Release: publish results then mark done
-  __asm__ volatile("dsb 0" ::
-                     : "memory");
-  __asm__ volatile("isb 0" ::
-                     : "memory");
+
+  __asm volatile("dsb" ::
+                   : "memory");
+  __asm volatile("isb" ::
+                   : "memory");
+
   g_job_flag = 3u;
 }
 
 // Core0 helper: run already-loaded RAM code on core1, return result.
-// timeoutMs: how long to wait for completion (default 100ms; override in execBlob* helpers).
 static bool runOnCore1(ExecType type, uintptr_t codeAligned, uint32_t sz,
                        int32_t a, int32_t b, int32_t c, int32_t d,
                        int& retVal, uint32_t timeoutMs = 100) {
-  // If core1 is busy, bail (simple single-job mailbox)
   if (g_job_flag != 0u) {
     Serial.println("core1 busy");
     return false;
   }
-  // Publish job
   g_job.type = (uint8_t)type;
   g_job.code = codeAligned;
   g_job.size = sz;
@@ -218,20 +407,19 @@ static bool runOnCore1(ExecType type, uintptr_t codeAligned, uint32_t sz,
   g_job.d = d;
   g_status = 0;
   g_result = 0;
-  __asm__ volatile("dsb 0" ::
-                     : "memory");
-  __asm__ volatile("isb 0" ::
-                     : "memory");
-  // Signal ready
+
+  __asm volatile("dsb" ::
+                   : "memory");
+  __asm volatile("isb" ::
+                   : "memory");
+
   g_job_flag = 1u;
-  // Wait for done or timeout
+
   uint32_t start = millis();
   while (g_job_flag != 3u) {
-    // give core1 cycles
     tight_loop_contents();
     if ((millis() - start) > timeoutMs) {
       Serial.println("core1 timeout");
-      // Leave job_flag non-zero so we don't race results; user can retry later.
       return false;
     }
   }
@@ -242,7 +430,7 @@ static bool runOnCore1(ExecType type, uintptr_t codeAligned, uint32_t sz,
     return false;
   }
   retVal = (int)g_result;
-  g_job_flag = 0u;  // reset for next job
+  g_job_flag = 0u;
   return true;
 }
 
@@ -259,6 +447,7 @@ static bool checkNameLen(const char* name) {
   }
   return true;
 }
+
 static void listBlobs() {
   Serial.println("Available blobs:");
   for (size_t i = 0; i < g_blobs_count; ++i) {
@@ -269,12 +458,14 @@ static void listBlobs() {
     Serial.println(" bytes)");
   }
 }
+
 static const BlobReg* findBlob(const char* id) {
   for (size_t i = 0; i < g_blobs_count; ++i) {
     if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
   }
   return nullptr;
 }
+
 static void dumpFileHead(const char* fname, uint32_t count) {
   uint32_t sz = 0;
   if (!fs.getFileSize(fname, sz) || sz == 0) {
@@ -300,8 +491,8 @@ static void dumpFileHead(const char* fname, uint32_t count) {
     off += n;
   }
 }
+
 // Load file fully into an aligned RAM buffer suitable for execution.
-// Returns aligned pointer in outBuf, size in outSize, and raw allocation in rawOut (free(rawOut) when done).
 static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut) {
   rawOut = nullptr;
   alignedBuf = nullptr;
@@ -312,7 +503,7 @@ static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& aligne
     return false;
   }
   if (sz & 1u) {
-    Serial.println("load: odd-sized blob (Thumb requires 16-bit alignment)");
+    Serial.println("load: odd-sized blob (Thumb/PIO require 16-bit alignment)");
     return false;
   }
   void* raw = malloc(sz + 4);
@@ -331,6 +522,7 @@ static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& aligne
   szOut = sz;
   return true;
 }
+
 // Create/Update a file with a blob (manual path: create slot if not present, in-place update if possible)
 static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = DEFAULT_SLOT_RESERVE) {
   if (!checkNameLen(fname)) return false;
@@ -348,7 +540,6 @@ static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len,
       return false;
     }
   }
-  // Compare existing content
   uint32_t addr, size, cap;
   if (!fs.getFileInfo(fname, addr, size, cap)) {
     Serial.println("getFileInfo failed");
@@ -388,6 +579,7 @@ static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len,
   Serial.println("Failed to update file");
   return false;
 }
+
 // Auto-write ONLY IF MISSING (does not update if present)
 static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = DEFAULT_SLOT_RESERVE) {
   if (!checkNameLen(fname)) return false;
@@ -408,6 +600,7 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
   Serial.println("Auto-create failed");
   return false;
 }
+
 // Call this to auto-create only the blobs you enabled with #defines above
 static void autogenBlobWrites() {
   bool allOk = true;
@@ -441,22 +634,47 @@ static void autogenBlobWrites() {
 #if AUTO_BLOB_GPIOPWMC
   allOk &= ensureBlobIfMissing(FILE_GPIOPWMC, blob_gpio_pwm_cycles, blob_gpio_pwm_cycles_len);
 #endif
+#if AUTO_BLOB_PIOBLINK
+  allOk &= ensureBlobIfMissing(FILE_PIOBLINK, blob_pio_blink, blob_pio_blink_len);
+#endif
   Serial.print("autogen: ");
   Serial.println(allOk ? "OK" : "some failures");
 }
 
-// Core1-based execution helpers (load -> run on core1 -> free)
-static bool execBlobNoArg(const char* fname, int& retVal) {
+// ================== Execution helpers ==================
+#if USE_PIO_ADAPTER
+static bool execPIOFileGeneric(const char* fname, int a, int b, int c, int d, int& retVal) {
   void* raw = nullptr;
   uint8_t* buf = nullptr;
   uint32_t sz = 0;
   if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
-  Serial.print("Blob head: ");
-  for (int i = 0; i < 8 && i < (int)sz; ++i) {
-    if (i) Serial.print(' ');
-    printHexByte(buf[i]);
-  }
-  Serial.println();
+
+#if PIO_RUN_ON_CORE1
+  uintptr_t code = (uintptr_t)buf;
+  Serial.print("PIO(core1): loading blob at 0x");
+  Serial.println((uintptr_t)buf, HEX);
+  bool ok = runOnCore1(EX_PIO, code, sz, a, b, c, d, retVal, getTimeout(100000));
+  if (!ok) Serial.println("PIO: core1 run failed");
+#else
+  Serial.print("PIO(core0): loading blob at 0x");
+  Serial.println((uintptr_t)buf, HEX);
+  bool ok = runPIOOnThisCore(buf, sz, a, b, c, d, retVal);
+  if (!ok) Serial.println("PIO: run failed");
+#endif
+
+  free(raw);
+  return ok;
+}
+#endif
+
+static bool execBlobNoArg(const char* fname, int& retVal) {
+#if USE_PIO_ADAPTER
+  return execPIOFileGeneric(fname, -1, -1, -1, -1, retVal);
+#else
+  void* raw = nullptr;
+  uint8_t* buf = nullptr;
+  uint32_t sz = 0;
+  if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
   uintptr_t code = (uintptr_t)buf;  // raw aligned address (LSB 0)
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
@@ -464,8 +682,13 @@ static bool execBlobNoArg(const char* fname, int& retVal) {
   if (!ok) Serial.println("exec0: core1 run failed");
   free(raw);
   return ok;
+#endif
 }
+
 static bool execBlob1Arg(const char* fname, int a, int& retVal) {
+#if USE_PIO_ADAPTER
+  return execPIOFileGeneric(fname, a, -1, -1, -1, retVal);
+#else
   void* raw = nullptr;
   uint8_t* buf = nullptr;
   uint32_t sz = 0;
@@ -473,13 +696,17 @@ static bool execBlob1Arg(const char* fname, int a, int& retVal) {
   uintptr_t code = (uintptr_t)buf;
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
-  // Raised timeout to 5000ms to allow visible blinks to complete
   bool ok = runOnCore1(EX1, code, sz, a, 0, 0, 0, retVal, getTimeout(100000));
   if (!ok) Serial.println("exec1: core1 run failed");
   free(raw);
   return ok;
+#endif
 }
+
 static bool execBlob2Arg(const char* fname, int a, int b, int& retVal) {
+#if USE_PIO_ADAPTER
+  return execPIOFileGeneric(fname, a, b, -1, -1, retVal);
+#else
   void* raw = nullptr;
   uint8_t* buf = nullptr;
   uint32_t sz = 0;
@@ -487,13 +714,17 @@ static bool execBlob2Arg(const char* fname, int a, int b, int& retVal) {
   uintptr_t code = (uintptr_t)buf;
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
-  // Raised timeout to 5000ms to be safer for longer operations
   bool ok = runOnCore1(EX2, code, sz, a, b, 0, 0, retVal, getTimeout(100000));
   if (!ok) Serial.println("exec2: core1 run failed");
   free(raw);
   return ok;
+#endif
 }
+
 static bool execBlob3Arg(const char* fname, int a, int b, int c, int& retVal) {
+#if USE_PIO_ADAPTER
+  return execPIOFileGeneric(fname, a, b, c, -1, retVal);
+#else
   void* raw = nullptr;
   uint8_t* buf = nullptr;
   uint32_t sz = 0;
@@ -501,13 +732,17 @@ static bool execBlob3Arg(const char* fname, int a, int b, int c, int& retVal) {
   uintptr_t code = (uintptr_t)buf;
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
-  // Raised timeout to 10000ms; for gpio_blink_ms this covers typical delays
   bool ok = runOnCore1(EX3, code, sz, a, b, c, 0, retVal, getTimeout(100000));
   if (!ok) Serial.println("exec3: core1 run failed");
   free(raw);
   return ok;
+#endif
 }
+
 static bool execBlob4Arg(const char* fname, int a, int b, int c, int d, int& retVal) {
+#if USE_PIO_ADAPTER
+  return execPIOFileGeneric(fname, a, b, c, d, retVal);
+#else
   void* raw = nullptr;
   uint8_t* buf = nullptr;
   uint32_t sz = 0;
@@ -515,15 +750,16 @@ static bool execBlob4Arg(const char* fname, int a, int b, int c, int d, int& ret
   uintptr_t code = (uintptr_t)buf;
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
-  // Keep 1000ms here; adjust per use-case
   bool ok = runOnCore1(EX4, code, sz, a, b, c, d, retVal, getTimeout(100000));
   if (!ok) Serial.println("exec4: core1 run failed");
   free(raw);
   return ok;
+#endif
 }
 
 // ---------- Console ----------
 static char lineBuf[192];
+
 static int nextToken(char*& p, char*& tok) {
   // Skip spaces/tabs/newlines
   while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
@@ -536,9 +772,10 @@ static int nextToken(char*& p, char*& tok) {
   if (*p) {
     *p = 0;
     ++p;
-  }  // null-terminate token
+  }
   return 1;
 }
+
 static bool readLine() {
   static size_t pos = 0;
   while (Serial.available()) {
@@ -553,6 +790,7 @@ static bool readLine() {
   }
   return false;
 }
+
 static void printHelp() {
   Serial.println("Commands (filename max 32 chars):");
   Serial.println("  help                         - this help");
@@ -563,35 +801,20 @@ static void printHelp() {
   Serial.println("  dump <file> <nbytes>         - hex dump head of file");
   Serial.println("  mkSlot <file> <reserve>      - create sector-aligned slot");
   Serial.println("  writeblob <file> <blobId>    - create/update file from blob");
+#if USE_PIO_ADAPTER
+  Serial.println("  exec0/1/2/3/4 <file> [args]  - load PIO blob, run on core0/core1:");
+  Serial.println("      args override header: a=pin_base (-1=keep), b=run_ms (<=0 keep), c=sm, d=pio");
+#else
   Serial.println("  exec0 <file>                 - execute as int entry(void) on core1");
   Serial.println("  exec1 <file> <a>             - execute as int entry(int) on core1");
   Serial.println("  exec2 <file> <a> <b>         - execute as int entry(int,int) on core1");
   Serial.println("  exec3 <file> <a> <b> <c>     - execute as int entry(int,int,int) on core1");
   Serial.println("  exec4 <file> <a> <b> <c> <d> - execute as int entry(int,int,int,int) on core1");
+#endif
   Serial.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Serial.println();
-  Serial.println("Examples:");
-  Serial.println("  writeblob " FILE_RET42 " ret42");
-  Serial.println("  exec0 " FILE_RET42);
-  Serial.println("  writeblob " FILE_ADD2 " add2");
-  Serial.println("  exec2 " FILE_ADD2 " 7 5");
-  Serial.println("  writeblob " FILE_SQUARE " square");
-  Serial.println("  exec2 " FILE_SQUARE " 9 0");
-  Serial.println("  writeblob " FILE_MULA " muladd_a");
-  Serial.println("  exec2 " FILE_MULA " 3 4");
-  Serial.println("  writeblob " FILE_MULB " muladd_b");
-  Serial.println("  exec2 " FILE_MULB " 3 4");
-  Serial.println("  writeblob " FILE_GPIO8BLINK " gpio8blink");
-  Serial.println("  exec0 " FILE_GPIO8BLINK);
-  Serial.println("  writeblob " FILE_GPIO1S " gpio_blink1s");
-  Serial.println("  exec1 " FILE_GPIO1S " 25");
-  Serial.println("  writeblob " FILE_GPIOMS " gpio_blink_ms");
-  Serial.println("  exec3 " FILE_GPIOMS " 25 250 750");
-  Serial.println("  writeblob " FILE_GPIOPWM " gpio_pwm");
-  Serial.println("  exec4 " FILE_GPIOPWM " <pin> <high_ms> <low_ms> <dur_ms>");
-  Serial.println("  writeblob " FILE_GPIOPWMC " gpio_pwm_cycles");
-  Serial.println("  exec4 " FILE_GPIOPWMC " <pin> <low_ms> <high_ms> <cycles>");
 }
+
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
@@ -789,6 +1012,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) {}
   delay(5);
+
   flash.begin();
   uint8_t mfr, memType, capCode;
   uint32_t capacityBytes = flash.readJEDEC(mfr, memType, capCode);
@@ -801,6 +1025,7 @@ void setup() {
   Serial.print("  Capacity: ");
   Serial.print(capacityBytes);
   Serial.println(" bytes");
+
   if (!fs.mount(true)) {
     Serial.println("FS mount failed");
     return;
@@ -808,9 +1033,11 @@ void setup() {
   Serial.println("Initial listing:");
   fs.listFilesToSerial();
   fs.setAlignToPageBoundary(false);  // packing preference for append-only writes
+
 #if AUTO_RUN_AUTOGEN_ON_BOOT
   autogenBlobWrites();
 #endif
+
   Serial.println();
   printHelp();
   Serial.println();
@@ -830,6 +1057,7 @@ void loop1() {
   // Power-friendly idle between polls
   tight_loop_contents();
 }
+
 void loop() {
   if (readLine()) {
     handleCommand(lineBuf);
