@@ -503,7 +503,11 @@ static void mailboxPrintIfAny() {
 }
 
 // ================== Execution helpers ==================
-static bool execBlobNoArg(const char* fname, int& retVal) {
+// Generic exec: runs blob with 0..4 integer args, handles mailbox clear/print.
+static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& retVal) {
+  if (argc < 0) argc = 0;
+  if (argc > 4) argc = 4;
+
   void* raw = nullptr;
   uint8_t* buf = nullptr;
   uint32_t sz = 0;
@@ -511,121 +515,31 @@ static bool execBlobNoArg(const char* fname, int& retVal) {
 
   mailboxClearFirstByte();
 
-  uintptr_t code = (uintptr_t)buf;  // raw aligned address (LSB 0)
+  uintptr_t code = (uintptr_t)buf;  // aligned buffer address
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
 
-  bool ok = runOnCore1(EX0, code, sz, 0, 0, 0, 0, retVal, getTimeout(100000));
-  if (!ok) {
-    Serial.println("exec0: core1 run failed");
-    free(raw);
-    return false;
+  bool ok = false;
+  switch (argc) {
+    case 0:
+      ok = runOnCore1(EX0, code, sz, 0, 0, 0, 0, retVal, getTimeout(100000));
+      break;
+    case 1:
+      ok = runOnCore1(EX1, code, sz, argv[0], 0, 0, 0, retVal, getTimeout(100000));
+      break;
+    case 2:
+      ok = runOnCore1(EX2, code, sz, argv[0], argv[1], 0, 0, retVal, getTimeout(100000));
+      break;
+    case 3:
+      ok = runOnCore1(EX3, code, sz, argv[0], argv[1], argv[2], 0, retVal, getTimeout(100000));
+      break;
+    case 4:
+      ok = runOnCore1(EX4, code, sz, argv[0], argv[1], argv[2], argv[3], retVal, getTimeout(100000));
+      break;
   }
 
-  Serial.print("Return=");
-  Serial.println(retVal);
-  mailboxPrintIfAny();
-
-  free(raw);
-  return true;
-}
-
-static bool execBlob1Arg(const char* fname, int a, int& retVal) {
-  void* raw = nullptr;
-  uint8_t* buf = nullptr;
-  uint32_t sz = 0;
-  if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
-
-  mailboxClearFirstByte();
-
-  uintptr_t code = (uintptr_t)buf;
-  Serial.print("Calling entry on core1 at 0x");
-  Serial.println((uintptr_t)buf, HEX);
-
-  bool ok = runOnCore1(EX1, code, sz, a, 0, 0, 0, retVal, getTimeout(100000));
   if (!ok) {
-    Serial.println("exec1: core1 run failed");
-    free(raw);
-    return false;
-  }
-
-  Serial.print("Return=");
-  Serial.println(retVal);
-  mailboxPrintIfAny();
-
-  free(raw);
-  return true;
-}
-
-static bool execBlob2Arg(const char* fname, int a, int b, int& retVal) {
-  void* raw = nullptr;
-  uint8_t* buf = nullptr;
-  uint32_t sz = 0;
-  if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
-
-  mailboxClearFirstByte();
-
-  uintptr_t code = (uintptr_t)buf;
-  Serial.print("Calling entry on core1 at 0x");
-  Serial.println((uintptr_t)buf, HEX);
-
-  bool ok = runOnCore1(EX2, code, sz, a, b, 0, 0, retVal, getTimeout(100000));
-  if (!ok) {
-    Serial.println("exec2: core1 run failed");
-    free(raw);
-    return false;
-  }
-
-  Serial.print("Return=");
-  Serial.println(retVal);
-  mailboxPrintIfAny();
-
-  free(raw);
-  return true;
-}
-
-static bool execBlob3Arg(const char* fname, int a, int b, int c, int& retVal) {
-  void* raw = nullptr;
-  uint8_t* buf = nullptr;
-  uint32_t sz = 0;
-  if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
-
-  mailboxClearFirstByte();
-
-  uintptr_t code = (uintptr_t)buf;
-  Serial.print("Calling entry on core1 at 0x");
-  Serial.println((uintptr_t)buf, HEX);
-
-  bool ok = runOnCore1(EX3, code, sz, a, b, c, 0, retVal, getTimeout(100000));
-  if (!ok) {
-    Serial.println("exec3: core1 run failed");
-    free(raw);
-    return false;
-  }
-
-  Serial.print("Return=");
-  Serial.println(retVal);
-  mailboxPrintIfAny();
-
-  free(raw);
-  return true;
-}
-
-static bool execBlob4Arg(const char* fname, int a, int b, int c, int d, int& retVal) {
-  void* raw = nullptr;
-  uint8_t* buf = nullptr;
-  uint32_t sz = 0;
-  if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
-
-  mailboxClearFirstByte();
-
-  uintptr_t code = (uintptr_t)buf;
-  Serial.print("Calling entry on core1 at 0x");
-  Serial.println((uintptr_t)buf, HEX);
-
-  bool ok = runOnCore1(EX4, code, sz, a, b, c, d, retVal, getTimeout(100000));
-  if (!ok) {
-    Serial.println("exec4: core1 run failed");
+    Serial.println("exec: core1 run failed");
     free(raw);
     return false;
   }
@@ -682,11 +596,8 @@ static void printHelp() {
   Serial.println("  dump <file> <nbytes>         - hex dump head of file");
   Serial.println("  mkSlot <file> <reserve>      - create sector-aligned slot");
   Serial.println("  writeblob <file> <blobId>    - create/update file from blob");
-  Serial.println("  exec0 <file>                 - execute as int entry(void) on core1");
-  Serial.println("  exec1 <file> <a>             - execute as int entry(int) on core1");
-  Serial.println("  exec2 <file> <a> <b>         - execute as int entry(int,int) on core1");
-  Serial.println("  exec3 <file> <a> <b> <c>     - execute as int entry(int,int,int) on core1");
-  Serial.println("  exec4 <file> <a> <b> <c> <d> - execute as int entry(int,int,int,int) on core1");
+  Serial.println("  exec <file> [a [b [c [d]]]]  - execute blob with 0..4 int args on core1");
+  Serial.println("  exec0/1/2/3/4 ...            - legacy forms (still supported)");
   Serial.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Serial.println();
 }
@@ -756,6 +667,22 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Serial.println("writeblob OK");
     else Serial.println("writeblob failed");
+  } else if (!strcmp(t0, "exec")) {
+    char* fn;
+    if (!nextToken(p, fn)) {
+      Serial.println("usage: exec <file> [a [b [c [d]]]]");
+      return;
+    }
+    int argv4[4] = { 0, 0, 0, 0 };
+    int argc = 0;
+    char* tok;
+    while (argc < 4 && nextToken(p, tok)) {
+      argv4[argc++] = (int)strtol(tok, nullptr, 0);
+    }
+    int rv;
+    if (!execBlobGeneric(fn, argc, argv4, rv)) {
+      Serial.println("exec failed");
+    }
   } else if (!strcmp(t0, "exec0")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -763,7 +690,9 @@ static void handleCommand(char* line) {
       return;
     }
     int rv;
-    if (!execBlobNoArg(fn, rv)) Serial.println("exec0 failed");
+    int argv4[4] = { 0, 0, 0, 0 };
+    if (!execBlobGeneric(fn, 0, argv4, rv)) Serial.println("exec0 failed");
+
   } else if (!strcmp(t0, "exec1")) {
     char* fn;
     char* as;
@@ -771,9 +700,10 @@ static void handleCommand(char* line) {
       Serial.println("usage: exec1 <file> <a>");
       return;
     }
-    int a = (int)strtol(as, nullptr, 0);
     int rv;
-    if (!execBlob1Arg(fn, a, rv)) Serial.println("exec1 failed");
+    int argv4[4] = { (int)strtol(as, nullptr, 0), 0, 0, 0 };
+    if (!execBlobGeneric(fn, 1, argv4, rv)) Serial.println("exec1 failed");
+
   } else if (!strcmp(t0, "exec2")) {
     char* fn;
     char* as;
@@ -782,10 +712,10 @@ static void handleCommand(char* line) {
       Serial.println("usage: exec2 <file> <a> <b>");
       return;
     }
-    int a = (int)strtol(as, nullptr, 0);
-    int b = (int)strtol(bs, nullptr, 0);
     int rv;
-    if (!execBlob2Arg(fn, a, b, rv)) Serial.println("exec2 failed");
+    int argv4[4] = { (int)strtol(as, nullptr, 0), (int)strtol(bs, nullptr, 0), 0, 0 };
+    if (!execBlobGeneric(fn, 2, argv4, rv)) Serial.println("exec2 failed");
+
   } else if (!strcmp(t0, "exec3")) {
     char* fn;
     char* as;
@@ -795,11 +725,10 @@ static void handleCommand(char* line) {
       Serial.println("usage: exec3 <file> <a> <b> <c>");
       return;
     }
-    int a = (int)strtol(as, nullptr, 0);
-    int b = (int)strtol(bs, nullptr, 0);
-    int c = (int)strtol(cs, nullptr, 0);
     int rv;
-    if (!execBlob3Arg(fn, a, b, c, rv)) Serial.println("exec3 failed");
+    int argv4[4] = { (int)strtol(as, nullptr, 0), (int)strtol(bs, nullptr, 0), (int)strtol(cs, nullptr, 0), 0 };
+    if (!execBlobGeneric(fn, 3, argv4, rv)) Serial.println("exec3 failed");
+
   } else if (!strcmp(t0, "exec4")) {
     char* fn;
     char* s0;
@@ -810,12 +739,14 @@ static void handleCommand(char* line) {
       Serial.println("usage: exec4 <file> <a> <b> <c> <d>");
       return;
     }
-    int a = (int)strtol(s0, nullptr, 0);
-    int b = (int)strtol(s1, nullptr, 0);
-    int c = (int)strtol(s2, nullptr, 0);
-    int d = (int)strtol(s3, nullptr, 0);
     int rv;
-    if (!execBlob4Arg(fn, a, b, c, d, rv)) Serial.println("exec4 failed");
+    int argv4[4] = {
+      (int)strtol(s0, nullptr, 0),
+      (int)strtol(s1, nullptr, 0),
+      (int)strtol(s2, nullptr, 0),
+      (int)strtol(s3, nullptr, 0)
+    };
+    if (!execBlobGeneric(fn, 4, argv4, rv)) Serial.println("exec4 failed");
   } else if (!strcmp(t0, "del")) {
     char* fn;
     if (!nextToken(p, fn)) {
