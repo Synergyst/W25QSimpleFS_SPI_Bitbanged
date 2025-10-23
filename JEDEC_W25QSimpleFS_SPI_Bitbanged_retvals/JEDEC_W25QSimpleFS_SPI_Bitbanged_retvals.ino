@@ -4,9 +4,6 @@
 //   Pin 1 -> CS
 //   Pin 2 -> SCK
 //   Pin 3 -> MOSI
-#include "pico/stdlib.h"    // tight_loop_contents(), etc.
-#include "pico/platform.h"  // for __scratch_x()
-#include <Arduino.h>
 #include "W25QBitbang.h"
 #include "W25QSimpleFS.h"
 
@@ -32,9 +29,8 @@ W25QBitbang flash(PIN_MISO, PIN_CS, PIN_SCK, PIN_MOSI);
 W25QSimpleFS fs(flash);
 
 // ================== Mailbox reservation (Scratch) ==================
-// Reserve mailbox in Scratch X (0x20040000..0x20040FFF)
-extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
-uint8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
+extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))  // Reserve mailbox in Scratch X (0x20040000..0x20040FFF)
+int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
 
 // ================== Blob registry (compiled-in arrays) ==================
 struct BlobReg {
@@ -59,14 +55,34 @@ static inline uint32_t getTimeout(uint32_t defMs) {
 }
 
 // ================== Core1 execution plumbing (mailbox) ==================
-typedef int (*fn4_t)(int, int, int, int);
+#define MAX_EXEC_ARGS 64
+extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
+  if (!entryThumb) return 0;
+  // Always prepare 64 ints; extra entries are zero.
+  constexpr uint32_t N = 64;
+  int32_t a64[N] = { 0 };
+  uint32_t n = argc;
+  if (n > N) n = N;
+  if (args && n) {
+    for (uint32_t i = 0; i < n; ++i) a64[i] = args[i];
+  }
+  using fvar_t = int (*)(...);  // call ABI: r0..r3 then stack per AAPCS
+  fvar_t f = reinterpret_cast<fvar_t>(entryThumb);
+  return f(
+    a64[0], a64[1], a64[2], a64[3], a64[4], a64[5], a64[6], a64[7],
+    a64[8], a64[9], a64[10], a64[11], a64[12], a64[13], a64[14], a64[15],
+    a64[16], a64[17], a64[18], a64[19], a64[20], a64[21], a64[22], a64[23],
+    a64[24], a64[25], a64[26], a64[27], a64[28], a64[29], a64[30], a64[31],
+    a64[32], a64[33], a64[34], a64[35], a64[36], a64[37], a64[38], a64[39],
+    a64[40], a64[41], a64[42], a64[43], a64[44], a64[45], a64[46], a64[47],
+    a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
+    a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
+}
 struct ExecJob {
-  uintptr_t code;  // raw aligned code address (LSB 0)
-  uint32_t size;   // code size (bytes, even)
-  int32_t a;
-  int32_t b;
-  int32_t c;
-  int32_t d;
+  uintptr_t code;               // raw aligned code address (LSB 0)
+  uint32_t size;                // code size (bytes, even)
+  uint32_t argc;                // number of int args (0..MAX_EXEC_ARGS)
+  int32_t args[MAX_EXEC_ARGS];  // argument values
 };
 
 // ================== Shared mailbox ==================
@@ -85,13 +101,13 @@ static void core1WorkerPoll() {
 
   g_job_flag = 2u;
 
+  // Snapshot job to local (avoid volatile reads during call)
   ExecJob job;
   job.code = g_job.code;
   job.size = g_job.size;
-  job.a = g_job.a;
-  job.b = g_job.b;
-  job.c = g_job.c;
-  job.d = g_job.d;
+  job.argc = g_job.argc;
+  if (job.argc > MAX_EXEC_ARGS) job.argc = MAX_EXEC_ARGS;
+  for (uint32_t i = 0; i < job.argc; ++i) job.args[i] = g_job.args[i];
 
   int32_t rv = 0;
   int32_t st = 0;
@@ -100,8 +116,7 @@ static void core1WorkerPoll() {
     st = -1;  // invalid entry
   } else {
     void* entryThumb = (void*)(job.code | 1u);
-    fn4_t fn = (fn4_t)entryThumb;
-    rv = fn(job.a, job.b, job.c, job.d);
+    rv = call_with_args_thumb(entryThumb, job.argc, job.args);
   }
 
   g_result = rv;
@@ -114,19 +129,17 @@ static void core1WorkerPoll() {
 
   g_job_flag = 3u;
 }
-static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, int32_t a, int32_t b, int32_t c, int32_t d, int& retVal, uint32_t timeoutMs = 100) {
-  // Core0 helper: run already-loaded RAM code on core1, return result.
+static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const int32_t* argv, int& retVal, uint32_t timeoutMs = 100) {
   if (g_job_flag != 0u) {
     Serial.println("core1 busy");
     return false;
   }
+  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
 
   g_job.code = codeAligned;
   g_job.size = sz;
-  g_job.a = a;
-  g_job.b = b;
-  g_job.c = c;
-  g_job.d = d;
+  g_job.argc = argc;
+  for (uint32_t i = 0; i < argc; ++i) g_job.args[i] = argv[i];
   g_status = 0;
   g_result = 0;
 
@@ -134,18 +147,23 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, int32_t a, int32_t b,
                    : "memory");
   __asm volatile("isb" ::
                    : "memory");
-
   g_job_flag = 1u;
 
   uint32_t start = millis();
   while (g_job_flag != 3u) {
     tight_loop_contents();
     if ((millis() - start) > timeoutMs) {
+      // One last check in case it completed just now
+      if (g_job_flag == 3u) break;
       Serial.println("core1 timeout");
+      // Clear flag so we don't wedge the system; core1 will either be idle or eventually
+      // set to 3, but we allow new jobs.
+      g_job_flag = 0u;
       return false;
     }
   }
 
+  // If worker signaled an error
   if (g_status != 0) {
     Serial.print("core1 error status=");
     Serial.println((int)g_status);
@@ -205,7 +223,12 @@ static void dumpFileHead(const char* fname, uint32_t count) {
 
   while (off < count) {
     size_t n = (count - off > CHUNK) ? CHUNK : (count - off);
-    fs.readFileRange(fname, off, buf, n);
+    //fs.readFileRange(fname, off, buf, n);
+    size_t got = fs.readFileRange(fname, off, buf, n);
+    if (got != n) {
+      Serial.println("  read error");
+      break;
+    }
     Serial.print("  ");
     for (size_t i = 0; i < n; ++i) {
       if (i) Serial.print(' ');
@@ -363,9 +386,9 @@ static void mailboxPrintIfAny() {
 // ================== Execution helpers ==================
 static char lineBuf[fs.SECTOR_SIZE];
 static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& retVal) {
-  // Generic exec: runs blob with 0..4 integer args, handles mailbox clear/print.
+  // Generic exec: runs blob with 0..MAX_EXEC_ARGS integer args, handles mailbox clear/print.
   if (argc < 0) argc = 0;
-  if (argc > 4) argc = 4;
+  if (argc > (int)MAX_EXEC_ARGS) argc = (int)MAX_EXEC_ARGS;
 
   void* raw = nullptr;
   uint8_t* buf = nullptr;
@@ -378,13 +401,7 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   Serial.print("Calling entry on core1 at 0x");
   Serial.println((uintptr_t)buf, HEX);
 
-  // Always pass 4 args; zero-fill the rest.
-  int a = (argc > 0) ? argv[0] : 0;
-  int b = (argc > 1) ? argv[1] : 0;
-  int c = (argc > 2) ? argv[2] : 0;
-  int d = (argc > 3) ? argv[3] : 0;
-
-  bool ok = runOnCore1(code, sz, a, b, c, d, retVal, getTimeout(100000));
+  bool ok = runOnCore1(code, sz, (uint32_t)argc, (const int32_t*)argv, retVal, getTimeout(100000));
   if (!ok) {
     Serial.println("exec: core1 run failed");
     free(raw);
@@ -406,6 +423,7 @@ static int nextToken(char*& p, char*& tok) {
     return 0;
   }
   tok = p;
+  // Read up to next whitespace
   while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') ++p;
   if (*p) {
     *p = 0;
@@ -437,7 +455,7 @@ static void printHelp() {
   Serial.println("  dump <file> <nbytes>         - hex dump head of file");
   Serial.println("  mkSlot <file> <reserve>      - create sector-aligned slot");
   Serial.println("  writeblob <file> <blobId>    - create/update file from blob");
-  Serial.println("  exec <file> [a [b [c [d]]]]  - execute blob with 0..4 int args on core1");
+  Serial.printf("  exec <file> [a0..aN]      - execute blob with 0..%d int args on core1\n", MAX_EXEC_ARGS);
   Serial.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Serial.println();
 }
@@ -530,17 +548,17 @@ static void handleCommand(char* line) {
   } else if (!strcmp(t0, "exec")) {
     char* fn;
     if (!nextToken(p, fn)) {
-      Serial.println("usage: exec <file> [a [b [c [d]]]]");
+      Serial.println("usage: exec <file> [a0 ... aN]");
       return;
     }
-    int argv4[4] = { 0, 0, 0, 0 };
+    static int argvN[MAX_EXEC_ARGS];
     int argc = 0;
     char* tok;
-    while (argc < 4 && nextToken(p, tok)) {
-      argv4[argc++] = (int)strtol(tok, nullptr, 0);
+    while (argc < (int)MAX_EXEC_ARGS && nextToken(p, tok)) {
+      argvN[argc++] = (int)strtol(tok, nullptr, 0);
     }
     int rv;
-    if (!execBlobGeneric(fn, argc, argv4, rv)) {
+    if (!execBlobGeneric(fn, argc, argvN, rv)) {
       Serial.println("exec failed");
     }
 
@@ -599,6 +617,7 @@ static void handleCommand(char* line) {
   }
 }
 
+// ================== Core0/Core1 entries ==================
 void setup() {
   Serial.begin(115200);
   while (!Serial) {}
