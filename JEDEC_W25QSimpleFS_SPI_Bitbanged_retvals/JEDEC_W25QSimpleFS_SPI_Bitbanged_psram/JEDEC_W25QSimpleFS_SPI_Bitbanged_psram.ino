@@ -13,68 +13,64 @@
   Notes:
    - FS_SECTOR_SIZE is a compile-time constant used for buffers.
    - PSRAM capacity should be set correctly when constructing PSRAMSimpleFS.
-   - Display wiring (WaveShare RP2040 Zero):
-       SCL -> GP15
-       SDA -> GP14
-       RST -> GP26
-       DC  -> GP27
-       CS  -> GP28
-       VCC -> 3V3, GND -> GND
 */
-#include <Arduino.h>
+#define CONSOLE_TFT_ENABLE
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include "ConsolePrint.h"
 #include "W25QSimpleFS.h"
 #include "W25QBitbang.h"
 #include "PSRAMBitbang.h"
 #include "PSRAMSimpleFS.h"
+#include "PSRAMMulti.h"
 #include "blob_mailbox_config.h"
-#include "blob_add2.h"
-#define FILE_ADD2 "add2"
 #include "blob_ret42.h"
 #define FILE_RET42 "ret42"
-#include "blob_square.h"
-#define FILE_SQUARE "square"
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
-#include "blob_uart_rx_to_mailbox.h"
-#define FILE_RX "rxmb"
-#include "blob_mcp4921_bb_wave.h"
-#define FILE_WAVE "wave"
 // Adafruit ST7789 TFT library
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
-#include <stdarg.h>
+
+static ConsolePrint Console;
 
 // Static buffer-related compile-time constant (used previously as fs.SECTOR_SIZE)
 #define FS_SECTOR_SIZE 4096
 
 // ========== bitbang pin definitions (flash) ==========
-const uint8_t PIN_FLASH_MISO = 0;  // GP0
-const uint8_t PIN_FLASH_CS = 1;    // GP1
-const uint8_t PIN_FLASH_SCK = 2;   // GP2
-const uint8_t PIN_FLASH_MOSI = 3;  // GP3
+const uint8_t PIN_FLASH_MISO = 11;  // GP12
+const uint8_t PIN_FLASH_CS = 28;    // GP13
+const uint8_t PIN_FLASH_SCK = 10;   // GP14
+const uint8_t PIN_FLASH_MOSI = 12;  // GP15
 
 // ========== bitbang pin definitions (psram) ==========
 const bool PSRAM_ENABLE_QPI = false;
 const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // 3 is a safe slow default
-const uint8_t PIN_PSRAM_CS = 9;
-const uint8_t PIN_PSRAM_MISO = 12;
-const uint8_t PIN_PSRAM_MOSI = 11;
+const uint8_t PIN_PSRAM_MISO = 11;
+const uint8_t PIN_PSRAM_MOSI = 12;
 const uint8_t PIN_PSRAM_SCK = 10;
-const uint8_t PIN_PSRAM_IO2 = 13;  // only used if QPI enabled
-const uint8_t PIN_PSRAM_IO3 = 14;  // only used if QPI enabled
+//const uint8_t PIN_PSRAM_IO2 = ;  // only used if QPI enabled
+//const uint8_t PIN_PSRAM_IO3 = ;  // only used if QPI enabled
+const uint8_t PIN_PSRAM_CS0 = 29;
+const uint8_t PIN_PSRAM_CS1 = 9;
+const uint8_t PIN_PSRAM_CS2 = 8;
+const uint8_t PIN_PSRAM_CS3 = 7;
 
 // ========== TFT display pins (SPI via Adafruit ST7789) ==========
 // Wiring for GMT020-02 2.0" TFT SPI on WaveShare RP2040 Zero:
-//   SCL -> GP15
-//   SDA -> GP14
-//   RST -> GP26
-//   DC  -> GP27
-//   CS  -> GP28
-const uint8_t PIN_TFT_CS = 28;
-const uint8_t PIN_TFT_DC = 27;
-const uint8_t PIN_TFT_RST = 26;
-const uint8_t PIN_TFT_SCK = 15;   // SCL
-const uint8_t PIN_TFT_MOSI = 14;  // SDA
+//   SCL -> GP6
+//   SDA -> GP7
+//   RST -> GP3
+//   DC  -> GP2
+//   CS  -> GP5
+//   NC  -> GP4
+const uint8_t PIN_TFT_SCK = 10;   // SCL pin
+const uint8_t PIN_TFT_MOSI = 12;  // SDA pin
+const uint8_t PIN_TFT_RST = 14;   // RST pin
+const uint8_t PIN_TFT_DC = 15;    // DC pin
+const uint8_t PIN_TFT_CS = 7;     // CS pin
+const uint8_t PIN_TFT_MISO = 11;  // (unused)
 
 // ===== TFT state =====
 static bool tft_ready = false;
@@ -89,9 +85,7 @@ static uint16_t tft_console_fg = 0xFFFF;  // white
 static uint16_t tft_console_bg = 0x0000;  // black
 static uint8_t tft_console_textsize = 1;
 
-// Adafruit ST7789 instance (software SPI per user's wiring)
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+// Adafruit ST7789 instance
 static Adafruit_ST7789 tft = Adafruit_ST7789(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCK, PIN_TFT_RST);
 
 // Forward decls so findBlob can be placed earlier if needed
@@ -107,9 +101,13 @@ static StorageBackend g_storage = StorageBackend::Flash;
 // ======== Flash/PSRAM instances (needed before bindActiveFs) ========
 W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
 W25QSimpleFS fsFlash(flashBB);
-PSRAMBitbang psramBB(PIN_PSRAM_CS, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK);
+/*PSRAMBitbang psramBB(PIN_PSRAM_CS, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK);
 constexpr uint32_t PSRAM_CAPACITY_BYTES = 8UL * 1024UL * 1024UL;
-PSRAMSimpleFS fsPSRAM(psramBB, PSRAM_CAPACITY_BYTES);
+PSRAMSimpleFS fsPSRAM(psramBB, PSRAM_CAPACITY_BYTES);*/
+constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;                                                                                                    // Each chip capacity (bytes). Example: 8MB per chip.
+PSRAMAggregateDevice psramBB({ PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // Create the aggregate multi-chip device
+constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * 4;                                                                                                   // Total capacity is sum across chips:
+PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);                                                                                                         // Filesystem on top of the aggregate device
 
 // Dev/prod mode
 static bool g_dev_mode = true;
@@ -248,11 +246,7 @@ struct BlobReg {
 };
 static const BlobReg g_blobs[] = {
   { FILE_RET42, blob_ret42, blob_ret42_len },
-  { FILE_ADD2, blob_add2, blob_add2_len },
-  { FILE_SQUARE, blob_square, blob_square_len },
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
-  { FILE_RX, blob_uart_rx_to_mailbox, blob_uart_rx_to_mailbox_len },
-  { FILE_WAVE, blob_mcp4921_bb_wave, blob_mcp4921_bb_wave_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
 
@@ -301,8 +295,18 @@ static void tftConsoleWriteChar(char c) {
   tftConsoleAutoPageIfNeeded();
 }
 static void tftConsoleWrite(const char* s, size_t n) {
-  if (!tft_ready || !s || n == 0) return;
-  for (size_t i = 0; i < n; ++i) tftConsoleWriteChar(s[i]);
+  if (!tft_ready || !s || !n) return;
+  tft.startWrite();
+  while (n--) {
+    char c = *s++;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      tft.println();
+    } else {
+      tft.write((uint8_t)c);  // avoids per-call SPI begin/end
+    }
+  }
+  tft.endWrite();
 }
 static void tftConsoleWriteStr(const char* s) {
   if (!tft_ready || !s) return;
@@ -381,71 +385,6 @@ static bool tftDrawRGB565FromFS(const char* fname, uint16_t x, uint16_t y, uint1
   tft.endWrite();
   return true;
 }
-
-// ============ Mirrored Console (Serial + TFT) ============
-class ConsolePrint : public Print {
-public:
-  // Call after Serial.begin and TFT optional init
-  void begin() {}
-
-  // printf-style
-  int printf(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    int ret = vprintf_impl(fmt, ap);
-    va_end(ap);
-    return ret;
-  }
-
-  // Print base class will route to this write()
-  virtual size_t write(uint8_t b) override {
-    // write to Serial
-    size_t s = Serial.write(b);
-    // mirror to TFT console
-    tftConsoleWrite((const char*)&b, 1);
-    return s;
-  }
-
-  virtual size_t write(const uint8_t* buffer, size_t size) override {
-    if (!buffer || !size) return 0;
-    size_t s = Serial.write(buffer, size);
-    tftConsoleWrite((const char*)buffer, size);
-    return s;
-  }
-
-private:
-  int vprintf_impl(const char* fmt, va_list ap) {
-    if (!fmt) return 0;
-    // Use a reasonably large buffer; will chunk if needed
-    char buf[256];
-    int total = 0;
-    va_list aq;
-    va_copy(aq, ap);
-    int n = vsnprintf(buf, sizeof(buf), fmt, aq);
-    va_end(aq);
-    if (n < 0) return n;
-    if ((size_t)n < sizeof(buf)) {
-      // Single shot
-      write((const uint8_t*)buf, (size_t)n);
-      total = n;
-    } else {
-      // Allocate dynamic buffer for long lines
-      char* big = (char*)malloc(n + 1);
-      if (!big) {
-        // fallback: truncated
-        write((const uint8_t*)buf, sizeof(buf) - 1);
-        total = (int)(sizeof(buf) - 1);
-      } else {
-        vsnprintf(big, n + 1, fmt, ap);  // reuse original ap
-        write((const uint8_t*)big, (size_t)n);
-        total = n;
-        free(big);
-      }
-    }
-    return total;
-  }
-};
-static ConsolePrint Console;
 
 // ===== helpers using Console =====
 static void printHexByte(uint8_t b) {
@@ -766,11 +705,7 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
 static void autogenBlobWrites() {
   bool allOk = true;
   allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
-  allOk &= ensureBlobIfMissing(FILE_ADD2, blob_add2, blob_add2_len);
-  allOk &= ensureBlobIfMissing(FILE_SQUARE, blob_square, blob_square_len);
   allOk &= ensureBlobIfMissing(FILE_PWMC, blob_pwmc, blob_pwmc_len);
-  allOk &= ensureBlobIfMissing(FILE_RX, blob_uart_rx_to_mailbox, blob_uart_rx_to_mailbox_len);
-  allOk &= ensureBlobIfMissing(FILE_WAVE, blob_mcp4921_bb_wave, blob_mcp4921_bb_wave_len);
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
@@ -1362,10 +1297,19 @@ static void handleCommand(char* line) {
 // ========== Setup and main loop ==========
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {}
-  delay(5);
+  while (!Serial) { delay(2000); }
+  delay(500);
 
   // Initialize mirrored console
+  // If you need non-default SPI or pins, configure your SPI object first
+  // Example RP2040 (SPI1):
+  // SPI1.setRX(12); SPI1.setSCK(14); SPI1.setTX(15); SPI1.begin();
+
+  // Attach TFT (SPI bus, CS, DC, RST, width, height, rotation, invert)
+  // Replace SPI with SPI1 if using a secondary bus, and pins with your wiring.
+  Console.tftAttach(&SPI, /*CS=*/4, /*DC=*/2, /*RST=*/3, /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true);
+  Console.tftSetTextSize(1);
+  Console.tftSetColors(0xFFFF, 0x0000);  // white on black
   Console.begin();
 
   // Initialize flash and PSRAM bitbang drivers
@@ -1386,15 +1330,27 @@ void setup() {
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
 
-  bool ok = tftInit(tft_rot);
-  if (ok) {
-    Console.print("TFT init OK, rot=");
-    Console.print((int)tft_rot);
-    Console.print(" size=");
-    Console.print((int)tft_w);
-    Console.print("x");
-    Console.println((int)tft_h);
-  } else Console.println("TFT init failed");
+  /*SPI.setRX(0);  // (RP2040 ZERO pin 0, 4)
+  SPI.setCS(1);  // (RP2040 ZERO pin 1, 5, 17)
+  SPI.setSCK(2); // (RP2040 ZERO pin 2, 6, 18)
+  SPI.setTX(3);  // (RP2040 ZERO pin 3, 7, 19)
+  SPI.begin();
+
+  SPI1.setRX(12);  // (RP2040 ZERO pin 8, 12)
+  SPI1.setCS(13);  // (RP2040 ZERO pin 9, 13)
+  SPI1.setSCK(14); // (RP2040 ZERO pin 10, 14)
+  SPI1.setTX(15);  // (RP2040 ZERO pin 11, 15)
+  SPI1.begin();*/
+
+  tft.init(tft_w, tft_h);
+  tft.setRotation(tft_rot & 3);
+  // Bump SPI to 62.5MHz (safe on RP2040); try 75-80MHz if stable
+  tft.setSPISpeed(112500000);
+  tft.invertDisplay(true);
+  tft_ready = true;
+  tft_w = tft.width();
+  tft_h = tft.height();
+  tftConsoleBegin();
 
   Console.println("System ready. Type 'help'.");
   Console.print("> ");

@@ -1,22 +1,264 @@
 /*
-  PSRAMSimpleFS.h - simple directory+data FS stored in PSRAM (header-only)
-  Updated:
-   - Driver-agnostic: works with PSRAMBitbang or any driver providing:
-       void readData03(uint32_t addr, uint8_t* buf, uint32_t len);
-       void writeData02(uint32_t addr, const uint8_t* buf, uint32_t len);
-   - Backward-compatible ctor for PSRAMBitbang&.
-   - API unchanged.
+  PSRAMMulti.h - Single-header multi-chip PSRAM aggregator + generic FS
+  - Aggregates up to PSRAMMULTI_MAX_CHIPS identical PSRAM devices sharing MISO/MOSI/SCK
+    with unique CS pins into one linear address space.
+  - Reuses PSRAMBitbang's bit-banged SPI engine (transfer and bus timing), but manages CS per bank.
+  - Includes a generic FS (PSRAMSimpleFS_Generic<Driver>) compatible with any Driver that
+    implements:
+       bool readData03(uint32_t addr, uint8_t* buf, size_t len);
+       bool writeData02(uint32_t addr, const uint8_t* buf, size_t len, bool needsWriteEnable=false);
+       uint32_t capacity() const;
 */
-#ifndef PSRAMSIMPLEFS_H
-#define PSRAMSIMPLEFS_H
 
+#ifndef PSRAMMULTI_H
+#define PSRAMMULTI_H
+
+#include <Arduino.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 
-// Keep Bitbang include for backward compatibility. If you don't use it, it's harmless.
 #include "PSRAMBitbang.h"
 
-class PSRAMSimpleFS {
+#ifndef PSRAMMULTI_MAX_CHIPS
+#define PSRAMMULTI_MAX_CHIPS 8
+#endif
+
+class PSRAMAggregateDevice {
+public:
+  // Construct with bus pins and per-chip capacity (bytes).
+  // Add chips later with addChip(csPin) before begin().
+  PSRAMAggregateDevice(uint8_t pin_miso,
+                       uint8_t pin_mosi,
+                       uint8_t pin_sck,
+                       uint32_t perChipCapacityBytes)
+    : _bus(/*dummy CS not used*/ 0xFF, pin_miso, pin_mosi, pin_sck),
+      _pinMISO(pin_miso),
+      _pinMOSI(pin_mosi),
+      _pinSCK(pin_sck),
+      _chipCount(0),
+      _perChipCapacity(perChipCapacityBytes),
+      _halfCycleDelayUs(1),
+      _useQuad(false),
+      _io2(255), _io3(255) {}
+
+  // Construct with an array of CS pins.
+  PSRAMAggregateDevice(const uint8_t* csPins, size_t count,
+                       uint8_t pin_miso,
+                       uint8_t pin_mosi,
+                       uint8_t pin_sck,
+                       uint32_t perChipCapacityBytes)
+    : PSRAMAggregateDevice(pin_miso, pin_mosi, pin_sck, perChipCapacityBytes) {
+    for (size_t i = 0; i < count; ++i) addChip(csPins[i]);
+  }
+
+#if __cplusplus >= 201103L
+  // Construct with initializer_list of CS pins.
+  PSRAMAggregateDevice(std::initializer_list<uint8_t> csList,
+                       uint8_t pin_miso,
+                       uint8_t pin_mosi,
+                       uint8_t pin_sck,
+                       uint32_t perChipCapacityBytes)
+    : PSRAMAggregateDevice(pin_miso, pin_mosi, pin_sck, perChipCapacityBytes) {
+    for (uint8_t cs : csList) addChip(cs);
+  }
+#endif
+
+  // Add a chip by CS pin; call before begin().
+  bool addChip(uint8_t csPin) {
+    if (_chipCount >= PSRAMMULTI_MAX_CHIPS) return false;
+    _csPins[_chipCount++] = csPin;
+    return true;
+  }
+
+  void begin() {
+    // Configure shared bus pins (we do not call _bus.begin() to avoid touching a dummy CS)
+    pinMode(_pinMOSI, OUTPUT);
+    pinMode(_pinSCK, OUTPUT);
+    pinMode(_pinMISO, INPUT);
+    digitalWrite(_pinSCK, LOW);
+    digitalWrite(_pinMOSI, LOW);
+
+    // Configure per-chip CS lines
+    for (uint8_t i = 0; i < _chipCount; ++i) {
+      pinMode(_csPins[i], OUTPUT);
+      digitalWrite(_csPins[i], HIGH);
+    }
+
+    // Timing and optional quad config pass-through to the engine (IO2/IO3 INPUT is fine here)
+    _bus.setClockDelayUs(_halfCycleDelayUs);
+    if (_io2 != 255 || _io3 != 255) {
+      _bus.setExtraDataPins(_io2, _io3);
+      _bus.setModeQuad(_useQuad);
+    }
+  }
+
+  void setExtraDataPins(uint8_t io2, uint8_t io3) {
+    _io2 = io2;
+    _io3 = io3;
+  }
+
+  void setModeQuad(bool enable) {
+    _useQuad = enable;
+    _bus.setModeQuad(enable);
+  }
+
+  void setClockDelayUs(uint8_t halfCycleDelayUs) {
+    _halfCycleDelayUs = halfCycleDelayUs;
+    _bus.setClockDelayUs(halfCycleDelayUs);
+  }
+
+  // Total linear capacity across all banks
+  uint32_t capacity() const {
+    return _perChipCapacity * _chipCount;
+  }
+
+  uint32_t perChipCapacity() const {
+    return _perChipCapacity;
+  }
+  uint8_t chipCount() const {
+    return _chipCount;
+  }
+
+  // Read JEDEC for a specific bank (0..chipCount-1)
+  void readJEDEC(uint8_t bank, uint8_t* out, size_t len) {
+    if (bank >= _chipCount || !out || len == 0) return;
+    uint8_t cmd = PSRAM_CMD_READ_JEDEC;
+    csLow(bank);
+    _bus.transfer(cmd);
+    if (len) _bus.transfer(nullptr, out, len);
+    csHigh(bank);
+  }
+
+  // Flat address space read (0x03)
+  bool readData03(uint32_t addr, uint8_t* buf, size_t len) {
+    if (len == 0) return true;
+    if (!buf) return false;
+    if (_chipCount == 0) return false;
+    uint32_t total = capacity();
+    if (addr >= total) return false;
+
+    size_t remaining = len;
+    uint32_t cur = addr;
+    uint8_t* p = buf;
+
+    while (remaining > 0) {
+      uint8_t bank;
+      uint32_t off;
+      size_t chunk;
+      if (!mapAddress(cur, remaining, bank, off, chunk)) return false;
+      if (!bankRead(bank, off, p, chunk)) return false;
+      cur += chunk;
+      p += chunk;
+      remaining -= chunk;
+    }
+    return true;
+  }
+
+  // Flat address space write (0x02)
+  bool writeData02(uint32_t addr, const uint8_t* buf, size_t len, bool needsWriteEnable = false) {
+    if (len == 0) return true;
+    if (!buf) return false;
+    if (_chipCount == 0) return false;
+    uint32_t total = capacity();
+    if (addr >= total) return false;
+
+    size_t remaining = len;
+    uint32_t cur = addr;
+    const uint8_t* p = buf;
+
+    while (remaining > 0) {
+      uint8_t bank;
+      uint32_t off;
+      size_t chunk;
+      if (!mapAddress(cur, remaining, bank, off, chunk)) return false;
+      if (!bankWrite(bank, off, p, chunk, needsWriteEnable)) return false;
+      cur += chunk;
+      p += chunk;
+      remaining -= chunk;
+    }
+    return true;
+  }
+
+  // Optional helper: raw MISO scan on a bank
+  void rawMisoScan(uint8_t bank, uint8_t* out, size_t len) {
+    if (bank >= _chipCount || !out || len == 0) return;
+    csLow(bank);
+    for (size_t i = 0; i < len; ++i) out[i] = _bus.transfer(0x00);
+    csHigh(bank);
+  }
+
+private:
+  inline void csLow(uint8_t bank) {
+    digitalWrite(_csPins[bank], LOW);
+  }
+  inline void csHigh(uint8_t bank) {
+    digitalWrite(_csPins[bank], HIGH);
+  }
+
+  bool mapAddress(uint32_t addr, size_t reqLen,
+                  uint8_t& bankOut, uint32_t& offOut, size_t& chunkOut) const {
+    if (_perChipCapacity == 0) return false;
+    uint8_t bank = (uint8_t)(addr / _perChipCapacity);
+    if (bank >= _chipCount) return false;
+    uint32_t off = addr - ((uint32_t)bank * _perChipCapacity);
+    uint32_t space = _perChipCapacity - off;
+    size_t chunk = (reqLen < (size_t)space) ? reqLen : (size_t)space;
+    bankOut = bank;
+    offOut = off;
+    chunkOut = chunk;
+    return true;
+  }
+
+  bool bankRead(uint8_t bank, uint32_t off, uint8_t* buf, size_t len) {
+    uint8_t cmd[4];
+    cmd[0] = PSRAM_CMD_READ_03;
+    cmd[1] = (uint8_t)((off >> 16) & 0xFF);
+    cmd[2] = (uint8_t)((off >> 8) & 0xFF);
+    cmd[3] = (uint8_t)(off & 0xFF);
+    csLow(bank);
+    _bus.transfer(cmd, nullptr, 4);
+    _bus.transfer(nullptr, buf, len);
+    csHigh(bank);
+    return true;
+  }
+
+  bool bankWrite(uint8_t bank, uint32_t off, const uint8_t* buf, size_t len, bool needsWriteEnable) {
+    if (!buf || len == 0) return true;
+    if (needsWriteEnable) {
+      uint8_t we = PSRAM_CMD_WRITE_ENABLE;
+      csLow(bank);
+      _bus.transfer(we);
+      csHigh(bank);
+    }
+    uint8_t cmd[4];
+    cmd[0] = PSRAM_CMD_WRITE_02;
+    cmd[1] = (uint8_t)((off >> 16) & 0xFF);
+    cmd[2] = (uint8_t)((off >> 8) & 0xFF);
+    cmd[3] = (uint8_t)(off & 0xFF);
+    csLow(bank);
+    _bus.transfer(cmd, nullptr, 4);
+    _bus.transfer(buf, nullptr, len);
+    csHigh(bank);
+    return true;
+  }
+
+  // Members: order matches initialization to avoid -Wreorder
+  PSRAMBitbang _bus;
+  uint8_t _pinMISO, _pinMOSI, _pinSCK;
+  uint8_t _csPins[PSRAMMULTI_MAX_CHIPS];
+  uint8_t _chipCount;
+  uint32_t _perChipCapacity;
+  uint8_t _halfCycleDelayUs;
+  bool _useQuad;
+  uint8_t _io2, _io3;
+};
+
+// -------------------------
+// Generic, header-only FS
+// -------------------------
+template<typename Driver>
+class PSRAMSimpleFS_Generic {
 public:
   static const uint32_t DIR_START = 0x000000UL;
   static const uint32_t DIR_SIZE = 64UL * 1024UL;
@@ -27,8 +269,8 @@ public:
   static const size_t MAX_NAME = 32;
 
   enum class WriteMode : uint8_t {
-    ReplaceIfExists,
-    FailIfExists
+    ReplaceIfExists = 0,
+    FailIfExists = 1
   };
 
   struct FileInfo {
@@ -41,50 +283,34 @@ public:
     bool slotSafe;
   };
 
-  // Backward-compatible ctor for PSRAMBitbang
-  PSRAMSimpleFS(PSRAMBitbang& psram, uint32_t capacityBytes)
-    : _capacity(capacityBytes) {
-    bind<PSRAMBitbang>(psram);
+  PSRAMSimpleFS_Generic(Driver& dev, uint32_t capacityBytes)
+    : _dev(dev), _capacity(capacityBytes) {
     _fileCount = 0;
     _dirWriteOffset = 0;
     _nextSeq = 1;
     _dataHead = DATA_START;
   }
 
-  // Generic ctor: accept any driver D with readData03/writeData02
-  template<typename D>
-  PSRAMSimpleFS(D& psram, uint32_t capacityBytes)
-    : _capacity(capacityBytes) {
-    bind<D>(psram);
-    _fileCount = 0;
-    _dirWriteOffset = 0;
-    _nextSeq = 1;
-    _dataHead = DATA_START;
-  }
-
-  // Mount. If autoFormatIfEmpty true, initialize dir region if appears empty.
   bool mount(bool autoFormatIfEmpty = true) {
     if (_capacity == 0 || _capacity <= DATA_START) return false;
     _fileCount = 0;
     _dirWriteOffset = 0;
     _nextSeq = 1;
     _dataHead = DATA_START;
-
     uint32_t maxEnd = DATA_START;
     uint32_t maxSeq = 0;
     bool sawAny = false;
     uint32_t entries = DIR_SIZE / ENTRY_SIZE;
     uint8_t buf[ENTRY_SIZE];
-
     for (uint32_t i = 0; i < entries; ++i) {
       uint32_t addr = DIR_START + i * ENTRY_SIZE;
-      _ops.read03(_ops.ctx, addr, buf, ENTRY_SIZE);
+      _dev.readData03(addr, buf, ENTRY_SIZE);
       if (isAllFF(buf, ENTRY_SIZE)) {
         _dirWriteOffset = i * ENTRY_SIZE;
         break;
       }
       sawAny = true;
-      if (buf[0] != 0x57 || buf[1] != 0x46) continue;  // MAGIC 'W' 'F'
+      if (buf[0] != 0x57 || buf[1] != 0x46) continue;  // 'W' 'F'
       uint8_t flags = buf[2];
       uint8_t nameLen = buf[3];
       if (nameLen == 0 || nameLen > MAX_NAME) continue;
@@ -118,7 +344,6 @@ public:
       }
       if (i == entries - 1) _dirWriteOffset = DIR_SIZE;
     }
-
     if (!sawAny) {
       _dirWriteOffset = 0;
       if (autoFormatIfEmpty) {
@@ -133,13 +358,12 @@ public:
   }
 
   bool format() {
-    // Fill directory region with 0xFF in page-chunk writes
     const uint32_t PAGE_CHUNK = 256;
     uint8_t tmp[PAGE_CHUNK];
     memset(tmp, 0xFF, PAGE_CHUNK);
     for (uint32_t i = 0; i < DIR_SIZE; i += PAGE_CHUNK) {
       uint32_t chunk = (i + PAGE_CHUNK <= DIR_SIZE) ? PAGE_CHUNK : (DIR_SIZE - i);
-      _ops.write02(_ops.ctx, DIR_START + i, tmp, chunk);
+      _dev.writeData02(DIR_START + i, tmp, chunk);
     }
     _fileCount = 0;
     _dirWriteOffset = 0;
@@ -157,7 +381,7 @@ public:
     uint32_t pos = 0;
     while (pos < _capacity) {
       uint32_t n = (pos + CHUNK <= _capacity) ? CHUNK : (_capacity - pos);
-      _ops.write02(_ops.ctx, pos, tmp, n);
+      _dev.writeData02(pos, tmp, n);
       pos += n;
     }
     _fileCount = 0;
@@ -167,25 +391,34 @@ public:
     return true;
   }
 
-  // Append-only write (allocates new space at tail)
+  // Primary API with our enum
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, WriteMode mode = WriteMode::ReplaceIfExists) {
     if (!validName(name) || size > 0xFFFFFFUL) return false;
     if (_dirWriteOffset + ENTRY_SIZE > DIR_SIZE) return false;
     int idxExisting = findIndexByName(name);
     bool exists = (idxExisting >= 0 && !_files[idxExisting].deleted);
     if (exists && mode == WriteMode::FailIfExists) return false;
-
     uint32_t start = _dataHead;
     if (start < DATA_START) start = DATA_START;
     if (start + size > _capacity) return false;
-
-    if (size > 0) _ops.write02(_ops.ctx, start, data, size);
+    if (size > 0) _dev.writeData02(start, data, size);
     if (!appendDirEntry(0x00, name, start, size)) return false;
-
     upsertFileIndex(name, start, size, false);
     _dataHead = start + size;
     computeCapacities(_dataHead);
     return true;
+  }
+
+  // Compatibility overload: accept int mode (0=ReplaceIfExists, 1=FailIfExists)
+  bool writeFile(const char* name, const uint8_t* data, uint32_t size, int modeInt) {
+    WriteMode m = (modeInt == (int)WriteMode::FailIfExists) ? WriteMode::FailIfExists : WriteMode::ReplaceIfExists;
+    return writeFile(name, data, size, m);
+  }
+
+  // Compatibility overload: accept any enum-like type (e.g., PSRAMSimpleFS::WriteMode)
+  template<typename ModeT>
+  bool writeFile(const char* name, const uint8_t* data, uint32_t size, ModeT modeOther) {
+    return writeFile(name, data, size, (int)modeOther);
   }
 
   bool createFileSlot(const char* name, uint32_t reserveBytes, const uint8_t* initialData = nullptr, uint32_t initialSize = 0) {
@@ -193,25 +426,21 @@ public:
     if (_dirWriteOffset + ENTRY_SIZE > DIR_SIZE) return false;
     if (initialSize > reserveBytes) return false;
     if (exists(name)) return false;
-
     uint32_t cap = alignUp((reserveBytes < 1u ? 1u : reserveBytes), SECTOR_SIZE);
     uint32_t start = alignUp(_dataHead, SECTOR_SIZE);
     if (start < DATA_START) start = DATA_START;
     if (start + cap > _capacity) return false;
-
-    // Pre-fill slot with 0xFF (PSRAM overwrite-safe, used to mark "erased")
+    uint32_t p = start;
     const uint32_t PAGE_CHUNK = 256;
     uint8_t tmp[PAGE_CHUNK];
     memset(tmp, 0xFF, PAGE_CHUNK);
-    for (uint32_t p = start; p < start + cap;) {
-      uint32_t n = (start + cap - p > PAGE_CHUNK) ? PAGE_CHUNK : (start + cap - p);
-      _ops.write02(_ops.ctx, p, tmp, n);
+    while (p < start + cap) {
+      uint32_t n = min<uint32_t>(PAGE_CHUNK, start + cap - p);
+      _dev.writeData02(p, tmp, n);
       p += n;
     }
-
-    if (initialSize > 0) _ops.write02(_ops.ctx, start, initialData, initialSize);
+    if (initialSize > 0) _dev.writeData02(start, initialData, initialSize);
     if (!appendDirEntry(0x00, name, start, initialSize)) return false;
-
     upsertFileIndex(name, start, initialSize, false);
     _dataHead = start + cap;
     computeCapacities(_dataHead);
@@ -223,9 +452,8 @@ public:
     if (idx < 0 || _files[idx].deleted) return false;
     FileInfo& fi = _files[idx];
     uint32_t cap = (fi.capEnd > fi.addr) ? (fi.capEnd - fi.addr) : 0;
-
     if (fi.slotSafe && cap >= size) {
-      if (size > 0) _ops.write02(_ops.ctx, fi.addr, data, size);
+      if (size > 0) _dev.writeData02(fi.addr, data, size);
       if (!appendDirEntry(0x00, name, fi.addr, size)) return false;
       fi.size = size;
       return true;
@@ -240,7 +468,7 @@ public:
     uint32_t n = _files[idx].size;
     if (bufSize < n) n = bufSize;
     if (n == 0) return 0;
-    _ops.read03(_ops.ctx, _files[idx].addr, buf, n);
+    _dev.readData03(_files[idx].addr, buf, n);
     return n;
   }
 
@@ -251,7 +479,7 @@ public:
     uint32_t maxLen = _files[idx].size - offset;
     if (len > maxLen) len = maxLen;
     if (len == 0) return 0;
-    _ops.read03(_ops.ctx, _files[idx].addr + offset, buf, len);
+    _dev.readData03(_files[idx].addr + offset, buf, len);
     return len;
   }
 
@@ -276,7 +504,6 @@ public:
     return (idx >= 0 && !_files[idx].deleted);
   }
 
-  // New: delete a file by appending a tombstone directory entry
   bool deleteFile(const char* name) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return false;
@@ -289,13 +516,13 @@ public:
   }
 
   void listFilesToSerial() {
-    Serial.println("Files (PSRAM):");
+    Serial.println("Files (PSRAM Multi):");
     for (size_t i = 0; i < _fileCount; ++i) {
       if (_files[i].deleted) continue;
-      Serial.printf("- %s  \tsize=%d  \taddr=0x", _files[i].name, _files[i].size);
+      Serial.printf("- %s  \tsize=%u  \taddr=0x", _files[i].name, (unsigned)_files[i].size);
       Serial.print(_files[i].addr, HEX);
       uint32_t cap = (_files[i].capEnd > _files[i].addr) ? (_files[i].capEnd - _files[i].addr) : 0;
-      Serial.printf("  \tcap=%d  \tslotSafe=%s\n", cap, _files[i].slotSafe ? "Y" : "N");
+      Serial.printf("  \tcap=%u  \tslotSafe=%s\n", (unsigned)cap, _files[i].slotSafe ? "Y" : "N");
     }
   }
 
@@ -305,39 +532,21 @@ public:
       if (!_files[i].deleted) ++n;
     return n;
   }
+
   uint32_t nextDataAddr() const {
     return _dataHead;
   }
+
   uint32_t capacity() const {
     return _capacity;
   }
+
   uint32_t dataRegionStart() const {
     return DATA_START;
   }
 
 private:
-  // Driver call trampoline
-  struct PsOps {
-    void* ctx = nullptr;
-    void (*read03)(void*, uint32_t, uint8_t*, uint32_t) = nullptr;
-    void (*write02)(void*, uint32_t, const uint8_t*, uint32_t) = nullptr;
-  } _ops;
-
-  template<typename D>
-  static void readThunk(void* ctx, uint32_t addr, uint8_t* buf, uint32_t len) {
-    static_cast<D*>(ctx)->readData03(addr, buf, len);
-  }
-  template<typename D>
-  static void writeThunk(void* ctx, uint32_t addr, const uint8_t* buf, uint32_t len) {
-    static_cast<D*>(ctx)->writeData02(addr, buf, len);
-  }
-  template<typename D>
-  void bind(D& d) {
-    _ops.ctx = &d;
-    _ops.read03 = &readThunk<D>;
-    _ops.write02 = &writeThunk<D>;
-  }
-
+  Driver& _dev;
   uint32_t _capacity;
   static const size_t MAX_FILES = 64;
   FileInfo _files[MAX_FILES];
@@ -406,7 +615,7 @@ private:
     wr32(&rec[20], addr);
     wr32(&rec[24], size);
     wr32(&rec[28], _nextSeq++);
-    _ops.write02(_ops.ctx, DIR_START + _dirWriteOffset, rec, ENTRY_SIZE);
+    _dev.writeData02(DIR_START + _dirWriteOffset, rec, ENTRY_SIZE);
     _dirWriteOffset += ENTRY_SIZE;
     return true;
   }
@@ -435,4 +644,7 @@ private:
   }
 };
 
-#endif  // PSRAMSIMPLEFS_H
+// Convenience alias
+using PSRAMSimpleFS_Multi = PSRAMSimpleFS_Generic<PSRAMAggregateDevice>;
+
+#endif  // PSRAMMULTI_H

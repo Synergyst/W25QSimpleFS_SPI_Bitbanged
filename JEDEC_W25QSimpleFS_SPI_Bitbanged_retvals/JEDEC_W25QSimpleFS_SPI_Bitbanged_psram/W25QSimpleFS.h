@@ -308,13 +308,13 @@ public:
   }
 
   void listFilesToSerial() {
-    Serial.println("Files:");
+    Serial.println("Files (FLASH):");
     for (size_t i = 0; i < _fileCount; ++i) {
       if (_files[i].deleted) continue;
-      Serial.printf("- %s  \tsize=%d  \taddr=0x", _files[i].name, _files[i].size);
+      Serial.printf("- %s  \tsize=%" PRIu32 "  \taddr=0x", _files[i].name, _files[i].size);
       Serial.print(_files[i].addr, HEX);
       uint32_t cap = (_files[i].capEnd > _files[i].addr) ? (_files[i].capEnd - _files[i].addr) : 0;
-      Serial.printf("  \tcap=%d  \tslotSafe=%s\n", cap, _files[i].slotSafe ? "Y" : "N");
+      Serial.printf("  \tcap=%" PRIu32 "  \tslotSafe=%s\n", cap, _files[i].slotSafe ? "Y" : "N");
     }
   }
 
