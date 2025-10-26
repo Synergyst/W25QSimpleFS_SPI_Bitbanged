@@ -188,6 +188,56 @@ public:
     csHigh(bank);
   }
 
+  // Paste inside PSRAMAggregateDevice (public:)
+  bool printCapacityReport(Stream& out = Serial) {
+    out.println(F("PSRAM capacity report:"));
+    out.print(F("  Banks: "));
+    out.println(_chipCount);
+    out.print(F("  Per-chip: "));
+    out.print(_perChipCapacity);
+    out.print(F(" bytes ("));
+    out.print(_perChipCapacity / (1024UL * 1024UL));
+    out.println(F(" MB)"));
+    const uint32_t total = capacity();
+    out.print(F("  Total: "));
+    out.print(total);
+    out.print(F(" bytes ("));
+    out.print(total / (1024UL * 1024UL));
+    out.println(F(" MB)"));
+
+    uint8_t okCount = 0;
+    for (uint8_t i = 0; i < _chipCount; ++i) {
+      uint8_t id[6] = { 0 };
+      readJEDEC(i, id, sizeof(id));
+      bool allFF = true, all00 = true;
+      for (size_t k = 0; k < sizeof(id); ++k) {
+        if (id[k] != 0xFF) allFF = false;
+        if (id[k] != 0x00) all00 = false;
+      }
+      const bool valid = !(allFF || all00);
+      if (valid) ++okCount;
+
+      out.print(F("  Bank "));
+      out.print(i);
+      out.print(F(" (CS="));
+      out.print(_csPins[i]);
+      out.print(F(") JEDEC: "));
+      for (size_t k = 0; k < sizeof(id); ++k) {
+        if (k) out.print(' ');
+        if (id[k] < 16) out.print('0');
+        out.print(id[k], HEX);
+      }
+      out.println(valid ? F("  [OK]") : F("  [NO RESP]"));
+    }
+
+    out.print(F("Probe result: "));
+    out.print(okCount);
+    out.print(F("/"));
+    out.print(_chipCount);
+    out.println(F(" banks responded"));
+    return (okCount == _chipCount);
+  }
+
 private:
   inline void csLow(uint8_t bank) {
     digitalWrite(_csPins[bank], LOW);

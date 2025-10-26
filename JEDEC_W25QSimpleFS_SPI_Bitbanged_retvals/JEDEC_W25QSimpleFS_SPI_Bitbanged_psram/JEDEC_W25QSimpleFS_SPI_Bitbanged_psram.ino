@@ -15,8 +15,6 @@
    - PSRAM capacity should be set correctly when constructing PSRAMSimpleFS.
 */
 #define CONSOLE_TFT_ENABLE
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
 #include "ConsolePrint.h"
 #include "W25QSimpleFS.h"
 #include "W25QBitbang.h"
@@ -28,22 +26,15 @@
 #define FILE_RET42 "ret42"
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
-// Adafruit ST7789 TFT library
-#include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
 
 static ConsolePrint Console;
-
 // Static buffer-related compile-time constant (used previously as fs.SECTOR_SIZE)
 #define FS_SECTOR_SIZE 4096
-
 // ========== bitbang pin definitions (flash) ==========
 const uint8_t PIN_FLASH_MISO = 11;  // GP12
 const uint8_t PIN_FLASH_CS = 28;    // GP13
 const uint8_t PIN_FLASH_SCK = 10;   // GP14
 const uint8_t PIN_FLASH_MOSI = 12;  // GP15
-
 // ========== bitbang pin definitions (psram) ==========
 const bool PSRAM_ENABLE_QPI = false;
 const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // 3 is a safe slow default
@@ -56,7 +47,6 @@ const uint8_t PIN_PSRAM_CS0 = 29;
 const uint8_t PIN_PSRAM_CS1 = 9;
 const uint8_t PIN_PSRAM_CS2 = 8;
 const uint8_t PIN_PSRAM_CS3 = 7;
-
 // ========== TFT display pins (SPI via Adafruit ST7789) ==========
 // Wiring for GMT020-02 2.0" TFT SPI on WaveShare RP2040 Zero:
 //   SCL -> GP6
@@ -71,33 +61,27 @@ const uint8_t PIN_TFT_RST = 14;   // RST pin
 const uint8_t PIN_TFT_DC = 15;    // DC pin
 const uint8_t PIN_TFT_CS = 7;     // CS pin
 const uint8_t PIN_TFT_MISO = 11;  // (unused)
-
 // ===== TFT state =====
 static bool tft_ready = false;
 static uint16_t tft_w = 240;
 static uint16_t tft_h = 320;
-static uint8_t tft_rot = 1;      // 0..3
-static uint16_t tft_xstart = 0;  // panel offsets if needed
-static uint16_t tft_ystart = 0;
-
+static uint8_t tft_rot = 1;  // 0..3
 // ----- Simple TFT text console mirroring for Serial output -----
 static uint16_t tft_console_fg = 0xFFFF;  // white
 static uint16_t tft_console_bg = 0x0000;  // black
 static uint8_t tft_console_textsize = 1;
-
 // Adafruit ST7789 instance
 static Adafruit_ST7789 tft = Adafruit_ST7789(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCK, PIN_TFT_RST);
-
 // Forward decls so findBlob can be placed earlier if needed
 struct BlobReg;
-
+// ---------- persistent block helpers (now operate on active FS) ----------
+const size_t PERSIST_LEN = 32;
 // Choose active storage at runtime
 enum class StorageBackend {
   Flash,
   PSRAM_BACKEND
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-
 // ======== Flash/PSRAM instances (needed before bindActiveFs) ========
 W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
 W25QSimpleFS fsFlash(flashBB);
@@ -108,10 +92,8 @@ constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;                  
 PSRAMAggregateDevice psramBB({ PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // Create the aggregate multi-chip device
 constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * 4;                                                                                                   // Total capacity is sum across chips:
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);                                                                                                         // Filesystem on top of the aggregate device
-
 // Dev/prod mode
 static bool g_dev_mode = true;
-
 // Active FS forwarding helpers (thin wrapper)
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -134,7 +116,6 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-
 // Helper to bind either flash or psram into activeFs at runtime
 static void bindActiveFs(StorageBackend backend) {
   if (backend == StorageBackend::Flash) {
@@ -203,7 +184,7 @@ static void bindActiveFs(StorageBackend backend) {
       return fsPSRAM.createFileSlot(n, r, d, s);
     };
     activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsPSRAM.writeFile(n, d, s, static_cast<PSRAMSimpleFS::WriteMode>(m));
+      return fsPSRAM.writeFile(n, d, s, m);  // generic FS accepts int
     };
     activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
       return fsPSRAM.writeFileInPlace(n, d, s, a);
@@ -237,7 +218,6 @@ static void bindActiveFs(StorageBackend backend) {
     };
   }
 }
-
 // ========== Blob registry from your original file ==========
 struct BlobReg {
   const char* id;
@@ -249,17 +229,6 @@ static const BlobReg g_blobs[] = {
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-
-// ===== TFT API (now using Adafruit_ST7789) =====
-static void tftSetAddrWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
-static bool tftInit(uint8_t rotation = 1);
-static void tftFillScreen(uint16_t c);
-static void tftFillRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c);
-static bool tftDrawRGB565FromFS(const char* fname, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
-static uint16_t color565(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
-
 // ==== TFT console helpers to mirror Serial output ====
 static void tftConsoleBegin() {
   if (!tft_ready) return;
@@ -274,128 +243,14 @@ static void tftConsoleClear() {
   tft.fillScreen(tft_console_bg);
   tft.setCursor(0, 0);
 }
-static void tftConsoleAutoPageIfNeeded() {
-  if (!tft_ready) return;
-  int16_t cy = tft.getCursorY();
-  int16_t ch = 8 * tft_console_textsize;  // default 7px font + 1px spacing
-  if (cy + ch > (int16_t)tft_h) {
-    // Simple page-clear when reaching bottom
-    tft.fillScreen(tft_console_bg);
-    tft.setCursor(0, 0);
-  }
-}
-static void tftConsoleWriteChar(char c) {
-  if (!tft_ready) return;
-  if (c == '\r') return;
-  if (c == '\n') {
-    tft.println();
-  } else {
-    tft.print(c);
-  }
-  tftConsoleAutoPageIfNeeded();
-}
-static void tftConsoleWrite(const char* s, size_t n) {
-  if (!tft_ready || !s || !n) return;
-  tft.startWrite();
-  while (n--) {
-    char c = *s++;
-    if (c == '\r') continue;
-    if (c == '\n') {
-      tft.println();
-    } else {
-      tft.write((uint8_t)c);  // avoids per-call SPI begin/end
-    }
-  }
-  tft.endWrite();
-}
-static void tftConsoleWriteStr(const char* s) {
-  if (!tft_ready || !s) return;
-  while (*s) {
-    tftConsoleWriteChar(*s++);
-  }
-}
-
-// Adafruit ST7789 init and primitives
-static bool tftInit(uint8_t rotation) {
-  // Init panel 240x320
-  tft.init(240, 320);
-  tft.setRotation(rotation & 3);
-  tft_rot = rotation & 3;
-  // If your panel needs color inversion similar to previous INVON, enable:
-  tft.invertDisplay(true);
-  // Update our tracking sizes to match rotation
-  tft_w = tft.width();
-  tft_h = tft.height();
-  tft_xstart = 0;
-  tft_ystart = 0;
-  tft_ready = true;
-  tftConsoleBegin();
-  return true;
-}
-static void tftSetAddrWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  // Adafruit_SPITFT provides setAddrWindow
-  tft.setAddrWindow(x + tft_xstart, y + tft_ystart, w, h);
-}
-static void tftFillScreen(uint16_t c) {
-  if (!tft_ready) return;
-  tft.fillScreen(c);
-}
-static void tftFillRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c) {
-  if (!tft_ready) return;
-  if (x >= tft_w || y >= tft_h) return;
-  if (x + w > tft_w) w = tft_w - x;
-  if (y + h > tft_h) h = tft_h - y;
-  tft.fillRect(x, y, w, h, c);
-}
-static bool tftDrawRGB565FromFS(const char* fname, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  if (!tft_ready) return false;
-  if (x >= tft_w || y >= tft_h) return false;
-  if (x + w > tft_w || y + h > tft_h) return false;
-  uint32_t need = (uint32_t)w * (uint32_t)h * 2u;
-  uint32_t fsz = 0;
-  if (!activeFs.getFileSize(fname, fsz) || fsz < need) {
-    // Use Console for mirrored output
-    // (Implemented later after Console class definition)
-    return false;
-  }
-  tft.startWrite();
-  tftSetAddrWindow(x, y, w, h);
-  // Stream the file as RGB565. File is big-endian RGB565. Convert to little-endian 16-bit values.
-  const uint32_t CHUNK = 1024;  // bytes, must be even
-  uint8_t buf[CHUNK];
-  uint32_t off = 0, remain = need;
-  while (remain) {
-    uint32_t n = (remain > CHUNK) ? CHUNK : remain;
-    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
-    if (got != n) {
-      tft.endWrite();
-      return false;
-    }
-    // Byte-swap to native 16-bit for writePixels()
-    for (uint32_t i = 0; i < got; i += 2) {
-      uint8_t hi = buf[i];
-      buf[i] = buf[i + 1];
-      buf[i + 1] = hi;
-    }
-    tft.writePixels((uint16_t*)buf, got / 2);
-    off += n;
-    remain -= n;
-    yield();
-  }
-  tft.endWrite();
-  return true;
-}
-
 // ===== helpers using Console =====
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
   Console.print(b, HEX);
 }
-
 // ================== Return mailbox reservation (Scratch) ==================
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
-
 // ===== Mailbox helpers =====
 static inline void mailboxClearFirstByte() {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
@@ -412,12 +267,10 @@ static void mailboxPrintIfAny() {
   }
   Console.println("\"");
 }
-
 // ===== Core1 execution plumbing (mailbox) =====
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
-
 extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
   constexpr uint32_t N = 64;
@@ -439,7 +292,6 @@ extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
-
 struct ExecJob {
   uintptr_t code;               // raw aligned code address (LSB 0)
   uint32_t size;                // code size (bytes, even)
@@ -450,7 +302,6 @@ static volatile ExecJob g_job;
 static volatile int32_t g_result = 0;
 static volatile int32_t g_status = 0;
 static volatile uint32_t g_job_flag = 0;  // 0=idle, 1=ready, 2=running, 3=done
-
 static void core1WorkerPoll() {
   if (g_job_flag != 1u) return;
   __asm volatile("dsb" ::
@@ -480,15 +331,12 @@ static void core1WorkerPoll() {
                    : "memory");
   g_job_flag = 3u;
 }
-
 static volatile uint32_t g_timeout_override_ms = 0;
 static inline uint32_t getTimeout(uint32_t defMs) {
   return g_timeout_override_ms ? g_timeout_override_ms : defMs;
 }
-
 // Forward declaration required before execBlobGeneric
 static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut);
-
 static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const int32_t* argv, int& retVal, uint32_t timeoutMs = 100) {
   if (g_job_flag != 0u) {
     Console.println("core1 busy");
@@ -526,7 +374,6 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const 
   g_job_flag = 0u;
   return true;
 }
-
 static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& retVal) {
   // Generic exec: runs blob with 0..MAX_EXEC_ARGS integer args, handles mailbox clear/print.
   if (argc < 0) argc = 0;
@@ -551,7 +398,6 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   free(raw);
   return true;
 }
-
 // ================== FS helpers and console ==================
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -709,43 +555,6 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
-
-// ---------- persistent block helpers (now operate on active FS) ----------
-const uint32_t PERSIST_ADDR = 0x000200;
-const size_t PERSIST_LEN = 32;
-const uint32_t MAGIC = 0x5053524D;  // "PSRM"
-static bool readUint32FromFile(const char* fname, uint32_t offset, uint32_t& v) {
-  uint8_t tmp[4];
-  if (activeFs.readFileRange(fname, offset, tmp, 4) != 4) return false;
-  v = ((uint32_t)tmp[0] << 24) | ((uint32_t)tmp[1] << 16) | ((uint32_t)tmp[2] << 8) | (uint32_t)tmp[3];
-  return true;
-}
-static bool writeUint32ToFile(const char* fname, uint32_t offset, uint32_t v) {
-  uint8_t tmp[4];
-  tmp[0] = (v >> 24) & 0xFF;
-  tmp[1] = (v >> 16) & 0xFF;
-  tmp[2] = (v >> 8) & 0xFF;
-  tmp[3] = v & 0xFF;
-  if (!activeFs.exists(fname)) {
-    if (!activeFs.createFileSlot(fname, ActiveFS::SECTOR_SIZE, nullptr, 0)) return false;
-  }
-  uint32_t size = 0;
-  activeFs.getFileSize(fname, size);
-  uint32_t need = offset + 4;
-  if (need > size) {
-    uint8_t* buf = (uint8_t*)malloc(need);
-    if (!buf) return false;
-    memset(buf, 0x00, need);
-    if (size > 0) activeFs.readFile(fname, buf, size);
-    memcpy(buf + offset, tmp, 4);
-    bool ok = activeFs.writeFile(fname, buf, need, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
-    free(buf);
-    return ok;
-  } else {
-    return activeFs.writeFileInPlace(fname, tmp, 4, true);
-  }
-}
-
 // ---------- Binary upload helpers (single-line puthex/putb64) ----------
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -782,7 +591,6 @@ static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   outLen = bytes;
   return true;
 }
-
 static int8_t b64Map[256];
 static void initB64MapOnce() {
   static bool inited = false;
@@ -874,10 +682,8 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
-
 // ---------- Serial console / command handling ----------
 static char lineBuf[FS_SECTOR_SIZE];
-
 static bool readLine() {
   static size_t pos = 0;
   while (Serial.available()) {
@@ -954,10 +760,8 @@ static void handleCommand(char* line) {
   char* p = line;
   char* t0;
   if (!nextToken(p, t0)) return;
-
   if (!strcmp(t0, "help")) {
     printHelp();
-
   } else if (!strcmp(t0, "storage")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -980,7 +784,6 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: storage [flash|psram]");
     }
-
   } else if (!strcmp(t0, "mode")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -995,7 +798,6 @@ static void handleCommand(char* line) {
       g_dev_mode = false;
       Console.println("mode=prod");
     } else Console.println("usage: mode [dev|prod]");
-
   } else if (!strcmp(t0, "persist")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1040,14 +842,11 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: persist [read|write]");
     }
-
   } else if (!strcmp(t0, "autogen")) {
     autogenBlobWrites();
-
   } else if (!strcmp(t0, "files")) {
     // Note: listing is printed by FS to Serial directly; may not mirror fully to TFT.
     activeFs.listFilesToSerial();
-
   } else if (!strcmp(t0, "info")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1064,7 +863,6 @@ static void handleCommand(char* line) {
       Console.print(" cap=");
       Console.println(c);
     } else Console.println("not found");
-
   } else if (!strcmp(t0, "dump")) {
     char* fn;
     char* nstr;
@@ -1073,7 +871,6 @@ static void handleCommand(char* line) {
       return;
     }
     dumpFileHead(fn, (uint32_t)strtoul(nstr, nullptr, 0));
-
   } else if (!strcmp(t0, "mkSlot")) {
     char* fn;
     char* nstr;
@@ -1085,7 +882,6 @@ static void handleCommand(char* line) {
     uint32_t res = (uint32_t)strtoul(nstr, nullptr, 0);
     if (activeFs.createFileSlot(fn, res, nullptr, 0)) Console.println("slot created");
     else Console.println("mkSlot failed");
-
   } else if (!strcmp(t0, "writeblob")) {
     char* fn;
     char* bid;
@@ -1101,7 +897,6 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
-
   } else if (!strcmp(t0, "exec")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1114,10 +909,8 @@ static void handleCommand(char* line) {
     while (argc < (int)MAX_EXEC_ARGS && nextToken(p, tok)) argvN[argc++] = (int)strtol(tok, nullptr, 0);
     int rv;
     if (!execBlobGeneric(fn, argc, argvN, rv)) { Console.println("exec failed"); }
-
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
-
   } else if (!strcmp(t0, "timeout")) {
     char* msStr;
     if (!nextToken(p, msStr)) {
@@ -1131,7 +924,6 @@ static void handleCommand(char* line) {
       Console.print(ms);
       Console.println(" ms");
     }
-
   } else if (!strcmp(t0, "meminfo")) {
     Console.println();
     Console.printf("Total Heap:        %d bytes\n", rp2040.getTotalHeap());
@@ -1141,13 +933,12 @@ static void handleCommand(char* line) {
     Console.printf("Free PSRAM Heap:   %d bytes\n", rp2040.getFreePSRAMHeap());
     Console.printf("Used PSRAM Heap:   %d bytes\n", rp2040.getUsedPSRAMHeap());
     Console.printf("Free Stack:        %d bytes\n", rp2040.getFreeStack());
-
+    psramBB.printCapacityReport();
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
     delay(20);
     yield();
     rp2040.reboot();
-
   } else if (!strcmp(t0, "del")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1156,11 +947,9 @@ static void handleCommand(char* line) {
     }
     if (activeFs.deleteFile && activeFs.deleteFile(fn)) Console.println("deleted");
     else Console.println("delete failed");
-
   } else if (!strcmp(t0, "format")) {
     if (activeFs.format && activeFs.format()) Console.println("FS formatted");
     else Console.println("format failed");
-
   } else if (!strcmp(t0, "wipebootloader")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1169,7 +958,6 @@ static void handleCommand(char* line) {
       yield();
       rp2040.rebootToBootloader();
     } else Console.println("wipe failed");
-
   } else if (!strcmp(t0, "wipereboot")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1178,12 +966,10 @@ static void handleCommand(char* line) {
       yield();
       rp2040.reboot();
     } else Console.println("wipe failed");
-
   } else if (!strcmp(t0, "wipe")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) Console.println("Chip wiped");
     else Console.println("wipe failed");
-
   } else if (!strcmp(t0, "puthex")) {
     char* fn;
     char* hex;
@@ -1208,7 +994,6 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("puthex: write failed");
-
   } else if (!strcmp(t0, "putb64")) {
     char* fn;
     char* b64;
@@ -1233,85 +1018,29 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
-
-  } else if (!strcmp(t0, "tft.init")) {
-    char* rotStr;
-    uint8_t rot = 0;
-    if (nextToken(p, rotStr)) rot = (uint8_t)strtoul(rotStr, nullptr, 0) & 3;
-    bool ok = tftInit(rot);
-    if (ok) {
-      Console.print("TFT init OK, rot=");
-      Console.print((int)rot);
-      Console.print(" size=");
-      Console.print((int)tft_w);
-      Console.print("x");
-      Console.println((int)tft_h);
-    } else Console.println("TFT init failed");
-
-  } else if (!strcmp(t0, "tft.fill")) {
-    char* colStr;
-    if (!nextToken(p, colStr)) {
-      Console.println("usage: tft.fill <rgb565_hex>");
-      return;
-    }
-    uint16_t c = (uint16_t)strtoul(colStr, nullptr, 0);
-    tftFillScreen(c);
-    Console.println("TFT filled");
-
-  } else if (!strcmp(t0, "tft.rect")) {
-    char *xs, *ys, *ws, *hs, *cs;
-    if (!nextToken(p, xs) || !nextToken(p, ys) || !nextToken(p, ws) || !nextToken(p, hs) || !nextToken(p, cs)) {
-      Console.println("usage: tft.rect x y w h <rgb565>");
-      return;
-    }
-    uint16_t x = (uint16_t)strtoul(xs, nullptr, 0);
-    uint16_t y = (uint16_t)strtoul(ys, nullptr, 0);
-    uint16_t w = (uint16_t)strtoul(ws, nullptr, 0);
-    uint16_t h = (uint16_t)strtoul(hs, nullptr, 0);
-    uint16_t c = (uint16_t)strtoul(cs, nullptr, 0);
-    tftFillRect(x, y, w, h, c);
-    Console.println("TFT rect filled");
-
-  } else if (!strcmp(t0, "tft.img")) {
-    char *fn, *xs, *ys, *ws, *hs;
-    if (!nextToken(p, fn) || !nextToken(p, xs) || !nextToken(p, ys) || !nextToken(p, ws) || !nextToken(p, hs)) {
-      Console.println("usage: tft.img <file> x y w h   (RGB565)");
-      return;
-    }
-    uint16_t x = (uint16_t)strtoul(xs, nullptr, 0);
-    uint16_t y = (uint16_t)strtoul(ys, nullptr, 0);
-    uint16_t w = (uint16_t)strtoul(ws, nullptr, 0);
-    uint16_t h = (uint16_t)strtoul(hs, nullptr, 0);
-    bool ok = tftDrawRGB565FromFS(fn, x, y, w, h);
-    Console.println(ok ? "tft.img OK" : "tft.img failed");
-
   } else if (!strcmp(t0, "tft.clear") || !strcmp(t0, "clear")) {
     tftConsoleClear();
     Console.println("(TFT cleared)");
-
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
 }
-
 // ========== Setup and main loop ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(2000); }
   delay(500);
-
   // Initialize mirrored console
   // If you need non-default SPI or pins, configure your SPI object first
   // Example RP2040 (SPI1):
   // SPI1.setRX(12); SPI1.setSCK(14); SPI1.setTX(15); SPI1.begin();
-
   // Attach TFT (SPI bus, CS, DC, RST, width, height, rotation, invert)
   // Replace SPI with SPI1 if using a secondary bus, and pins with your wiring.
-  Console.tftAttach(&SPI, /*CS=*/4, /*DC=*/2, /*RST=*/3, /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true);
+  Console.tftAttach(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST, /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true, /*mosi=*/PIN_TFT_MOSI, /*sck=*/PIN_TFT_SCK, /*spiHz=*/112500000);
   Console.tftSetTextSize(1);
   Console.tftSetColors(0xFFFF, 0x0000);  // white on black
   Console.begin();
-
+  Console.println("Please be patient.. system is booting..");
   // Initialize flash and PSRAM bitbang drivers
   flashBB.begin();
   psramBB.begin();
@@ -1322,26 +1051,21 @@ void setup() {
   //   psramBB.setExtraDataPins(PIN_PSRAM_IO2, PIN_PSRAM_IO3);
   //   psramBB.setModeQuad(true);
   // }
-
   bindActiveFs(g_storage);
   bool mounted = (g_storage == StorageBackend::Flash) ? activeFs.mount(true) : activeFs.mount(false);
   if (!mounted) { Console.println("FS mount failed on active storage"); }
-
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-
   /*SPI.setRX(0);  // (RP2040 ZERO pin 0, 4)
   SPI.setCS(1);  // (RP2040 ZERO pin 1, 5, 17)
   SPI.setSCK(2); // (RP2040 ZERO pin 2, 6, 18)
   SPI.setTX(3);  // (RP2040 ZERO pin 3, 7, 19)
   SPI.begin();
-
   SPI1.setRX(12);  // (RP2040 ZERO pin 8, 12)
   SPI1.setCS(13);  // (RP2040 ZERO pin 9, 13)
   SPI1.setSCK(14); // (RP2040 ZERO pin 10, 14)
   SPI1.setTX(15);  // (RP2040 ZERO pin 11, 15)
   SPI1.begin();*/
-
   tft.init(tft_w, tft_h);
   tft.setRotation(tft_rot & 3);
   // Bump SPI to 62.5MHz (safe on RP2040); try 75-80MHz if stable
@@ -1351,7 +1075,7 @@ void setup() {
   tft_w = tft.width();
   tft_h = tft.height();
   tftConsoleBegin();
-
+  psramBB.printCapacityReport();
   Console.println("System ready. Type 'help'.");
   Console.print("> ");
 }
