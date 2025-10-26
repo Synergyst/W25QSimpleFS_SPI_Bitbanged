@@ -404,16 +404,18 @@ static volatile bool g_bg_active = false;
 static volatile uint32_t g_bg_start_ms = 0;
 static volatile uint32_t g_bg_timeout_ms = 0;
 static char g_bg_fname[ActiveFS::MAX_NAME + 1] = { 0 };
-static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBuf, uint32_t sz, uint32_t argc, const int32_t* argv, uint32_t timeoutMs) {
-  // Submit a job to core1 but do not wait. rawOut/alignedBuf must remain allocated until job finishes.
-  // Returns true if job accepted (and background tracking started), false otherwise.
-  // timeoutMs: use getTimeout(default) to honor override.
-  if (!raw || !alignedBuf || sz == 0) return false;
+static volatile bool g_bg_cancel_requested = false;  // Add this global near the other background globals
+static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBuf, uint32_t sz,
+                                uint32_t argc, const int32_t* argv, uint32_t timeoutMs) {
+  // Validate
+  if (!fname || !raw || !alignedBuf || sz == 0) return false;
   if (g_job_flag != 0u) {
     Console.println("core1 busy");
     return false;
   }
-  // Mark global background state first
+
+  // Initialize background tracking state
+  g_bg_cancel_requested = false;
   g_bg_raw = raw;
   g_bg_buf = alignedBuf;
   g_bg_sz = sz;
@@ -423,28 +425,34 @@ static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBu
   strncpy(g_bg_fname, fname, sizeof(g_bg_fname) - 1);
   g_bg_fname[sizeof(g_bg_fname) - 1] = '\0';
 
-  // Fill g_job (volatile global) with job details
-  g_job.code = (uintptr_t)alignedBuf;
+  // Prepare job struct (volatile global g_job)
+  g_job.code = (uintptr_t)alignedBuf;  // aligned entry address
   g_job.size = sz;
   g_job.argc = (argc > MAX_EXEC_ARGS) ? MAX_EXEC_ARGS : argc;
   for (uint32_t i = 0; i < (uint32_t)g_job.argc; ++i) g_job.args[i] = (int32_t)argv[i];
-  // Memory barrier before publishing
+
+  // IMPORTANT: ensure the mailbox cancel sentinel is cleared BEFORE we publish the job.
+  // This prevents the blob from immediately deciding it was canceled due to prior state.
+  mailboxClearCancelFlag();
+
+  // Ensure mailbox store is visible before we publish the job flag.
   __asm volatile("dsb" ::
                    : "memory");
   __asm volatile("isb" ::
                    : "memory");
-  g_job_flag = 1u;  // mark ready, core1 will pick it up
-  Console.printf("Background job '%s' started on core1 at 0x%08X (sz=%u)\n", fname, (unsigned)g_job.code, (unsigned)g_job.size);
+
+  // Publish job_ready for core1 to pick up
+  g_job_flag = 1u;
+
+  Console.printf("Background job '%s' started on core1 at 0x%08X (sz=%u)\n",
+                 g_bg_fname, (unsigned)g_job.code, (unsigned)g_job.size);
   return true;
 }
 static void pollBackgroundExec() {
-  // Called from main loop to observe background execution, handle completion, timeouts, and cleanup.
-  // No background job in progress => nothing to do
+  // If no tracked background job, consume any stale completion and return.
   if (!g_bg_active) {
-    // However, handle stale completions: if core1 reports completion but we no longer track it,
-    // clear the flag so new jobs can be submitted.
     if (g_job_flag == 3u) {
-      // stale completion; consume and clear
+      // Stale completion from a previously-forgotten job: consume it to allow new submissions.
       __asm volatile("dsb" ::
                        : "memory");
       __asm volatile("isb" ::
@@ -454,23 +462,25 @@ static void pollBackgroundExec() {
     return;
   }
 
-  // If core1 finished
+  // If core1 reports the job finished, handle completion
   if (g_job_flag == 3u) {
-    // copy non-volatile values for printing
     int32_t result = (int32_t)g_result;
     int32_t status = (int32_t)g_status;
-    Console.printf("Background job '%s' completed: Return=%d\n", g_bg_fname, (int)result);
-    if (status != 0) {
-      Console.printf(" Background job status=%d\n", (int)status);
+
+    if (g_bg_cancel_requested) {
+      Console.printf("Background job '%s' finished on core1 but was canceled — result ignored\n", g_bg_fname);
+    } else {
+      Console.printf("Background job '%s' completed: Return=%d\n", g_bg_fname, (int)result);
+      if (status != 0) Console.printf(" Background job status=%d\n", (int)status);
+      // Print mailbox content if any (blob may have written info)
+      mailboxPrintIfAny();
     }
-    // print any mailbox content
-    mailboxPrintIfAny();
-    // free the loader buffer
-    void* raw = (void*)g_bg_raw;
-    if (raw) {
-      free(raw);
-    }
-    // Clear background tracking
+
+    // After printing mailbox info, clear the first mailbox byte so future jobs don't see stale cancel.
+    mailboxClearCancelFlag();
+
+    // Free loader buffer and clear bookkeeping
+    if (g_bg_raw) free((void*)g_bg_raw);
     g_bg_raw = nullptr;
     g_bg_buf = nullptr;
     g_bg_sz = 0;
@@ -478,8 +488,9 @@ static void pollBackgroundExec() {
     g_bg_start_ms = 0;
     g_bg_timeout_ms = 0;
     g_bg_fname[0] = '\0';
+    g_bg_cancel_requested = false;
 
-    // Clear job flag to allow new jobs
+    // Clear core1 job flag so new jobs can be submitted
     __asm volatile("dsb" ::
                      : "memory");
     __asm volatile("isb" ::
@@ -488,30 +499,70 @@ static void pollBackgroundExec() {
     return;
   }
 
-  // Check for timeout
+  // If still running/queued, check for timeout.
+  // A timeout of 0 means "no timeout" (infinite).
   uint32_t timeoutMs = g_bg_timeout_ms ? g_bg_timeout_ms : 0;
-  if (timeoutMs && (uint32_t)(millis() - g_bg_start_ms) > timeoutMs) {
-    Console.println("core1 timeout (background job)");
-    // free loader buffer
-    void* raw = (void*)g_bg_raw;
-    if (raw) free(raw);
-    // Clear background tracking
-    g_bg_raw = nullptr;
-    g_bg_buf = nullptr;
-    g_bg_sz = 0;
-    g_bg_active = false;
-    g_bg_start_ms = 0;
-    g_bg_timeout_ms = 0;
-    g_bg_fname[0] = '\0';
-    // Allow new jobs -- best-effort; the core1 worker may later set 3 (stale) which will be dropped by above logic.
-    __asm volatile("dsb" ::
-                     : "memory");
-    __asm volatile("isb" ::
-                     : "memory");
-    g_job_flag = 0u;
-    return;
+  if (g_bg_active && timeoutMs != 0) {
+    uint32_t elapsed = (uint32_t)(millis() - g_bg_start_ms);
+    if (elapsed > timeoutMs) {
+      Console.println("core1 timeout (background job)");
+
+      // Cooperative attempt: request cancel via mailbox so a well-behaved blob will exit.
+      g_bg_cancel_requested = true;
+      mailboxSetCancelFlag(1);
+
+      // Allow a short grace period for the blob to observe cancellation.
+      const uint32_t graceMs = 50;
+      uint32_t waited = 0;
+      while (waited < graceMs) {
+        // Poll for an early completion from core1
+        if (g_job_flag == 3u) {
+          // Will be handled by completion branch on next tick
+          return;
+        }
+        delay(1);
+        ++waited;
+      }
+
+      // If we reach here, the blob didn't respond in the grace period.
+      // Free loader buffer and clear bookkeeping so follow-ups can be submitted.
+      if (g_bg_raw) free((void*)g_bg_raw);
+      g_bg_raw = nullptr;
+      g_bg_buf = nullptr;
+      g_bg_sz = 0;
+      g_bg_active = false;
+      g_bg_start_ms = 0;
+      g_bg_timeout_ms = 0;
+      g_bg_fname[0] = '\0';
+      // leave g_bg_cancel_requested true (logical)
+      // Clear job flag so new jobs can be submitted. core1 may still be running;
+      // if it later sets g_job_flag==3 the stale-completion case above will consume it.
+      __asm volatile("dsb" ::
+                       : "memory");
+      __asm volatile("isb" ::
+                       : "memory");
+      g_job_flag = 0u;
+      // Optionally: If you want to hard-stop core1, call forceResetCore1AndRelaunch() here.
+      // That is a heavy hammer; better only on explicit user request.
+      return;
+    }
   }
-  // nothing to do this tick
+  // Nothing to do this tick
+}
+static inline void mailboxSetCancelFlag(uint8_t v) {
+  // Set mailbox cancel flag (non-zero = cancel requested)
+  volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
+  mb[0] = v;
+}
+static inline void mailboxClearCancelFlag() {
+  // Clear mailbox cancel flag (set to 0)
+  volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
+  mb[0] = 0;
+}
+static inline uint8_t mailboxGetCancelFlag() {
+  // Optional: read current cancel flag
+  volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
+  return mb[0];
 }
 // ================== FS helpers and console ==================
 static bool checkNameLen(const char* name) {
@@ -1053,15 +1104,18 @@ static void printHelp() {
   Console.println("  dump <file> <nbytes>         - hex dump head of file");
   Console.println("  mkSlot <file> <reserve>      - create sector-aligned slot");
   Console.println("  writeblob <file> <blobId>    - create/update file from blob");
-  Console.printf("  exec <file> [a0..aN]         - execute blob with 0..%d int args on core1\n", (MAX_EXEC_ARGS - 1));
+  Console.printf("  exec <file> [a0..aN] [&]     - execute blob with 0..%d int args on core1; use '&' to background\n", (int)MAX_EXEC_ARGS);
+  Console.println("                                (foreground blocks until completion; background returns immediately)");
   Console.println("  del <file>                   - delete a file");
   Console.println("  format                       - format active FS");
   Console.println("  wipe                         - erase active chip (DANGEROUS to FS)");
   Console.println("  wipereboot                   - erase chip then reboot (DANGEROUS to FS)");
   Console.println("  wipebootloader               - erase chip then reboot to bootloader (DANGEROUS to FS)");
   Console.println("  meminfo                      - show heap/stack info");
-  Console.println("  psramsmoketestsafe           - low-level testing for PSRAM");
+  Console.println("  psramsafe                    - safe, non-destructive PSRAM test (prefers FS-free region)");
   Console.println("  psramsmoketest               - low-level testing for PSRAM (DANGEROUS to FS)");
+  Console.println("  bg [status|query]            - query background job status");
+  Console.println("  bg kill|cancel [force]       - cancel background job; 'force' may reset core1 (platform-dependent)");
   Console.println("  reboot                       - reboot the MCU");
   Console.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Console.println("  puthex <file> <hex>          - upload binary as hex string (single line)");
@@ -1074,7 +1128,9 @@ static void printHelp() {
   Console.println("Example:");
   Console.println("  putb64 myprog <paste_output_of_base64>");
   Console.println("  puthex myprog <paste_output_of_xxd>");
-  Console.println("Note: For blobs you intend to exec, even byte length is recommended (Thumb).");
+  Console.println("Notes:");
+  Console.println("  - For blobs you intend to exec, even byte length is recommended (Thumb).");
+  Console.println("  - Background jobs: only one background job supported at a time. Use 'bg' to query or cancel.");
   Console.println();
 }
 static void handleCommand(char* line) {
@@ -1290,6 +1346,91 @@ static void handleCommand(char* line) {
       } else {
         // accepted; message already printed by submitJobBackground
       }
+    }
+  } else if (!strcmp(t0, "bg")) {
+    // bg [status|query]         - show current background job status
+    // bg kill|cancel [force]    - request cancellation; 'force' tries to hard-reset core1 (if supported)
+    char* tok;
+    if (!nextToken(p, tok)) {
+      // print status
+      if (!g_bg_active) {
+        Console.println("No active background job");
+      } else {
+        uint32_t elapsed = millis() - g_bg_start_ms;
+        Console.printf("BG job: '%s'\n", g_bg_fname);
+        Console.printf("  elapsed=%u ms  timeout=%u ms  job_flag=%u\n", (unsigned)elapsed, (unsigned)g_bg_timeout_ms, (unsigned)g_job_flag);
+      }
+      return;
+    }
+    if (!strcmp(tok, "status") || !strcmp(tok, "query")) {
+      if (!g_bg_active) Console.println("No active background job");
+      else {
+        uint32_t elapsed = millis() - g_bg_start_ms;
+        Console.printf("BG job: '%s'  elapsed=%u ms  timeout=%u ms  job_flag=%u\n",
+                       g_bg_fname, (unsigned)elapsed, (unsigned)g_bg_timeout_ms, (unsigned)g_job_flag);
+      }
+    } else if (!strcmp(tok, "kill") || !strcmp(tok, "cancel")) {
+      char* sub = nullptr;
+      nextToken(p, sub);  // optional 'force'
+      if (!g_bg_active) {
+        // Nothing backgrounded; but if a job is queued we can still clear it
+        if (g_job_flag == 1u) {
+          // queued but not tracked by bg system; clear the job and allow new ones
+          __asm volatile("dsb" ::
+                           : "memory");
+          __asm volatile("isb" ::
+                           : "memory");
+          g_job_flag = 0u;
+          Console.println("Cleared queued core1 job");
+        } else {
+          Console.println("No active background job to cancel");
+        }
+        return;
+      }
+      // If job is queued but not yet started, cancel immediately
+      if (g_job_flag == 1u) {
+        __asm volatile("dsb" ::
+                         : "memory");
+        __asm volatile("isb" ::
+                         : "memory");
+        g_job_flag = 0u;
+        // free loader buffer
+        void* raw = (void*)g_bg_raw;
+        if (raw) free(raw);
+        g_bg_raw = nullptr;
+        g_bg_buf = nullptr;
+        g_bg_sz = 0;
+        g_bg_active = false;
+        g_bg_start_ms = 0;
+        g_bg_timeout_ms = 0;
+        g_bg_fname[0] = '\0';
+        g_bg_cancel_requested = false;
+        Console.println("Background job canceled (was queued)");
+        return;
+      }
+      // Running (g_job_flag == 2)
+      if (g_job_flag == 2u) {
+        // cooperative cancellation: set mailbox flag and mark state
+        g_bg_cancel_requested = true;
+        mailboxSetCancelFlag(1);
+        Console.println("Cancellation requested (mailbox flag set). If blob cooperates, it will stop shortly.");
+        if (sub && strcmp(sub, "force") == 0) {
+#if defined(PICO_ON_DEVICE)
+          Console.println("Force kill: resetting core1 (PICO_ON_DEVICE)");
+          multicore_reset_core1();
+          // After reset you probably need to relaunch core1_entry depending on your platform;
+          // if your platform auto-launches setup1/loop1, core1 will restart automatically.
+#else
+          Console.println("Force kill not supported on this build (no PICO_ON_DEVICE).");
+#endif
+        }
+        return;
+      }
+      // If g_job_flag is something else, attempt best-effort cancel
+      g_bg_cancel_requested = true;
+      Console.println("Cancellation requested (best-effort).");
+    } else {
+      Console.println("bg: usage: bg [status|query] | bg kill|cancel [force]");
     }
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
