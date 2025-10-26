@@ -1,19 +1,27 @@
 /*
   main_psram_flash_switch.ino
-  Integrated program:
-   - RP2040 + W25Q bit-banged flash (W25QSimpleFS)
-   - Optional PSRAM bit-banged storage (PSRAMSimpleFS)
-   - Runtime-selectable storage backend (storage flash|psram)
-   - Dev/Prod mode toggle (mode dev|prod)
-   - Persistent block read/write stored in chosen backend
-   - Single-line binary upload (puthex/putb64) into the active FS
-   - TFT ST7789 2.0" SPI display support via Adafruit library (GMT020-02 style: CS, DC, RST, SDA, SCL)
-   - Mirrored console output to TFT (simple page console with auto-clear on overflow)
-   - Clear display command: 'tft.clear' or 'clear'
+
+  DEFAULT (golden) PSRAM CS SCHEME: Single 74HC138 (MC74HC138AN), 4 PSRAM chips
+  -------------------------------------------------------------------------------
+  - RP2040 pins (per your wiring):
+      GP8 -> 74HC138 pin 1 (A0)
+      GP7 -> 74HC138 pin 2 (A1)
+      GP9 -> 74HC138 pins 4 and 5 (G2A and G2B tied together). 10k pull-up to 3.3V.
+      74HC138 pin 3 (A2) -> GND
+      74HC138 pin 6 (G1) -> 3.3V
+      74HC138 pin 16 (VCC) -> 3.3V, pin 8 (GND) -> GND
+      Decoupling: 0.1 µF across VCC/GND near the chip.
+  - Outputs (ACTIVE-LOW):
+      74HC138 Y0..Y3 -> PSRAM CS0..CS3 respectively, each with its own 10k pull-up to 3.3V.
+  - SPI bus shared (bit-banged): MISO=GP11, MOSI=GP12, SCK=GP10
+
+  Selection sequence (handled in library):
+    EN (G2A/G2B) HIGH -> set A0/A1 -> EN LOW -> transfer -> EN HIGH
+
   Notes:
-   - FS_SECTOR_SIZE is a compile-time constant used for buffers.
-   - PSRAM capacity should be set correctly when constructing PSRAMSimpleFS.
+  - If you later want Direct CS or 74HC138+74HC595, keep this file as-is and switch in code later.
 */
+
 #define CONSOLE_TFT_ENABLE
 #include "ConsolePrint.h"
 #include "W25QSimpleFS.h"
@@ -27,14 +35,18 @@
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
 
+struct BlobReg;  // Forward declaration so findBlob can be placed earlier if needed
 static ConsolePrint Console;
-// Static buffer-related compile-time constant (used previously as fs.SECTOR_SIZE)
+
+// ========== Static buffer-related compile-time constant (used previously as fs.SECTOR_SIZE) ==========
 #define FS_SECTOR_SIZE 4096
+
 // ========== bitbang pin definitions (flash) ==========
 const uint8_t PIN_FLASH_MISO = 11;  // GP12
 const uint8_t PIN_FLASH_CS = 28;    // GP13
 const uint8_t PIN_FLASH_SCK = 10;   // GP14
 const uint8_t PIN_FLASH_MOSI = 12;  // GP15
+
 // ========== bitbang pin definitions (psram) ==========
 const bool PSRAM_ENABLE_QPI = false;
 const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // 3 is a safe slow default
@@ -43,10 +55,23 @@ const uint8_t PIN_PSRAM_MOSI = 12;
 const uint8_t PIN_PSRAM_SCK = 10;
 //const uint8_t PIN_PSRAM_IO2 = ;  // only used if QPI enabled
 //const uint8_t PIN_PSRAM_IO3 = ;  // only used if QPI enabled
-const uint8_t PIN_PSRAM_CS0 = 29;
+
+// Direct CS pins (default mode)
+/*const uint8_t PIN_PSRAM_CS0 = 29;
 const uint8_t PIN_PSRAM_CS1 = 9;
 const uint8_t PIN_PSRAM_CS2 = 8;
-const uint8_t PIN_PSRAM_CS3 = 7;
+const uint8_t PIN_PSRAM_CS3 = 7;*/
+
+// OPTIONAL: 74HC138 pins (for 138-only or 138+595 modes). Adjust if needed.
+const uint8_t PIN_138_A0 = 8;  // 74HC138 pin 1
+const uint8_t PIN_138_A1 = 7;  // 74HC138 pin 2
+const uint8_t PIN_138_EN = 9;  // drives both 74HC138 pins 4 + 5 (G2A/G2B), with 10k pull-up to 3.3V
+// If using up to 8 chips with A2 controlled by MCU, set a pin here; else keep 255 and tie A2 to GND.
+const uint8_t PIN_138_A2 = 255;  // 255 means "not used", not used (tie 74HC138 pin 3 to GND)
+
+// OPTIONAL: 74HC595 latch pin for method 138+595 (SER=MOSI, SRCLK=SCK are reused)
+const uint8_t PIN_595_LATCH = 4;  // 595.RCLK
+
 // ========== TFT display pins (SPI via Adafruit ST7789) ==========
 // Wiring for GMT020-02 2.0" TFT SPI on WaveShare RP2040 Zero:
 //   SCL -> GP6
@@ -61,37 +86,51 @@ const uint8_t PIN_TFT_RST = 14;   // RST pin
 const uint8_t PIN_TFT_DC = 15;    // DC pin
 const uint8_t PIN_TFT_CS = 6;     // CS pin
 const uint8_t PIN_TFT_MISO = 11;  // (unused)
-// ===== TFT state =====
+
+// ========== TFT state ==========
 static bool tft_ready = false;
 static uint16_t tft_w = 240;
 static uint16_t tft_h = 320;
 static uint8_t tft_rot = 1;  // 0..3
-// ----- Simple TFT text console mirroring for Serial output -----
+
+// ========== Simple TFT text console mirroring for Serial output ==========
 static uint16_t tft_console_fg = 0xFFFF;  // white
 static uint16_t tft_console_bg = 0x0000;  // black
 static uint8_t tft_console_textsize = 1;
-// Adafruit ST7789 instance
+
+// ========== Adafruit ST7789 instance ==========
 static Adafruit_ST7789 tft = Adafruit_ST7789(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCK, PIN_TFT_RST);
-// Forward decls so findBlob can be placed earlier if needed
-struct BlobReg;
-// ---------- persistent block helpers (now operate on active FS) ----------
+
+// ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 const size_t PERSIST_LEN = 32;
-// Choose active storage at runtime
+
 enum class StorageBackend {
+  // Choose active storage at runtime
   Flash,
   PSRAM_BACKEND
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-// ======== Flash/PSRAM instances (needed before bindActiveFs) ========
+
 W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
 W25QSimpleFS fsFlash(flashBB);
-constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;                                                                                                    // Each chip capacity (bytes). Example: 8MB per chip.
-constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * 4;                                                                                                   // Total capacity is sum across chips:
-PSRAMAggregateDevice psramBB({ PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // Create the aggregate multi-chip device
-PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);                                                                                                         // Filesystem on top of the aggregate device
-// Dev/prod mode
+
+// Capacity
+constexpr uint8_t PSRAM_NUM_CHIPS = 4;
+constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;  // Example: 8MB per chip.
+constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * PSRAM_NUM_CHIPS;
+
+// ---------- PSRAM device: choose one of the two constructor styles ----------
+
+// PSRAM aggregate device — 74HC138-only default
+PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
+// If later using Direct CS, replace with:
+// PSRAMAggregateDevice psramBB({ CS0, CS1, CS2, CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
+// If later using 74HC138+74HC595, keep bare ctor and call configureDecoder138Via595 in setup().
+
+PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
 static bool g_dev_mode = true;
-// Active FS forwarding helpers (thin wrapper)
+
+// ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
   bool (*format)() = nullptr;
@@ -109,12 +148,14 @@ struct ActiveFS {
   uint32_t (*nextDataAddr)() = nullptr;
   uint32_t (*capacity)() = nullptr;
   uint32_t (*dataRegionStart)() = nullptr;
+
   static constexpr uint32_t SECTOR_SIZE = FS_SECTOR_SIZE;
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-// Helper to bind either flash or psram into activeFs at runtime
+
 static void bindActiveFs(StorageBackend backend) {
+  // Helper to bind either flash or psram into activeFs at runtime
   if (backend == StorageBackend::Flash) {
     activeFs.mount = [](bool b) {
       return fsFlash.mount(b);
@@ -181,7 +222,7 @@ static void bindActiveFs(StorageBackend backend) {
       return fsPSRAM.createFileSlot(n, r, d, s);
     };
     activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsPSRAM.writeFile(n, d, s, m);  // generic FS accepts int
+      return fsPSRAM.writeFile(n, d, s, m);
     };
     activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
       return fsPSRAM.writeFileInPlace(n, d, s, a);
@@ -215,6 +256,7 @@ static void bindActiveFs(StorageBackend backend) {
     };
   }
 }
+
 // ========== Blob registry from your original file ==========
 struct BlobReg {
   const char* id;
@@ -226,7 +268,8 @@ static const BlobReg g_blobs[] = {
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-// ==== TFT console helpers to mirror Serial output ====
+
+// ========== TFT console helpers to mirror Serial output ==========
 static void tftConsoleBegin() {
   if (!tft_ready) return;
   tft.setTextWrap(false);
@@ -240,15 +283,18 @@ static void tftConsoleClear() {
   tft.fillScreen(tft_console_bg);
   tft.setCursor(0, 0);
 }
-// ===== helpers using Console =====
+
+// ========== helpers using Console ==========
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
   Console.print(b, HEX);
 }
-// ================== Return mailbox reservation (Scratch) ==================
+
+// ========== Return mailbox reservation (Scratch) ==========
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
-// ===== Mailbox helpers =====
+
+// ========== Mailbox helpers ==========
 static inline void mailboxClearFirstByte() {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   mb[0] = 0;  // sentinel
@@ -264,7 +310,8 @@ static void mailboxPrintIfAny() {
   }
   Console.println("\"");
 }
-// ===== Core1 execution plumbing (mailbox) =====
+
+// ========== Core1 execution plumbing (mailbox) ==========
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
@@ -299,6 +346,7 @@ static volatile ExecJob g_job;
 static volatile int32_t g_result = 0;
 static volatile int32_t g_status = 0;
 static volatile uint32_t g_job_flag = 0;  // 0=idle, 1=ready, 2=running, 3=done
+
 static void core1WorkerPoll() {
   if (g_job_flag != 1u) return;
   __asm volatile("dsb" ::
@@ -328,12 +376,14 @@ static void core1WorkerPoll() {
                    : "memory");
   g_job_flag = 3u;
 }
+
 static volatile uint32_t g_timeout_override_ms = 0;
 static inline uint32_t getTimeout(uint32_t defMs) {
   return g_timeout_override_ms ? g_timeout_override_ms : defMs;
 }
-// Forward declaration required before execBlobGeneric
-static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut);
+
+static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut);  // Forward declaration
+
 static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const int32_t* argv, int& retVal, uint32_t timeoutMs = 100) {
   if (g_job_flag != 0u) {
     Console.println("core1 busy");
@@ -357,7 +407,7 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const 
     if ((millis() - start) > timeoutMs) {
       if (g_job_flag == 3u) break;
       Console.println("core1 timeout");
-      g_job_flag = 0u;  // allow new jobs; worker may later set 3 (ok)
+      g_job_flag = 0u;
       return false;
     }
   }
@@ -371,8 +421,8 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const 
   g_job_flag = 0u;
   return true;
 }
+
 static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& retVal) {
-  // Generic exec: runs blob with 0..MAX_EXEC_ARGS integer args, handles mailbox clear/print.
   if (argc < 0) argc = 0;
   if (argc > (int)MAX_EXEC_ARGS) argc = (int)MAX_EXEC_ARGS;
   void* raw = nullptr;
@@ -380,7 +430,7 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   uint32_t sz = 0;
   if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
   mailboxClearFirstByte();
-  uintptr_t code = (uintptr_t)buf;  // aligned buffer address
+  uintptr_t code = (uintptr_t)buf;
   Console.print("Calling entry on core1 at 0x");
   Console.println((uintptr_t)buf, HEX);
   bool ok = runOnCore1(code, sz, (uint32_t)argc, (const int32_t*)argv, retVal, getTimeout(100000));
@@ -395,26 +445,24 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   free(raw);
   return true;
 }
+
 // Background execution support (one background job at a time)
-// Globals to track malloc'ed buffer and job state
-static volatile void* g_bg_raw = nullptr;     // malloc pointer (to free on completion)
-static volatile uint8_t* g_bg_buf = nullptr;  // aligned exec buffer pointer
+static volatile void* g_bg_raw = nullptr;
+static volatile uint8_t* g_bg_buf = nullptr;
 static volatile uint32_t g_bg_sz = 0;
 static volatile bool g_bg_active = false;
 static volatile uint32_t g_bg_start_ms = 0;
 static volatile uint32_t g_bg_timeout_ms = 0;
 static char g_bg_fname[ActiveFS::MAX_NAME + 1] = { 0 };
-static volatile bool g_bg_cancel_requested = false;  // Add this global near the other background globals
+static volatile bool g_bg_cancel_requested = false;
+
 static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBuf, uint32_t sz,
                                 uint32_t argc, const int32_t* argv, uint32_t timeoutMs) {
-  // Validate
   if (!fname || !raw || !alignedBuf || sz == 0) return false;
   if (g_job_flag != 0u) {
     Console.println("core1 busy");
     return false;
   }
-
-  // Initialize background tracking state
   g_bg_cancel_requested = false;
   g_bg_raw = raw;
   g_bg_buf = alignedBuf;
@@ -425,34 +473,26 @@ static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBu
   strncpy(g_bg_fname, fname, sizeof(g_bg_fname) - 1);
   g_bg_fname[sizeof(g_bg_fname) - 1] = '\0';
 
-  // Prepare job struct (volatile global g_job)
-  g_job.code = (uintptr_t)alignedBuf;  // aligned entry address
+  g_job.code = (uintptr_t)alignedBuf;
   g_job.size = sz;
   g_job.argc = (argc > MAX_EXEC_ARGS) ? MAX_EXEC_ARGS : argc;
   for (uint32_t i = 0; i < (uint32_t)g_job.argc; ++i) g_job.args[i] = (int32_t)argv[i];
 
-  // IMPORTANT: ensure the mailbox cancel sentinel is cleared BEFORE we publish the job.
-  // This prevents the blob from immediately deciding it was canceled due to prior state.
   mailboxClearCancelFlag();
-
-  // Ensure mailbox store is visible before we publish the job flag.
   __asm volatile("dsb" ::
                    : "memory");
   __asm volatile("isb" ::
                    : "memory");
-
-  // Publish job_ready for core1 to pick up
   g_job_flag = 1u;
 
   Console.printf("Background job '%s' started on core1 at 0x%08X (sz=%u)\n",
                  g_bg_fname, (unsigned)g_job.code, (unsigned)g_job.size);
   return true;
 }
+
 static void pollBackgroundExec() {
-  // If no tracked background job, consume any stale completion and return.
   if (!g_bg_active) {
     if (g_job_flag == 3u) {
-      // Stale completion from a previously-forgotten job: consume it to allow new submissions.
       __asm volatile("dsb" ::
                        : "memory");
       __asm volatile("isb" ::
@@ -461,25 +501,17 @@ static void pollBackgroundExec() {
     }
     return;
   }
-
-  // If core1 reports the job finished, handle completion
   if (g_job_flag == 3u) {
     int32_t result = (int32_t)g_result;
     int32_t status = (int32_t)g_status;
-
     if (g_bg_cancel_requested) {
       Console.printf("Background job '%s' finished on core1 but was canceled — result ignored\n", g_bg_fname);
     } else {
       Console.printf("Background job '%s' completed: Return=%d\n", g_bg_fname, (int)result);
       if (status != 0) Console.printf(" Background job status=%d\n", (int)status);
-      // Print mailbox content if any (blob may have written info)
       mailboxPrintIfAny();
     }
-
-    // After printing mailbox info, clear the first mailbox byte so future jobs don't see stale cancel.
     mailboxClearCancelFlag();
-
-    // Free loader buffer and clear bookkeeping
     if (g_bg_raw) free((void*)g_bg_raw);
     g_bg_raw = nullptr;
     g_bg_buf = nullptr;
@@ -489,8 +521,6 @@ static void pollBackgroundExec() {
     g_bg_timeout_ms = 0;
     g_bg_fname[0] = '\0';
     g_bg_cancel_requested = false;
-
-    // Clear core1 job flag so new jobs can be submitted
     __asm volatile("dsb" ::
                      : "memory");
     __asm volatile("isb" ::
@@ -498,34 +528,22 @@ static void pollBackgroundExec() {
     g_job_flag = 0u;
     return;
   }
-
-  // If still running/queued, check for timeout.
-  // A timeout of 0 means "no timeout" (infinite).
   uint32_t timeoutMs = g_bg_timeout_ms ? g_bg_timeout_ms : 0;
   if (g_bg_active && timeoutMs != 0) {
     uint32_t elapsed = (uint32_t)(millis() - g_bg_start_ms);
     if (elapsed > timeoutMs) {
       Console.println("core1 timeout (background job)");
-
-      // Cooperative attempt: request cancel via mailbox so a well-behaved blob will exit.
       g_bg_cancel_requested = true;
       mailboxSetCancelFlag(1);
-
-      // Allow a short grace period for the blob to observe cancellation.
       const uint32_t graceMs = 50;
       uint32_t waited = 0;
       while (waited < graceMs) {
-        // Poll for an early completion from core1
         if (g_job_flag == 3u) {
-          // Will be handled by completion branch on next tick
           return;
         }
         delay(1);
         ++waited;
       }
-
-      // If we reach here, the blob didn't respond in the grace period.
-      // Free loader buffer and clear bookkeeping so follow-ups can be submitted.
       if (g_bg_raw) free((void*)g_bg_raw);
       g_bg_raw = nullptr;
       g_bg_buf = nullptr;
@@ -534,37 +552,30 @@ static void pollBackgroundExec() {
       g_bg_start_ms = 0;
       g_bg_timeout_ms = 0;
       g_bg_fname[0] = '\0';
-      // leave g_bg_cancel_requested true (logical)
-      // Clear job flag so new jobs can be submitted. core1 may still be running;
-      // if it later sets g_job_flag==3 the stale-completion case above will consume it.
       __asm volatile("dsb" ::
                        : "memory");
       __asm volatile("isb" ::
                        : "memory");
       g_job_flag = 0u;
-      // Optionally: If you want to hard-stop core1, call forceResetCore1AndRelaunch() here.
-      // That is a heavy hammer; better only on explicit user request.
       return;
     }
   }
-  // Nothing to do this tick
 }
+
 static inline void mailboxSetCancelFlag(uint8_t v) {
-  // Set mailbox cancel flag (non-zero = cancel requested)
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   mb[0] = v;
 }
 static inline void mailboxClearCancelFlag() {
-  // Clear mailbox cancel flag (set to 0)
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   mb[0] = 0;
 }
 static inline uint8_t mailboxGetCancelFlag() {
-  // Optional: read current cancel flag
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   return mb[0];
 }
-// ================== FS helpers and console ==================
+
+// ========== FS helpers and console ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
   if (n == 0 || n > ActiveFS::MAX_NAME) {
@@ -721,13 +732,11 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
+
 static bool psramSmokeTest() {
-  // DANGEROUS: THIS IS UNSAFE FOR THE FILESYSTEM AND WILL CORRUPT IT IF RAN! - PLEASE DO NOT RUN THIS UNLESS TESTING!
   Console.println("PSRAM smoke test...");
   uint8_t w[256], r[256];
   for (uint32_t i = 0; i < sizeof(w); ++i) w[i] = (uint8_t)(0xA5 ^ i);
-
-  // Basic write/read at 0
   if (!psramBB.writeData02(0, w, sizeof(w))) {
     Console.println("write fail @0");
     return false;
@@ -742,11 +751,9 @@ static bool psramSmokeTest() {
       Console.printf("mismatch @%u\n", i);
       return false;
     }
-
-  // Cross-bank test (only meaningful if >1 chip)
   if (psramBB.chipCount() > 1) {
     const uint32_t per = psramBB.perChipCapacity();
-    const uint32_t addr = per - 128;  // cross boundary
+    const uint32_t addr = per - 128;
     if (!psramBB.writeData02(addr, w, 256)) {
       Console.println("write fail @cross");
       return false;
@@ -762,38 +769,30 @@ static bool psramSmokeTest() {
         return false;
       }
   }
-
   Console.println("PSRAM OK");
   return true;
 }
+
 static bool psramSafeSmokeTest() {
-  // Non-destructive PSRAM smoke test: attempts per-chip write-then-restore only inside
-  // the FS-free region (addresses >= activeFs.nextDataAddr()). If no writable free
-  // region exists for a chip, falls back to read-only probes.
-  // Returns true if all checked chips appeared OK; false if any failure detected.
-  const size_t TEST_N = 64;  // bytes tested per chip (small, to minimize risk)
+  const size_t TEST_N = 64;
   uint8_t chipCount = psramBB.chipCount();
   if (chipCount == 0) {
-    Console.println("psramSafeSmokeTest: no PSRAM chips detected");
+    Console.println("\nPSRAM: no PSRAM chips detected");
     return false;
   }
-
   uint32_t perChip = psramBB.perChipCapacity();
   uint32_t totalCap = psramBB.capacity();
   uint32_t fsNext = 0;
   uint32_t fsDataStart = 0;
   if (activeFs.nextDataAddr) fsNext = activeFs.nextDataAddr();
   if (activeFs.dataRegionStart) fsDataStart = activeFs.dataRegionStart();
-
-  Console.printf("psramSafeSmokeTest: chips=%u per_chip=%u total=%u fsNext=%u dataStart=%u\n",
+  Console.printf("\nPSRAM: chips=%u per_chip=%u total=%u fsNext=%u dataStart=%u\n",
                  (unsigned)chipCount, (unsigned)perChip, (unsigned)totalCap, (unsigned)fsNext, (unsigned)fsDataStart);
-
   bool allOk = true;
   uint8_t orig[TEST_N];
   uint8_t pattern[TEST_N];
   uint8_t readback[TEST_N];
 
-  // Per-chip JEDEC probe first (safe)
   for (uint8_t bank = 0; bank < chipCount; ++bank) {
     uint8_t jedec[6] = { 0 };
     psramBB.readJEDEC(bank, jedec, sizeof(jedec));
@@ -811,47 +810,38 @@ static bool psramSafeSmokeTest() {
       Console.print(jedec[k], HEX);
     }
     Console.println((!(allFF || all00)) ? " OK" : " NO_RESP");
-    // do not decide pass/fail solely on JEDEC; proceed to deeper checks
   }
+  Console.println();
 
   for (uint8_t bank = 0; bank < chipCount; ++bank) {
     const uint32_t chipStart = (uint32_t)bank * perChip;
     const uint32_t chipEnd = chipStart + perChip;
     Console.printf(" Testing chip %u (0x%08X - 0x%08X)...\n", (unsigned)bank, (unsigned)chipStart, (unsigned)(chipEnd - 1));
 
-    // Candidate writable address preference: first unused FS address that lies in this chip
     uint32_t candidate = UINT32_MAX;
     if (fsNext >= chipStart && (fsNext + TEST_N) <= chipEnd && fsNext < totalCap) {
       candidate = fsNext;
     } else {
-      // If FS next is outside this chip or not enough room, consider first address in chip that is >= DATA_START
       uint32_t prefer = chipStart;
       if (prefer < fsDataStart) prefer = fsDataStart;
       if (prefer + TEST_N <= chipEnd && prefer + TEST_N <= totalCap) candidate = prefer;
     }
-
     bool willWrite = false;
     if (candidate != UINT32_MAX) {
-      // Only allow write-then-restore if candidate is at or beyond fsNext (guaranteed free)
       if (candidate >= fsNext && (candidate + TEST_N) <= totalCap) willWrite = true;
-      else willWrite = false;
     } else {
-      // Fallback: pick mid-chip read-only probe
       candidate = chipStart + (perChip / 2);
       if (candidate + TEST_N > chipEnd) candidate = (chipEnd > TEST_N) ? (chipEnd - TEST_N) : chipStart;
       willWrite = false;
     }
 
-    // Always read original bytes first (safe)
     memset(orig, 0, sizeof(orig));
     if (!psramBB.readData03(candidate, orig, (uint32_t)TEST_N)) {
       Console.printf("  chip %u: read failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
       allOk = false;
       continue;
     }
-
     if (!willWrite) {
-      // Read-only confirmation: read another offset to increase coverage if possible
       uint32_t alt = candidate;
       uint32_t mid = chipStart + perChip / 2;
       if (mid + TEST_N <= chipEnd && mid != candidate) alt = mid;
@@ -864,22 +854,16 @@ static bool psramSafeSmokeTest() {
       continue;
     }
 
-    // Prepare deterministic test pattern
     for (size_t i = 0; i < TEST_N; ++i) pattern[i] = (uint8_t)(0xA5 ^ (uint8_t)i ^ (uint8_t)bank);
 
-    // Write test pattern to candidate (should be in free region)
     if (!psramBB.writeData02(candidate, pattern, (uint32_t)TEST_N)) {
       Console.printf("  chip %u: write failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      // Nothing to restore if write failed, but mark failure
       allOk = false;
       continue;
     }
-
-    // Read back and verify
     memset(readback, 0, sizeof(readback));
     if (!psramBB.readData03(candidate, readback, (uint32_t)TEST_N)) {
       Console.printf("  chip %u: read-back failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      // Attempt best-effort restore
       psramBB.writeData02(candidate, orig, (uint32_t)TEST_N);
       allOk = false;
       continue;
@@ -892,20 +876,15 @@ static bool psramSafeSmokeTest() {
       }
     if (!ok) {
       Console.printf("  chip %u: verification mismatch at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      // Attempt best-effort restore
       psramBB.writeData02(candidate, orig, (uint32_t)TEST_N);
       allOk = false;
       continue;
     }
-
-    // Restore original bytes
     if (!psramBB.writeData02(candidate, orig, (uint32_t)TEST_N)) {
       Console.printf("  chip %u: restore write failed at 0x%08X (DATA MAY BE CORRUPTED!)\n", (unsigned)bank, (unsigned)candidate);
       allOk = false;
       continue;
     }
-
-    // Verify restore
     memset(readback, 0, sizeof(readback));
     if (!psramBB.readData03(candidate, readback, (uint32_t)TEST_N)) {
       Console.printf("  chip %u: read-after-restore failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
@@ -923,15 +902,14 @@ static bool psramSafeSmokeTest() {
       allOk = false;
       continue;
     }
-
     Console.printf("  chip %u: write-restore OK at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
     yield();
   }
-
-  Console.printf("psramSafeSmokeTest: %s\n", allOk ? "ALL OK" : "SOME FAILURES");
+  Console.printf("PSRAM: %s\n", allOk ? "ALL OK\n" : "SOME FAILURES\n");
   return allOk;
 }
-// ---------- Binary upload helpers (single-line puthex/putb64) ----------
+
+// ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -1015,25 +993,13 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
       uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
       uint8_t b2 = (uint8_t)(((v2 & 0x03) << 6) | v3);
       if (pad == 0) {
-        if (o + 3 > outCap) {
-          free(buf);
-          return false;
-        }
         buf[o++] = b0;
         buf[o++] = b1;
         buf[o++] = b2;
       } else if (pad == 1) {
-        if (o + 2 > outCap) {
-          free(buf);
-          return false;
-        }
         buf[o++] = b0;
         buf[o++] = b1;
       } else if (pad == 2) {
-        if (o + 1 > outCap) {
-          free(buf);
-          return false;
-        }
         buf[o++] = b0;
       } else {
         free(buf);
@@ -1058,7 +1024,8 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
-// ---------- Serial console / command handling ----------
+
+// ========== Serial console / command handling ==========
 static char lineBuf[FS_SECTOR_SIZE];
 static bool readLine() {
   static size_t pos = 0;
@@ -1112,8 +1079,8 @@ static void printHelp() {
   Console.println("  wipereboot                   - erase chip then reboot (DANGEROUS to FS)");
   Console.println("  wipebootloader               - erase chip then reboot to bootloader (DANGEROUS to FS)");
   Console.println("  meminfo                      - show heap/stack info");
-  Console.println("  psramsafe                    - safe, non-destructive PSRAM test (prefers FS-free region)");
-  Console.println("  psramsmoketest               - low-level testing for PSRAM (DANGEROUS to FS)");
+  Console.println("  psramsmoketest               - safe, non-destructive PSRAM test (prefers FS-free region)");
+  Console.println("  psramsmoketestunsafe         - low-level testing for PSRAM (DANGEROUS to FS)");
   Console.println("  bg [status|query]            - query background job status");
   Console.println("  bg kill|cancel [force]       - cancel background job; 'force' may reset core1 (platform-dependent)");
   Console.println("  reboot                       - reboot the MCU");
@@ -1222,7 +1189,6 @@ static void handleCommand(char* line) {
   } else if (!strcmp(t0, "autogen")) {
     autogenBlobWrites();
   } else if (!strcmp(t0, "files")) {
-    // Note: listing is printed by FS to Serial directly; may not mirror fully to TFT.
     activeFs.listFilesToSerial();
   } else if (!strcmp(t0, "info")) {
     char* fn;
@@ -1280,58 +1246,41 @@ static void handleCommand(char* line) {
       Console.println("usage: exec <file> [a0 ... aN] [&]");
       return;
     }
-
-    // Helper: strip trailing '&' from a token, return true if stripped
     auto strip_trailing_amp = [](char* s) -> bool {
       if (!s) return false;
       size_t L = strlen(s);
       if (L == 0) return false;
       if (s[L - 1] == '&') {
         s[L - 1] = '\0';
-        // if token becomes empty after stripping, treat as stripped but empty
         return true;
       }
       return false;
     };
-
-    // Collect tokens into an array so we can detect optional trailing "&"
     char* toks[MAX_EXEC_ARGS + 2];
     int tcount = 0;
     char* tok = nullptr;
-    while (tcount < (int)MAX_EXEC_ARGS + 1 && nextToken(p, tok)) {
-      toks[tcount++] = tok;
-    }
-
+    while (tcount < (int)MAX_EXEC_ARGS + 1 && nextToken(p, tok)) toks[tcount++] = tok;
     bool background = false;
-    // case A: last token is a standalone "&"
     if (tcount > 0 && strcmp(toks[tcount - 1], "&") == 0) {
       background = true;
-      --tcount;  // drop & token
+      --tcount;
     } else if (tcount == 0) {
-      // No extra tokens; also check if '&' was glued to filename (e.g. "exec foo&")
       if (strip_trailing_amp(fn)) background = true;
     } else {
-      // tcount > 0: check if '&' is glued to last provided token (e.g. "exec foo 1 2&")
       if (strip_trailing_amp(toks[tcount - 1])) {
         background = true;
-        // if the token became empty, drop it
         if (toks[tcount - 1][0] == '\0') --tcount;
       }
     }
 
-    // Convert tokens to ints (args)
     static int argvN[MAX_EXEC_ARGS];
     int argc = 0;
-    for (int i = 0; i < tcount && argc < (int)MAX_EXEC_ARGS; ++i) {
-      argvN[argc++] = (int)strtol(toks[i], nullptr, 0);
-    }
+    for (int i = 0; i < tcount && argc < (int)MAX_EXEC_ARGS; ++i) argvN[argc++] = (int)strtol(toks[i], nullptr, 0);
 
     if (!background) {
-      // Existing foreground behavior (blocking)
       int rv;
       if (!execBlobGeneric(fn, argc, argvN, rv)) { Console.println("exec failed"); }
     } else {
-      // Background behavior: load blob into buffer, submit and return immediately.
       void* raw = nullptr;
       uint8_t* buf = nullptr;
       uint32_t sz = 0;
@@ -1339,23 +1288,16 @@ static void handleCommand(char* line) {
         Console.println("exec: load failed");
         return;
       }
-      uint32_t timeout = getTimeout(100000);  // same default as execBlobGeneric/runOnCore1
+      uint32_t timeout = getTimeout(100000);
       if (!submitJobBackground(fn, raw, buf, sz, (uint32_t)argc, (const int32_t*)argvN, timeout)) {
-        // submission failed; free raw buffer
         free(raw);
-      } else {
-        // accepted; message already printed by submitJobBackground
       }
     }
   } else if (!strcmp(t0, "bg")) {
-    // bg [status|query]         - show current background job status
-    // bg kill|cancel [force]    - request cancellation; 'force' tries to hard-reset core1 (if supported)
     char* tok;
     if (!nextToken(p, tok)) {
-      // print status
-      if (!g_bg_active) {
-        Console.println("No active background job");
-      } else {
+      if (!g_bg_active) Console.println("No active background job");
+      else {
         uint32_t elapsed = millis() - g_bg_start_ms;
         Console.printf("BG job: '%s'\n", g_bg_fname);
         Console.printf("  elapsed=%u ms  timeout=%u ms  job_flag=%u\n", (unsigned)elapsed, (unsigned)g_bg_timeout_ms, (unsigned)g_job_flag);
@@ -1371,11 +1313,9 @@ static void handleCommand(char* line) {
       }
     } else if (!strcmp(tok, "kill") || !strcmp(tok, "cancel")) {
       char* sub = nullptr;
-      nextToken(p, sub);  // optional 'force'
+      nextToken(p, sub);
       if (!g_bg_active) {
-        // Nothing backgrounded; but if a job is queued we can still clear it
         if (g_job_flag == 1u) {
-          // queued but not tracked by bg system; clear the job and allow new ones
           __asm volatile("dsb" ::
                            : "memory");
           __asm volatile("isb" ::
@@ -1387,14 +1327,12 @@ static void handleCommand(char* line) {
         }
         return;
       }
-      // If job is queued but not yet started, cancel immediately
       if (g_job_flag == 1u) {
         __asm volatile("dsb" ::
                          : "memory");
         __asm volatile("isb" ::
                          : "memory");
         g_job_flag = 0u;
-        // free loader buffer
         void* raw = (void*)g_bg_raw;
         if (raw) free(raw);
         g_bg_raw = nullptr;
@@ -1408,9 +1346,7 @@ static void handleCommand(char* line) {
         Console.println("Background job canceled (was queued)");
         return;
       }
-      // Running (g_job_flag == 2)
       if (g_job_flag == 2u) {
-        // cooperative cancellation: set mailbox flag and mark state
         g_bg_cancel_requested = true;
         mailboxSetCancelFlag(1);
         Console.println("Cancellation requested (mailbox flag set). If blob cooperates, it will stop shortly.");
@@ -1418,15 +1354,12 @@ static void handleCommand(char* line) {
 #if defined(PICO_ON_DEVICE)
           Console.println("Force kill: resetting core1 (PICO_ON_DEVICE)");
           multicore_reset_core1();
-          // After reset you probably need to relaunch core1_entry depending on your platform;
-          // if your platform auto-launches setup1/loop1, core1 will restart automatically.
 #else
           Console.println("Force kill not supported on this build (no PICO_ON_DEVICE).");
 #endif
         }
         return;
       }
-      // If g_job_flag is something else, attempt best-effort cancel
       g_bg_cancel_requested = true;
       Console.println("Cancellation requested (best-effort).");
     } else {
@@ -1457,10 +1390,10 @@ static void handleCommand(char* line) {
     Console.printf("Used PSRAM Heap:   %d bytes\n", rp2040.getUsedPSRAMHeap());
     Console.printf("Free Stack:        %d bytes\n", rp2040.getFreeStack());
     psramBB.printCapacityReport();
-  } else if (!strcmp(t0, "psramsmoketest")) {
+  } else if (!strcmp(t0, "psramsmoketestunsafe")) {
     psramBB.printCapacityReport();
     psramSmokeTest();
-  } else if (!strcmp(t0, "psramsmoketestsafe")) {
+  } else if (!strcmp(t0, "psramsmoketest")) {
     psramBB.printCapacityReport();
     psramSafeSmokeTest();
   } else if (!strcmp(t0, "reboot")) {
@@ -1554,58 +1487,84 @@ static void handleCommand(char* line) {
     Console.println("Unknown command. Type 'help'.");
   }
 }
+
 // ========== Setup and main loop ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
   Serial.println("System booting..");
-  // Initialize mirrored console
-  // If you need non-default SPI or pins, configure your SPI object first
-  // Example RP2040 (SPI1):
-  // SPI1.setRX(12); SPI1.setSCK(14); SPI1.setTX(15); SPI1.begin();
-  // Attach TFT (SPI bus, CS, DC, RST, width, height, rotation, invert)
-  // Replace SPI with SPI1 if using a secondary bus, and pins with your wiring.
-  Console.tftAttach(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST, /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true, /*mosi=*/PIN_TFT_MOSI, /*sck=*/PIN_TFT_SCK, /*spiHz=*/62500000);
+
+  // Initialize TFT Console
+  Console.tftAttach(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST,
+                    /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true,
+                    /*mosi=*/PIN_TFT_MOSI, /*sck=*/PIN_TFT_SCK, /*spiHz=*/62500000);
   Console.tftSetTextSize(1);
   Console.tftSetColors(0xFFFF, 0x0000);  // white on black
   Console.begin();
-  // Initialize flash and PSRAM bitbang drivers
+
+  // Initialize flash
   flashBB.begin();
+
+  // ---------- PSRAM CS mode selection ----------
+  // Default: Direct CS (no special configuration needed)
+  // psramBB constructed with CS0..CS3 already.
+
+  // 74HC138-only mode (requires PSRAMMulti.h with configureDecoder138):
+  // - 138.G1 -> VCC
+  // - 138.G2A & 138.G2B -> PIN_138_EN (active LOW)
+  // - 138.A0/A1[/A2] -> PIN_138_A0/PIN_138_A1[/PIN_138_A2]
+  // - 138.Y0..Y3 -> PSRAM CS0..CS3
+  // Steps:
+  //   1) Comment out the Direct CS psramBB constructor above.
+  //   2) Uncomment the bare constructor for psramBB.
+  //   3) Uncomment the configureDecoder138 call below.
+  // psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
+
+  // 74HC138 + 74HC595 mode (requires PSRAMMulti.h with configureDecoder138Via595):
+  // - 595.SER <- MOSI, 595.SRCLK <- SCK, 595.RCLK <- PIN_595_LATCH
+  // - 595.Q0->138.A0, 595.Q1->138.A1, 595.Q2->138.G2A/G2B (active LOW)
+  // - 138.G1->VCC, 138.A2->GND (for 4 chips), Y0..Y3->PSRAM CS0..CS3
+  // Steps:
+  //   1) Comment out the Direct CS psramBB constructor above.
+  //   2) Uncomment the bare constructor for psramBB.
+  //   3) Uncomment the configureDecoder138Via595 call below.
+  // psramBB.configureDecoder138Via595(PSRAM_NUM_CHIPS, PIN_595_LATCH, /*qBitA0=*/0, /*qBitA1=*/1, /*qBitEN=*/2, /*enActiveLow=*/true);
+
+  // Start PSRAM bitbang
+  /*psramBB.begin();
+  psramBB.setClockDelayUs(PSRAM_CLOCK_DELAY_US);*/
+
+
+  // Configure default 74HC138 CS selection
+  psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
   psramBB.begin();
   psramBB.setClockDelayUs(PSRAM_CLOCK_DELAY_US);
-  // Avoid configuring QPI IO2/IO3 lines to prevent pin conflict with TFT MOSI (GP14)
-  // Only enable if you truly need QPI and your wiring does not conflict.
+
+  // Avoid configuring QPI IO2/IO3 lines to prevent pin conflict unless you wired them explicitly.
   // if (PSRAM_ENABLE_QPI) {
   //   psramBB.setExtraDataPins(PIN_PSRAM_IO2, PIN_PSRAM_IO3);
   //   psramBB.setModeQuad(true);
   // }
+
   bindActiveFs(g_storage);
   bool mounted = (g_storage == StorageBackend::Flash) ? activeFs.mount(true) : activeFs.mount(false);
   if (!mounted) { Console.println("FS mount failed on active storage"); }
+
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-  /*SPI.setRX(0);  // (RP2040 ZERO pin 0, 4)
-  SPI.setCS(1);  // (RP2040 ZERO pin 1, 5, 17)
-  SPI.setSCK(2); // (RP2040 ZERO pin 2, 6, 18)
-  SPI.setTX(3);  // (RP2040 ZERO pin 3, 7, 19)
-  SPI.begin();
-  SPI1.setRX(12);  // (RP2040 ZERO pin 8, 12)
-  SPI1.setCS(13);  // (RP2040 ZERO pin 9, 13)
-  SPI1.setSCK(14); // (RP2040 ZERO pin 10, 14)
-  SPI1.setTX(15);  // (RP2040 ZERO pin 11, 15)
-  SPI1.begin();*/
+
   tft.init(tft_w, tft_h);
   tft.setRotation(tft_rot & 3);
-  // Bump SPI to 62.5MHz (safe on RP2040); try 75-80MHz if stable
   tft.setSPISpeed(112500000);
   tft.invertDisplay(true);
   tft_ready = true;
   tft_w = tft.width();
   tft_h = tft.height();
   tftConsoleBegin();
-  psramBB.printCapacityReport();
-  //psramSmokeTest();
+
+  psramSafeSmokeTest();
+
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {

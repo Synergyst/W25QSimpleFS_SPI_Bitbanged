@@ -1,15 +1,33 @@
 /*
   PSRAMMulti.h - Single-header multi-chip PSRAM aggregator + generic FS
   - Aggregates up to PSRAMMULTI_MAX_CHIPS identical PSRAM devices sharing MISO/MOSI/SCK
-    with unique CS pins into one linear address space.
-  - Reuses PSRAMBitbang's bit-banged SPI engine (transfer and bus timing), but manages CS per bank.
-  - Includes a generic FS (PSRAMSimpleFS_Generic<Driver>) compatible with any Driver that
-    implements:
-       bool readData03(uint32_t addr, uint8_t* buf, size_t len);
-       bool writeData02(uint32_t addr, const uint8_t* buf, size_t len, bool needsWriteEnable=false);
-       uint32_t capacity() const;
-*/
+    with a selectable CS-selection method:
+      0) Direct CS pins (one GPIO per PSRAM chip)
+      1) 74HC138-only: Address A0/A1(/A2) + single enable (G2A/G2B)
+      2) 74HC138 + 74HC595: A0/A1/EN driven by 595 via MOSI/SCK + LATCH
 
+  74HC138 quick wiring (single-decoder, 4 chips; outputs are ACTIVE-LOW):
+    Pin 16 VCC -> 3.3V
+    Pin  8 GND -> GND
+    Pin  6 G1  -> 3.3V (must be HIGH to enable the decoder)
+    Pin  4 G2A -> MCU EN (active LOW), with 10k pull-up to 3.3V
+    Pin  5 G2B -> MCU EN (tie to pin 4), with 10k pull-up to 3.3V
+    Pin  1 A0  -> MCU A0 (select LSB)   [in the sketch: GP8]
+    Pin  2 A1  -> MCU A1 (select MSB)   [in the sketch: GP7]
+    Pin  3 A2  -> GND (only 4 outputs used)
+    Pin 15 Y0  -> PSRAM CS0 (plus 10k pull-up to 3.3V)
+    Pin 14 Y1  -> PSRAM CS1 (plus 10k pull-up to 3.3V)
+    Pin 13 Y2  -> PSRAM CS2 (plus 10k pull-up to 3.3V)
+    Pin 12 Y3  -> PSRAM CS3 (plus 10k pull-up to 3.3V)
+    Decoupling: 0.1 µF close to pin 16/8.
+
+  Safe sequence to select a bank:
+    1) EN inactive (HIGH on G2A/G2B)
+    2) Set A0/A1 address for target bank
+    3) EN active (LOW on G2A/G2B) to assert Yx low -> selects PSRAM CS
+    4) SPI transfer
+    5) EN inactive before changing A0/A1 again
+*/
 #ifndef PSRAMMULTI_H
 #define PSRAMMULTI_H
 
@@ -17,7 +35,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-
 #include "PSRAMBitbang.h"
 
 #ifndef PSRAMMULTI_MAX_CHIPS
@@ -26,66 +43,130 @@
 
 class PSRAMAggregateDevice {
 public:
-  // Construct with bus pins and per-chip capacity (bytes).
-  // Add chips later with addChip(csPin) before begin().
+  enum class CSSelMode : uint8_t {
+    Direct = 0,
+    Decoder138 = 1,
+    Decoder138_595 = 2
+  };
+
+  // Bare device; configure CS method before begin()
   PSRAMAggregateDevice(uint8_t pin_miso,
                        uint8_t pin_mosi,
                        uint8_t pin_sck,
                        uint32_t perChipCapacityBytes)
-    : _bus(/*dummy CS not used*/ 0xFF, pin_miso, pin_mosi, pin_sck),
-      _pinMISO(pin_miso),
-      _pinMOSI(pin_mosi),
-      _pinSCK(pin_sck),
-      _chipCount(0),
-      _perChipCapacity(perChipCapacityBytes),
-      _halfCycleDelayUs(1),
-      _useQuad(false),
-      _io2(255), _io3(255) {}
+    : _bus(/*dummy CS*/ 0xFF, pin_miso, pin_mosi, pin_sck),
+      _pinMISO(pin_miso), _pinMOSI(pin_mosi), _pinSCK(pin_sck),
+      _chipCount(0), _perChipCapacity(perChipCapacityBytes),
+      _halfCycleDelayUs(1), _useQuad(false), _io2(255), _io3(255),
+      _mode(CSSelMode::Direct),
+      _decEn(255), _decA0(255), _decA1(255), _decA2(255), _decEnActiveLow(true),
+      _srLatch(255), _srMapA0(0), _srMapA1(1), _srMapEN(2), _srEnActiveLow(true) {}
 
-  // Construct with an array of CS pins.
+  // Direct mode constructor with CS pin array
   PSRAMAggregateDevice(const uint8_t* csPins, size_t count,
                        uint8_t pin_miso,
                        uint8_t pin_mosi,
                        uint8_t pin_sck,
                        uint32_t perChipCapacityBytes)
     : PSRAMAggregateDevice(pin_miso, pin_mosi, pin_sck, perChipCapacityBytes) {
+    _mode = CSSelMode::Direct;
     for (size_t i = 0; i < count; ++i) addChip(csPins[i]);
   }
 
 #if __cplusplus >= 201103L
-  // Construct with initializer_list of CS pins.
   PSRAMAggregateDevice(std::initializer_list<uint8_t> csList,
                        uint8_t pin_miso,
                        uint8_t pin_mosi,
                        uint8_t pin_sck,
                        uint32_t perChipCapacityBytes)
     : PSRAMAggregateDevice(pin_miso, pin_mosi, pin_sck, perChipCapacityBytes) {
+    _mode = CSSelMode::Direct;
     for (uint8_t cs : csList) addChip(cs);
   }
 #endif
 
-  // Add a chip by CS pin; call before begin().
+  // Add chip for direct mode
   bool addChip(uint8_t csPin) {
     if (_chipCount >= PSRAMMULTI_MAX_CHIPS) return false;
     _csPins[_chipCount++] = csPin;
+    _mode = CSSelMode::Direct;
+    return true;
+  }
+
+  // Configure 74HC138-only mode
+  bool configureDecoder138(uint8_t chipCount,
+                           uint8_t decEn, uint8_t decA0, uint8_t decA1,
+                           uint8_t decA2 = 255,
+                           bool enActiveLow = true) {
+    if (chipCount == 0 || chipCount > 8) return false;
+    _chipCount = chipCount;
+    _mode = CSSelMode::Decoder138;
+    _decEn = decEn;
+    _decA0 = decA0;
+    _decA1 = decA1;
+    _decA2 = decA2;
+    _decEnActiveLow = enActiveLow;
+    return true;
+  }
+
+  // Configure 74HC138 via 74HC595 mode
+  bool configureDecoder138Via595(uint8_t chipCount,
+                                 uint8_t srLatchPin,
+                                 uint8_t qBitA0 = 0,
+                                 uint8_t qBitA1 = 1,
+                                 uint8_t qBitEN = 2,
+                                 bool enActiveLow = true) {
+    if (chipCount == 0 || chipCount > 8) return false;
+    if (qBitA0 > 7 || qBitA1 > 7 || qBitEN > 7) return false;
+    _chipCount = chipCount;
+    _mode = CSSelMode::Decoder138_595;
+    _srLatch = srLatchPin;
+    _srMapA0 = (int8_t)qBitA0;
+    _srMapA1 = (int8_t)qBitA1;
+    _srMapEN = (int8_t)qBitEN;
+    _srEnActiveLow = enActiveLow;
     return true;
   }
 
   void begin() {
-    // Configure shared bus pins (we do not call _bus.begin() to avoid touching a dummy CS)
     pinMode(_pinMOSI, OUTPUT);
     pinMode(_pinSCK, OUTPUT);
     pinMode(_pinMISO, INPUT);
     digitalWrite(_pinSCK, LOW);
     digitalWrite(_pinMOSI, LOW);
 
-    // Configure per-chip CS lines
-    for (uint8_t i = 0; i < _chipCount; ++i) {
-      pinMode(_csPins[i], OUTPUT);
-      digitalWrite(_csPins[i], HIGH);
+    switch (_mode) {
+      case CSSelMode::Direct:
+        for (uint8_t i = 0; i < _chipCount; ++i) {
+          pinMode(_csPins[i], OUTPUT);
+          digitalWrite(_csPins[i], HIGH);
+        }
+        break;
+      case CSSelMode::Decoder138:
+        if (_decEn != 255) { pinMode(_decEn, OUTPUT); }
+        if (_decA0 != 255) {
+          pinMode(_decA0, OUTPUT);
+          digitalWrite(_decA0, LOW);
+        }
+        if (_decA1 != 255) {
+          pinMode(_decA1, OUTPUT);
+          digitalWrite(_decA1, LOW);
+        }
+        if (_decA2 != 255) {
+          pinMode(_decA2, OUTPUT);
+          digitalWrite(_decA2, LOW);
+        }
+        if (_decEn != 255) digitalWrite(_decEn, _decEnActiveLow ? HIGH : LOW);  // disable
+        break;
+      case CSSelMode::Decoder138_595:
+        if (_srLatch != 255) {
+          pinMode(_srLatch, OUTPUT);
+          digitalWrite(_srLatch, LOW);
+        }
+        srWriteByte(srCompose(0, /*enActive*/ false));
+        break;
     }
 
-    // Timing and optional quad config pass-through to the engine (IO2/IO3 INPUT is fine here)
     _bus.setClockDelayUs(_halfCycleDelayUs);
     if (_io2 != 255 || _io3 != 255) {
       _bus.setExtraDataPins(_io2, _io3);
@@ -97,22 +178,18 @@ public:
     _io2 = io2;
     _io3 = io3;
   }
-
   void setModeQuad(bool enable) {
     _useQuad = enable;
     _bus.setModeQuad(enable);
   }
-
   void setClockDelayUs(uint8_t halfCycleDelayUs) {
     _halfCycleDelayUs = halfCycleDelayUs;
     _bus.setClockDelayUs(halfCycleDelayUs);
   }
 
-  // Total linear capacity across all banks
   uint32_t capacity() const {
     return _perChipCapacity * _chipCount;
   }
-
   uint32_t perChipCapacity() const {
     return _perChipCapacity;
   }
@@ -120,7 +197,6 @@ public:
     return _chipCount;
   }
 
-  // Read JEDEC for a specific bank (0..chipCount-1)
   void readJEDEC(uint8_t bank, uint8_t* out, size_t len) {
     if (bank >= _chipCount || !out || len == 0) return;
     uint8_t cmd = PSRAM_CMD_READ_JEDEC;
@@ -130,18 +206,15 @@ public:
     csHigh(bank);
   }
 
-  // Flat address space read (0x03)
   bool readData03(uint32_t addr, uint8_t* buf, size_t len) {
     if (len == 0) return true;
     if (!buf) return false;
     if (_chipCount == 0) return false;
     uint32_t total = capacity();
     if (addr >= total) return false;
-
     size_t remaining = len;
     uint32_t cur = addr;
     uint8_t* p = buf;
-
     while (remaining > 0) {
       uint8_t bank;
       uint32_t off;
@@ -155,18 +228,15 @@ public:
     return true;
   }
 
-  // Flat address space write (0x02)
   bool writeData02(uint32_t addr, const uint8_t* buf, size_t len, bool needsWriteEnable = false) {
     if (len == 0) return true;
     if (!buf) return false;
     if (_chipCount == 0) return false;
     uint32_t total = capacity();
     if (addr >= total) return false;
-
     size_t remaining = len;
     uint32_t cur = addr;
     const uint8_t* p = buf;
-
     while (remaining > 0) {
       uint8_t bank;
       uint32_t off;
@@ -180,7 +250,6 @@ public:
     return true;
   }
 
-  // Optional helper: raw MISO scan on a bank
   void rawMisoScan(uint8_t bank, uint8_t* out, size_t len) {
     if (bank >= _chipCount || !out || len == 0) return;
     csLow(bank);
@@ -188,23 +257,16 @@ public:
     csHigh(bank);
   }
 
-  // Paste inside PSRAMAggregateDevice (public:)
   bool printCapacityReport(Stream& out = Serial) {
-    out.println(F("PSRAM capacity report:"));
-    out.print(F("  Banks: "));
-    out.println(_chipCount);
-    out.print(F("  Per-chip: "));
-    out.print(_perChipCapacity);
-    out.print(F(" bytes ("));
-    out.print(_perChipCapacity / (1024UL * 1024UL));
-    out.println(F(" MB)"));
     const uint32_t total = capacity();
-    out.print(F("  Total: "));
-    out.print(total);
-    out.print(F(" bytes ("));
-    out.print(total / (1024UL * 1024UL));
-    out.println(F(" MB)"));
-
+    out.printf("\nPSRAM capacity report:\n  Banks: \t\t%d\n  Per-chip: \t\t%lu bytes (%lu MB)\n  Total: \t\t%lu bytes (%lu MB)\n",
+               _chipCount, _perChipCapacity, _perChipCapacity / (1024UL * 1024UL), total, total / (1024UL * 1024UL));
+    out.print("  CS scheme: \t\t");
+    switch (_mode) {
+      case CSSelMode::Direct: out.println("Direct CS pins"); break;
+      case CSSelMode::Decoder138: out.println("74HC138 (A0/A1[/A2]+EN)"); break;
+      case CSSelMode::Decoder138_595: out.println("74HC138 via 74HC595"); break;
+    }
     uint8_t okCount = 0;
     for (uint8_t i = 0; i < _chipCount; ++i) {
       uint8_t id[6] = { 0 };
@@ -216,12 +278,10 @@ public:
       }
       const bool valid = !(allFF || all00);
       if (valid) ++okCount;
-
-      out.print(F("  Bank "));
-      out.print(i);
-      out.print(F(" (CS="));
-      out.print(_csPins[i]);
-      out.print(F(") JEDEC: "));
+      out.printf("  Bank %d (sel=", i);
+      if (_mode == CSSelMode::Direct) out.printf("CS pin %d", _csPins[i]);
+      else out.printf("addr=%d", i);
+      out.print(") \tJEDEC: ");
       for (size_t k = 0; k < sizeof(id); ++k) {
         if (k) out.print(' ');
         if (id[k] < 16) out.print('0');
@@ -229,21 +289,45 @@ public:
       }
       out.println(valid ? F("  [OK]") : F("  [NO RESP]"));
     }
-
-    out.print(F("Probe result: "));
-    out.print(okCount);
-    out.print(F("/"));
-    out.print(_chipCount);
-    out.println(F(" banks responded"));
+    out.printf("Probe result: %d/%d banks responded\n", okCount, _chipCount);
     return (okCount == _chipCount);
   }
 
 private:
   inline void csLow(uint8_t bank) {
-    digitalWrite(_csPins[bank], LOW);
+    switch (_mode) {
+      case CSSelMode::Direct:
+        digitalWrite(_csPins[bank], LOW);
+        break;
+      case CSSelMode::Decoder138:
+        if (_decEn != 255) digitalWrite(_decEn, _decEnActiveLow ? HIGH : LOW);
+        if (_decA0 != 255) digitalWrite(_decA0, (bank >> 0) & 1);
+        if (_decA1 != 255) digitalWrite(_decA1, (bank >> 1) & 1);
+        if (_decA2 != 255) digitalWrite(_decA2, (bank >> 2) & 1);
+        if (_halfCycleDelayUs) delayMicroseconds(_halfCycleDelayUs);
+        if (_decEn != 255) digitalWrite(_decEn, _decEnActiveLow ? LOW : HIGH);
+        break;
+      case CSSelMode::Decoder138_595:
+        srWriteByte(srCompose(bank, /*enActive*/ false));
+        if (_halfCycleDelayUs) delayMicroseconds(_halfCycleDelayUs);
+        srWriteByte(srCompose(bank, /*enActive*/ true));
+        break;
+    }
   }
+
   inline void csHigh(uint8_t bank) {
-    digitalWrite(_csPins[bank], HIGH);
+    (void)bank;
+    switch (_mode) {
+      case CSSelMode::Direct:
+        for (uint8_t i = 0; i < _chipCount; ++i) digitalWrite(_csPins[i], HIGH);
+        break;
+      case CSSelMode::Decoder138:
+        if (_decEn != 255) digitalWrite(_decEn, _decEnActiveLow ? HIGH : LOW);
+        break;
+      case CSSelMode::Decoder138_595:
+        srWriteByte(srCompose(_lastAddr595, /*enActive*/ false));
+        break;
+    }
   }
 
   bool mapAddress(uint32_t addr, size_t reqLen,
@@ -261,11 +345,8 @@ private:
   }
 
   bool bankRead(uint8_t bank, uint32_t off, uint8_t* buf, size_t len) {
-    uint8_t cmd[4];
-    cmd[0] = PSRAM_CMD_READ_03;
-    cmd[1] = (uint8_t)((off >> 16) & 0xFF);
-    cmd[2] = (uint8_t)((off >> 8) & 0xFF);
-    cmd[3] = (uint8_t)(off & 0xFF);
+    uint8_t cmd[4] = { PSRAM_CMD_READ_03,
+                       (uint8_t)((off >> 16) & 0xFF), (uint8_t)((off >> 8) & 0xFF), (uint8_t)(off & 0xFF) };
     csLow(bank);
     _bus.transfer(cmd, nullptr, 4);
     _bus.transfer(nullptr, buf, len);
@@ -281,11 +362,8 @@ private:
       _bus.transfer(we);
       csHigh(bank);
     }
-    uint8_t cmd[4];
-    cmd[0] = PSRAM_CMD_WRITE_02;
-    cmd[1] = (uint8_t)((off >> 16) & 0xFF);
-    cmd[2] = (uint8_t)((off >> 8) & 0xFF);
-    cmd[3] = (uint8_t)(off & 0xFF);
+    uint8_t cmd[4] = { PSRAM_CMD_WRITE_02,
+                       (uint8_t)((off >> 16) & 0xFF), (uint8_t)((off >> 8) & 0xFF), (uint8_t)(off & 0xFF) };
     csLow(bank);
     _bus.transfer(cmd, nullptr, 4);
     _bus.transfer(buf, nullptr, len);
@@ -293,7 +371,42 @@ private:
     return true;
   }
 
-  // Members: order matches initialization to avoid -Wreorder
+  // 74HC595 helpers for mode 2
+  inline uint8_t srCompose(uint8_t addr, bool enActive) {
+    uint8_t v = 0xFF;
+    if (_srMapA0 >= 0) {
+      if (addr & 0x01) v |= (1u << _srMapA0);
+      else v &= ~(1u << _srMapA0);
+    }
+    if (_srMapA1 >= 0) {
+      if (addr & 0x02) v |= (1u << _srMapA1);
+      else v &= ~(1u << _srMapA1);
+    }
+    if (_srMapEN >= 0) {
+      bool wantLow = (_srEnActiveLow ? enActive : !enActive);
+      if (wantLow) v &= ~(1u << _srMapEN);
+      else v |= (1u << _srMapEN);
+    }
+    _lastAddr595 = (addr & 0x07);
+    return v;
+  }
+  inline void srPulseLatch() {
+    if (_srLatch == 255) return;
+    digitalWrite(_srLatch, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(_srLatch, LOW);
+  }
+  inline void srWriteByte(uint8_t v) {
+    for (int b = 7; b >= 0; --b) {
+      digitalWrite(_pinSCK, LOW);
+      digitalWrite(_pinMOSI, (v >> b) & 1);
+      digitalWrite(_pinSCK, HIGH);
+    }
+    digitalWrite(_pinSCK, LOW);
+    digitalWrite(_pinMOSI, LOW);
+    srPulseLatch();
+  }
+
   PSRAMBitbang _bus;
   uint8_t _pinMISO, _pinMOSI, _pinSCK;
   uint8_t _csPins[PSRAMMULTI_MAX_CHIPS];
@@ -302,6 +415,18 @@ private:
   uint8_t _halfCycleDelayUs;
   bool _useQuad;
   uint8_t _io2, _io3;
+
+  CSSelMode _mode;
+
+  // 74HC138 fields
+  uint8_t _decEn, _decA0, _decA1, _decA2;
+  bool _decEnActiveLow;
+
+  // 74HC595 fields (for mode 2)
+  uint8_t _srLatch;
+  int8_t _srMapA0, _srMapA1, _srMapEN;
+  bool _srEnActiveLow;
+  uint8_t _lastAddr595 = 0;
 };
 
 // -------------------------
@@ -360,7 +485,7 @@ public:
         break;
       }
       sawAny = true;
-      if (buf[0] != 0x57 || buf[1] != 0x46) continue;  // 'W' 'F'
+      if (buf[0] != 0x57 || buf[1] != 0x46) continue;
       uint8_t flags = buf[2];
       uint8_t nameLen = buf[3];
       if (nameLen == 0 || nameLen > MAX_NAME) continue;
@@ -376,9 +501,7 @@ public:
         if (_fileCount < MAX_FILES) {
           idx = _fileCount++;
           copyName(_files[idx].name, nameBuf);
-        } else {
-          continue;
-        }
+        } else continue;
       }
       bool deleted = (flags & 0x01) != 0;
       _files[idx].seq = seq;
@@ -396,9 +519,7 @@ public:
     }
     if (!sawAny) {
       _dirWriteOffset = 0;
-      if (autoFormatIfEmpty) {
-        format();
-      }
+      if (autoFormatIfEmpty) format();
     }
     _nextSeq = maxSeq + 1;
     if (_nextSeq == 0) _nextSeq = 1;
@@ -441,7 +562,6 @@ public:
     return true;
   }
 
-  // Primary API with our enum
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, WriteMode mode = WriteMode::ReplaceIfExists) {
     if (!validName(name) || size > 0xFFFFFFUL) return false;
     if (_dirWriteOffset + ENTRY_SIZE > DIR_SIZE) return false;
@@ -458,14 +578,10 @@ public:
     computeCapacities(_dataHead);
     return true;
   }
-
-  // Compatibility overload: accept int mode (0=ReplaceIfExists, 1=FailIfExists)
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, int modeInt) {
     WriteMode m = (modeInt == (int)WriteMode::FailIfExists) ? WriteMode::FailIfExists : WriteMode::ReplaceIfExists;
     return writeFile(name, data, size, m);
   }
-
-  // Compatibility overload: accept any enum-like type (e.g., PSRAMSimpleFS::WriteMode)
   template<typename ModeT>
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, ModeT modeOther) {
     return writeFile(name, data, size, (int)modeOther);
@@ -582,15 +698,12 @@ public:
       if (!_files[i].deleted) ++n;
     return n;
   }
-
   uint32_t nextDataAddr() const {
     return _dataHead;
   }
-
   uint32_t capacity() const {
     return _capacity;
   }
-
   uint32_t dataRegionStart() const {
     return DATA_START;
   }
@@ -634,9 +747,8 @@ private:
     dst[n] = '\0';
   }
   int findIndexByName(const char* name) const {
-    for (size_t i = 0; i < _fileCount; ++i) {
+    for (size_t i = 0; i < _fileCount; ++i)
       if (strncmp(_files[i].name, name, MAX_NAME) == 0) return (int)i;
-    }
     return -1;
   }
   void upsertFileIndex(const char* name, uint32_t addr, uint32_t size, bool deleted) {
@@ -656,8 +768,8 @@ private:
     if (_dirWriteOffset + ENTRY_SIZE > DIR_SIZE) return false;
     uint8_t rec[ENTRY_SIZE];
     memset(rec, 0xFF, ENTRY_SIZE);
-    rec[0] = 0x57;  // 'W'
-    rec[1] = 0x46;  // 'F'
+    rec[0] = 0x57;
+    rec[1] = 0x46;
     rec[2] = flags;
     uint8_t nameLen = (uint8_t)min((size_t)MAX_NAME, strlen(name));
     rec[3] = nameLen;
@@ -672,10 +784,8 @@ private:
   void computeCapacities(uint32_t maxEnd) {
     int idxs[MAX_FILES];
     size_t n = 0;
-    for (size_t i = 0; i < _fileCount; ++i) {
-      if (_files[i].deleted) continue;
-      idxs[n++] = (int)i;
-    }
+    for (size_t i = 0; i < _fileCount; ++i)
+      if (!_files[i].deleted) idxs[n++] = (int)i;
     for (size_t i = 1; i < n; ++i) {
       int key = idxs[i];
       size_t j = i;
@@ -694,7 +804,6 @@ private:
   }
 };
 
-// Convenience alias
 using PSRAMSimpleFS_Multi = PSRAMSimpleFS_Generic<PSRAMAggregateDevice>;
 
-#endif  // PSRAMMULTI_H
+#endif
