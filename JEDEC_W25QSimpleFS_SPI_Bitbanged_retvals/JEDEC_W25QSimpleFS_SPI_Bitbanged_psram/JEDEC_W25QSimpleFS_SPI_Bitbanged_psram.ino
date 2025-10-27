@@ -31,22 +31,25 @@
 #define FILE_RET42 "ret42"
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
-struct BlobReg;  // Forward declaration so findBlob can be placed earlier if needed
-static ConsolePrint Console;
+
+struct BlobReg;               // Forward declaration so findBlob can be placed earlier if needed
+static ConsolePrint Console;  // Console/TFT (optional) wrapper
+
 // ========== Static buffer-related compile-time constant (used previously as fs.SECTOR_SIZE) ==========
 #define FS_SECTOR_SIZE 4096
+
 // ========== bitbang pin definitions (flash) ==========
 const uint8_t PIN_FLASH_MISO = 11;  // GP11
 const uint8_t PIN_FLASH_CS = 28;    // GP28
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_FLASH_MOSI = 12;  // GP12
+
 // ========== bitbang pin definitions (psram) ==========
-const bool PSRAM_ENABLE_QPI = false;
-// Small delay helps ensure decoder/address settle before asserting EN
-const uint8_t PSRAM_CLOCK_DELAY_US = 1;
-const uint8_t PIN_PSRAM_MISO = 11;  // GP11
-const uint8_t PIN_PSRAM_MOSI = 12;  // GP12
-const uint8_t PIN_PSRAM_SCK = 10;   // GP10
+const bool PSRAM_ENABLE_QPI = false;     // Should we enable the PSRAM QPI-mode?
+const uint8_t PSRAM_CLOCK_DELAY_US = 1;  // Small delay helps ensure decoder/address settle before asserting EN
+const uint8_t PIN_PSRAM_MISO = 11;       // GP11
+const uint8_t PIN_PSRAM_MOSI = 12;       // GP12
+const uint8_t PIN_PSRAM_SCK = 10;        // GP10
 //const uint8_t PIN_PSRAM_IO2 = ;  // only used if QPI enabled
 //const uint8_t PIN_PSRAM_IO3 = ;  // only used if QPI enabled
 // Direct CS pins (default mode)
@@ -62,6 +65,7 @@ const uint8_t PIN_138_EN = 9;  // 74HC138 pins 4+5 (G2A/G2B tied), 10k pull-up t
 const uint8_t PIN_138_A2 = 255;  // 255 means "not used"; tie 74HC138 pin 3 (A2) to GND
 // OPTIONAL: 74HC595 latch pin for method 138+595 (SER=MOSI, SRCLK=SCK are reused)
 const uint8_t PIN_595_LATCH = 4;  // 595.RCLK (unused in 138-only mode)
+
 // ========== TFT display pins (SPI via Adafruit ST7789) ==========
 // Wiring for GMT020-02 2.0" TFT SPI on WaveShare RP2040 Zero (if used):
 const uint8_t PIN_TFT_SCK = 10;   // SCL pin
@@ -70,17 +74,21 @@ const uint8_t PIN_TFT_RST = 14;   // RST pin
 const uint8_t PIN_TFT_DC = 15;    // DC pin
 const uint8_t PIN_TFT_CS = 6;     // CS pin
 const uint8_t PIN_TFT_MISO = 11;  // (unused)
+
 // ========== TFT state ==========
 static bool tft_ready = false;
 static uint16_t tft_w = 240;
 static uint16_t tft_h = 320;
 static uint8_t tft_rot = 1;  // 0..3
+
 // ========== Simple TFT text console mirroring for Serial output ==========
 static uint16_t tft_console_fg = 0xFFFF;  // white
 static uint16_t tft_console_bg = 0x0000;  // black
 static uint8_t tft_console_textsize = 1;
+
 // ========== Adafruit ST7789 instance ==========
 static Adafruit_ST7789 tft = Adafruit_ST7789(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCK, PIN_TFT_RST);
+
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 const size_t PERSIST_LEN = 32;
 enum class StorageBackend {
@@ -96,13 +104,12 @@ constexpr uint8_t PSRAM_NUM_CHIPS = 4;
 constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;  // Example: 8MB per chip.
 constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * PSRAM_NUM_CHIPS;
 // ---------- PSRAM device: choose one of the two constructor styles ----------
-// PSRAM aggregate device — 74HC138-only default (bare ctor, configured in setup())
-PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
-// If later using Direct CS, replace with:
-// PSRAMAggregateDevice psramBB({ CS0, CS1, CS2, CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
+PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // PSRAM aggregate device — 74HC138-only default (bare ctor, configured in setup())
+//PSRAMAggregateDevice psramBB({ CS0, CS1, CS2, CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // If using Direct CS
 // If later using 74HC138+74HC595, keep bare ctor and call configureDecoder138Via595 in setup().
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
 static bool g_dev_mode = true;
+
 // ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -227,6 +234,7 @@ static void bindActiveFs(StorageBackend backend) {
     };
   }
 }
+
 // ========== Blob registry from your original file ==========
 struct BlobReg {
   const char* id;
@@ -238,6 +246,7 @@ static const BlobReg g_blobs[] = {
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
+
 // ========== TFT console helpers to mirror Serial output ==========
 static void tftConsoleBegin() {
   if (!tft_ready) return;
@@ -252,6 +261,7 @@ static void tftConsoleClear() {
   tft.fillScreen(tft_console_bg);
   tft.setCursor(0, 0);
 }
+
 // ========== helpers using Console ==========
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
@@ -260,6 +270,7 @@ static void printHexByte(uint8_t b) {
 // ========== Return mailbox reservation (Scratch) ==========
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
+
 // ========== Mailbox helpers ==========
 static inline void mailboxClearFirstByte() {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
@@ -276,6 +287,7 @@ static void mailboxPrintIfAny() {
   }
   Console.println("\"");
 }
+
 // ========== Core1 execution plumbing (mailbox) ==========
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
@@ -527,6 +539,7 @@ static inline uint8_t mailboxGetCancelFlag() {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   return mb[0];
 }
+
 // ========== FS helpers and console ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -1010,6 +1023,7 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
+
 // ========== Serial console / command handling ==========
 static char lineBuf[FS_SECTOR_SIZE];
 static bool readLine() {
@@ -1466,6 +1480,7 @@ static void handleCommand(char* line) {
     Console.println("Unknown command. Type 'help'.");
   }
 }
+
 // ========== Setup and main loop ==========
 void setup() {
   Serial.begin(115200);
@@ -1505,7 +1520,7 @@ void setup() {
 
   tft.init(tft_w, tft_h);
   tft.setRotation(tft_rot & 3);
-  tft.setSPISpeed(112500000);
+  tft.setSPISpeed(62500000);
   tft.invertDisplay(true);
   tft_ready = true;
   tft_w = tft.width();
@@ -1513,7 +1528,7 @@ void setup() {
   tftConsoleBegin();
 
   // Optionally probe PSRAM now
-  psramSafeSmokeTest();
+  //psramSafeSmokeTest();
 
   Console.printf("System ready. Type 'help'\n> ");
 }
