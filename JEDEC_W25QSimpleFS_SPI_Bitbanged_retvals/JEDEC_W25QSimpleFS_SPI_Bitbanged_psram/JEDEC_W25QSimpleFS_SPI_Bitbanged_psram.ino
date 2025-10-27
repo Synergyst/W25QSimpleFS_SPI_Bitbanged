@@ -12,7 +12,7 @@
       Decoupling: 0.1 µF across VCC/GND near the chip.
   - Outputs (ACTIVE-LOW):
       74HC138 Y0..Y3 -> PSRAM CS0..CS3 respectively, each with its own 10k pull-up to 3.3V.
-  - SPI bus shared (bit-banged): MISO=GP11, MOSI=GP12, SCK=GP10
+  - SPI bus shared: MISO=GP12, MOSI=GP11, SCK=GP10
   Selection sequence (handled in library):
     EN (G2A/G2B) HIGH -> set A0/A1 -> EN LOW -> transfer -> EN HIGH
   Notes:
@@ -86,28 +86,13 @@ enum class StorageBackend {
   PSRAM_BACKEND
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-
-// Flash: restore original bitbang flash driver so W25QSimpleFS works unchanged
-/*W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
-W25QSimpleFS fsFlash(flashBB);*/
-
-// Capacity
 constexpr uint8_t PSRAM_NUM_CHIPS = 4;
 constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;  // Example: 8MB per chip.
 constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * PSRAM_NUM_CHIPS;
-
-// PSRAMAggregateDevice: use concrete class (macro selected underlying bus inside PSRAMMulti.h)
-/*PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
-PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);*/
-
-// Flash (bit-banged)
 W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
 W25QSimpleFS fsFlash(flashBB);
-
-// PSRAM aggregate using PSRAMBitbang (PSRAM_AGGREGATE_BUS defaults to PSRAMBitbang)
 PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
-
 static bool g_dev_mode = true;
 
 // ========== ActiveFS structure ==========
@@ -132,7 +117,6 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-
 static void bindActiveFs(StorageBackend backend) {
   // Helper to bind either flash or psram into activeFs at runtime
   if (backend == StorageBackend::Flash) {
@@ -279,7 +263,6 @@ static void mailboxPrintIfAny() {
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
-
 extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
   constexpr uint32_t N = 64;
@@ -301,19 +284,16 @@ extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
-
 struct ExecJob {
   uintptr_t code;               // raw aligned code address (LSB 0)
   uint32_t size;                // code size (bytes, even)
   uint32_t argc;                // number of int args (0..MAX_EXEC_ARGS)
   int32_t args[MAX_EXEC_ARGS];  // argument values
 };
-
 static volatile ExecJob g_job;
 static volatile int32_t g_result = 0;
 static volatile int32_t g_status = 0;
 static volatile uint32_t g_job_flag = 0;  // 0=idle, 1=ready, 2=running, 3=done
-
 static void core1WorkerPoll() {
   if (g_job_flag != 1u) return;
   __asm volatile("dsb" ::
@@ -343,14 +323,11 @@ static void core1WorkerPoll() {
                    : "memory");
   g_job_flag = 3u;
 }
-
 static volatile uint32_t g_timeout_override_ms = 0;
 static inline uint32_t getTimeout(uint32_t defMs) {
   return g_timeout_override_ms ? g_timeout_override_ms : defMs;
 }
-
 static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut);  // Forward declaration
-
 static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const int32_t* argv, int& retVal, uint32_t timeoutMs = 100) {
   if (g_job_flag != 0u) {
     Console.println("core1 busy");
@@ -388,7 +365,6 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const 
   g_job_flag = 0u;
   return true;
 }
-
 static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& retVal) {
   if (argc < 0) argc = 0;
   if (argc > (int)MAX_EXEC_ARGS) argc = (int)MAX_EXEC_ARGS;
@@ -412,7 +388,6 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   free(raw);
   return true;
 }
-
 // Background execution support (one background job at a time)
 static volatile void* g_bg_raw = nullptr;
 static volatile uint8_t* g_bg_buf = nullptr;
@@ -422,7 +397,6 @@ static volatile uint32_t g_bg_start_ms = 0;
 static volatile uint32_t g_bg_timeout_ms = 0;
 static char g_bg_fname[ActiveFS::MAX_NAME + 1] = { 0 };
 static volatile bool g_bg_cancel_requested = false;
-
 static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBuf, uint32_t sz,
                                 uint32_t argc, const int32_t* argv, uint32_t timeoutMs) {
   if (!fname || !raw || !alignedBuf || sz == 0) return false;
@@ -453,7 +427,6 @@ static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBu
                  g_bg_fname, (unsigned)g_job.code, (unsigned)g_job.size);
   return true;
 }
-
 static void pollBackgroundExec() {
   if (!g_bg_active) {
     if (g_job_flag == 3u) {
@@ -525,7 +498,6 @@ static void pollBackgroundExec() {
     }
   }
 }
-
 static inline void mailboxSetCancelFlag(uint8_t v) {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   mb[0] = v;
@@ -552,20 +524,17 @@ static bool checkNameLen(const char* name) {
   }
   return true;
 }
-
 static void listBlobs() {
   Console.println("Available blobs:");
   for (size_t i = 0; i < g_blobs_count; ++i) {
     Console.printf(" - %s  \t(%d bytes)\n", g_blobs[i].id, g_blobs[i].len);
   }
 }
-
 static const BlobReg* findBlob(const char* id) {
   for (size_t i = 0; i < g_blobs_count; ++i)
     if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
   return nullptr;
 }
-
 static void dumpFileHead(const char* fname, uint32_t count) {
   uint32_t sz = 0;
   if (!activeFs.getFileSize(fname, sz) || sz == 0) {
@@ -595,7 +564,6 @@ static void dumpFileHead(const char* fname, uint32_t count) {
     off += n;
   }
 }
-
 static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut) {
   rawOut = nullptr;
   alignedBuf = nullptr;
@@ -625,7 +593,6 @@ static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& aligne
   szOut = sz;
   return true;
 }
-
 static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
   if (!activeFs.exists(fname)) {
@@ -680,7 +647,6 @@ static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len,
   Console.println("Failed to update file");
   return false;
 }
-
 static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
   if (activeFs.exists(fname)) {
@@ -695,7 +661,6 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
   Console.println("Auto-create failed");
   return false;
 }
-
 static void autogenBlobWrites() {
   bool allOk = true;
   allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
@@ -703,7 +668,6 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
-
 static bool psramSafeSmokeTest() {
   // Requirements: PSRAM must be the active FS backend for safe behavior
   if (g_storage != StorageBackend::PSRAM_BACKEND) {
@@ -884,7 +848,6 @@ static inline int hexVal(char c) {
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
 }
-
 static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
@@ -914,7 +877,6 @@ static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   outLen = bytes;
   return true;
 }
-
 static int8_t b64Map[256];
 static void initB64MapOnce() {
   static bool inited = false;
@@ -926,7 +888,6 @@ static void initB64MapOnce() {
   b64Map[(uint8_t)'+'] = 62;
   b64Map[(uint8_t)'/'] = 63;
 }
-
 static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
@@ -990,7 +951,6 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   outLen = o;
   return true;
 }
-
 static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
   if (!checkNameLen(fname)) return false;
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
@@ -1013,7 +973,6 @@ static bool readLine() {
   }
   return false;
 }
-
 static int nextToken(char*& p, char*& tok) {
   while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
   if (!*p) {
@@ -1028,7 +987,6 @@ static int nextToken(char*& p, char*& tok) {
   }
   return 1;
 }
-
 static void printHelp() {
   Console.println("Commands (filename max 32 chars):");
   Console.println("  help                         - this help");
@@ -1072,7 +1030,6 @@ static void printHelp() {
   Console.println("  - Background jobs: only one background job supported at a time. Use 'bg' to query or cancel.");
   Console.println();
 }
-
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
@@ -1488,16 +1445,13 @@ void setup() {
 
   Console.printf("System ready. Type 'help'\n> ");
 }
-
 void setup1() {
   g_job_flag = 0u;
 }
-
 void loop1() {
   core1WorkerPoll();
   tight_loop_contents();
 }
-
 void loop() {
   pollBackgroundExec();  // handle any background job completions/timeouts
   if (readLine()) {
