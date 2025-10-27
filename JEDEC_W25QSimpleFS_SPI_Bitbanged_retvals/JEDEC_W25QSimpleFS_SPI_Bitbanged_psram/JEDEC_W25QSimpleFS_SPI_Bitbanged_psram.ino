@@ -19,6 +19,7 @@
   - If you later want Direct CS or 74HC138+74HC595, keep this file as-is and switch in code later.
 */
 #define CONSOLE_TFT_ENABLE
+#define CONSOLE_TFT_ATTACH 0
 #include "ConsolePrint.h"
 #include "W25QSimpleFS.h"
 #include "W25QBitbang.h"
@@ -683,173 +684,216 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
-static bool psramSmokeTest() {
-  Console.println("PSRAM smoke test...");
-  uint8_t w[256], r[256];
-  for (uint32_t i = 0; i < sizeof(w); ++i) w[i] = (uint8_t)(0xA5 ^ i);
-  if (!psramBB.writeData02(0, w, sizeof(w))) {
-    Console.println("write fail @0");
-    return false;
-  }
-  memset(r, 0, sizeof(r));
-  if (!psramBB.readData03(0, r, sizeof(r))) {
-    Console.println("read fail @0");
-    return false;
-  }
-  for (uint32_t i = 0; i < sizeof(w); ++i)
-    if (r[i] != w[i]) {
-      Console.printf("mismatch @%u\n", i);
-      return false;
-    }
-  if (psramBB.chipCount() > 1) {
-    const uint32_t per = psramBB.perChipCapacity();
-    const uint32_t addr = per - 128;
-    if (!psramBB.writeData02(addr, w, 256)) {
-      Console.println("write fail @cross");
-      return false;
-    }
-    memset(r, 0, sizeof(r));
-    if (!psramBB.readData03(addr, r, 256)) {
-      Console.println("read fail @cross");
-      return false;
-    }
-    for (uint32_t i = 0; i < 256; ++i)
-      if (r[i] != w[i]) {
-        Console.printf("mismatch @cross+%u\n", i);
-        return false;
-      }
-  }
-  Console.println("PSRAM OK");
-  return true;
-}
 static bool psramSafeSmokeTest() {
-  const size_t TEST_N = 64;
-  uint8_t chipCount = psramBB.chipCount();
-  if (chipCount == 0) {
+  // Requirements: PSRAM must be the active FS backend for safe behavior
+  if (g_storage != StorageBackend::PSRAM_BACKEND) {
+    Console.println("psramSafeSmokeTest: active storage is not PSRAM — aborting");
+    return false;
+  }
+
+  // Updated: aim to fill as much of PSRAM as possible (across all 4 banks)
+  const uint32_t UPDATE_STEP_PERCENT = 5;  // progress update granularity in percent
+  const uint32_t MAX_SLOTS = 2044;         // bump to accommodate large fills
+  const uint32_t PAGE = 256;               // write/read granularity
+  const bool VERIFY_READBACK = true;       // verify after each chunk
+
+  if (UPDATE_STEP_PERCENT == 0 || (100 % UPDATE_STEP_PERCENT) != 0) {
+    Console.println("psramSafeSmokeTest: UPDATE_STEP_PERCENT must divide 100 evenly");
+    return false;
+  }
+
+  const uint8_t chips = psramBB.chipCount();
+  if (chips == 0) {
     Console.println("\nPSRAM: no PSRAM chips detected");
     return false;
   }
-  uint32_t perChip = psramBB.perChipCapacity();
-  uint32_t totalCap = psramBB.capacity();
-  uint32_t fsNext = 0;
-  uint32_t fsDataStart = 0;
+  const uint32_t perChip = psramBB.perChipCapacity();
+  const uint32_t totalCap = psramBB.capacity();
+  const uint32_t SECT = ActiveFS::SECTOR_SIZE;
+
+  // FS head
+  uint32_t fsNext = 0, fsDataStart = 0;
   if (activeFs.nextDataAddr) fsNext = activeFs.nextDataAddr();
   if (activeFs.dataRegionStart) fsDataStart = activeFs.dataRegionStart();
-  Console.printf("\nPSRAM: chips=%u per_chip=%u total=%u fsNext=%u dataStart=%u\n",
-                 (unsigned)chipCount, (unsigned)perChip, (unsigned)totalCap, (unsigned)fsNext, (unsigned)fsDataStart);
-  bool allOk = true;
-  uint8_t orig[TEST_N];
-  uint8_t pattern[TEST_N];
-  uint8_t readback[TEST_N];
-  for (uint8_t bank = 0; bank < chipCount; ++bank) {
-    uint8_t jedec[6] = { 0 };
-    psramBB.readJEDEC(bank, jedec, sizeof(jedec));
-    bool allFF = true, all00 = true;
-    for (size_t k = 0; k < sizeof(jedec); ++k) {
-      if (jedec[k] != 0xFF) allFF = false;
-      if (jedec[k] != 0x00) all00 = false;
-    }
-    Console.print(" Bank ");
-    Console.print(bank);
-    Console.print(" JEDEC:");
-    for (size_t k = 0; k < sizeof(jedec); ++k) {
-      Console.print(' ');
-      if (jedec[k] < 0x10) Console.print('0');
-      Console.print(jedec[k], HEX);
-    }
-    Console.println((!(allFF || all00)) ? " OK" : " NO_RESP");
+
+  auto alignUp = [](uint32_t v, uint32_t a) -> uint32_t {
+    return (v + (a - 1)) & ~(a - 1);
+  };
+  const uint32_t fsAligned = alignUp(fsNext, SECT);
+
+  Console.printf("\nPSRAM multi-slot smoke: chips=%u per_chip=%u total=%u fsNext=%u fsAligned=%u\n",
+                 (unsigned)chips, (unsigned)perChip, (unsigned)totalCap, (unsigned)fsNext, (unsigned)fsAligned);
+
+  // Compute how much space is effectively free beyond FS (to maximize fill)
+  const uint32_t approxFree = (totalCap > fsAligned) ? (totalCap - fsAligned) : 0;
+  Console.printf("Plan: allocate approx %u bytes of PSRAM free space\n", (unsigned)approxFree);
+  if (approxFree == 0) {
+    Console.println("PSRAM: no free space beyond FS; smoke test aborted");
+    return false;
   }
-  Console.println();
-  for (uint8_t bank = 0; bank < chipCount; ++bank) {
-    const uint32_t chipStart = (uint32_t)bank * perChip;
-    const uint32_t chipEnd = chipStart + perChip;
-    Console.printf(" Testing chip %u (0x%08X - 0x%08X)...\n", (unsigned)bank, (unsigned)chipStart, (unsigned)(chipEnd - 1));
-    uint32_t candidate = UINT32_MAX;
-    if (fsNext >= chipStart && (fsNext + TEST_N) <= chipEnd && fsNext < totalCap) {
-      candidate = fsNext;
-    } else {
-      uint32_t prefer = chipStart;
-      if (prefer < fsDataStart) prefer = fsDataStart;
-      if (prefer + TEST_N <= chipEnd && prefer + TEST_N <= totalCap) candidate = prefer;
+
+  // Determine allocation strategy
+  uint32_t stepsDesired = 100u / UPDATE_STEP_PERCENT;
+  if (stepsDesired > MAX_SLOTS) {
+    Console.printf("NOTE: stepsDesired=%u > MAX_SLOTS=%u, capping steps to %u\n",
+                   (unsigned)stepsDesired, (unsigned)MAX_SLOTS, (unsigned)MAX_SLOTS);
+    stepsDesired = MAX_SLOTS;
+  }
+  uint32_t numSlots = stepsDesired;
+  // base reserve per slot (rounded up to SECT)
+  uint32_t baseReserve = (approxFree + numSlots - 1) / numSlots;
+  baseReserve = alignUp(baseReserve, SECT);
+
+  // If baseReserve * numSlots exceeds approxFree, lower numSlots
+  while ((uint64_t)baseReserve * numSlots > approxFree && numSlots > 1) {
+    --numSlots;
+    baseReserve = (approxFree + numSlots - 1) / numSlots;
+    baseReserve = alignUp(baseReserve, SECT);
+  }
+  if ((uint64_t)baseReserve * numSlots > approxFree) {
+    Console.printf("Not enough free space for %u slots (need %u bytes, have %u). Aborting.\n",
+                   (unsigned)numSlots, (unsigned)((uint64_t)baseReserve * numSlots), (unsigned)approxFree);
+    return false;
+  }
+
+  Console.printf("Allocating %u slots of ~%u bytes each (aligned to %u)\n", (unsigned)numSlots, (unsigned)baseReserve, (unsigned)SECT);
+
+  // Stage A: Allocate slots incrementally and show allocation progress on new lines
+  char slotName[32];
+  uint32_t allocatedBytes = 0;
+  uint32_t percentNextAlloc = UPDATE_STEP_PERCENT;  // next threshold (1..100)
+  uint32_t createdSlots = 0;
+
+  // Print initial allocation stage
+  Console.println("Stage: Allocate slots");
+
+  for (uint32_t i = 0; i < numSlots; ++i) {
+    snprintf(slotName, sizeof(slotName), ".span_part_%03u", (unsigned)i);
+    // If slot exists already, remove it first (fresh slot)
+    if (activeFs.exists && activeFs.exists(slotName)) {
+      if (activeFs.deleteFile) activeFs.deleteFile(slotName);
     }
-    bool willWrite = false;
-    if (candidate != UINT32_MAX) {
-      if (candidate >= fsNext && (candidate + TEST_N) <= totalCap) willWrite = true;
-    } else {
-      candidate = chipStart + (perChip / 2);
-      if (candidate + TEST_N > chipEnd) candidate = (chipEnd > TEST_N) ? (chipEnd - TEST_N) : chipStart;
-      willWrite = false;
+
+    // reserve this slot
+    uint32_t reserve = baseReserve;
+    uint32_t remainNeeded = (allocatedBytes >= approxFree) ? 0 : (approxFree - allocatedBytes);
+    if (reserve > remainNeeded && i == numSlots - 1) {
+      // ensure last slot size is at least SECT and covers remaining
+      reserve = alignUp(remainNeeded ? remainNeeded : SECT, SECT);
     }
-    memset(orig, 0, sizeof(orig));
-    if (!psramBB.readData03(candidate, orig, (uint32_t)TEST_N)) {
-      Console.printf("  chip %u: read failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      allOk = false;
-      continue;
-    }
-    if (!willWrite) {
-      uint32_t alt = candidate;
-      uint32_t mid = chipStart + perChip / 2;
-      if (mid + TEST_N <= chipEnd && mid != candidate) alt = mid;
-      if (!psramBB.readData03(alt, readback, (uint32_t)TEST_N)) {
-        Console.printf("  chip %u: read-only probe failed at 0x%08X\n", (unsigned)bank, (unsigned)alt);
-        allOk = false;
-      } else {
-        Console.printf("  chip %u: read-only OK at 0x%08X\n", (unsigned)bank, (unsigned)alt);
-      }
-      continue;
-    }
-    for (size_t i = 0; i < TEST_N; ++i) pattern[i] = (uint8_t)(0xA5 ^ (uint8_t)i ^ (uint8_t)bank);
-    if (!psramBB.writeData02(candidate, pattern, (uint32_t)TEST_N)) {
-      Console.printf("  chip %u: write failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      allOk = false;
-      continue;
-    }
-    memset(readback, 0, sizeof(readback));
-    if (!psramBB.readData03(candidate, readback, (uint32_t)TEST_N)) {
-      Console.printf("  chip %u: read-back failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      psramBB.writeData02(candidate, orig, (uint32_t)TEST_N);
-      allOk = false;
-      continue;
-    }
-    bool ok = true;
-    for (size_t i = 0; i < TEST_N; ++i)
-      if (readback[i] != pattern[i]) {
-        ok = false;
-        break;
-      }
+
+    bool ok = activeFs.createFileSlot(slotName, reserve, nullptr, 0);
     if (!ok) {
-      Console.printf("  chip %u: verification mismatch at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      psramBB.writeData02(candidate, orig, (uint32_t)TEST_N);
-      allOk = false;
-      continue;
+      Console.printf("\ncreateFileSlot failed for %s (reserve=%u). Aborting.\n", slotName, (unsigned)reserve);
+      return false;
     }
-    if (!psramBB.writeData02(candidate, orig, (uint32_t)TEST_N)) {
-      Console.printf("  chip %u: restore write failed at 0x%08X (DATA MAY BE CORRUPTED!)\n", (unsigned)bank, (unsigned)candidate);
-      allOk = false;
-      continue;
+
+    allocatedBytes += reserve;
+    ++createdSlots;
+
+    uint32_t allocPct = (uint32_t)(((uint64_t)allocatedBytes * 100u) / (uint64_t)approxFree);
+    if (allocPct > 100) allocPct = 100;
+
+    while (allocPct >= percentNextAlloc && percentNextAlloc <= 100) {
+      Console.printf("Alloc progress: %u%%\n", (unsigned)percentNextAlloc);
+      percentNextAlloc += UPDATE_STEP_PERCENT;
     }
-    memset(readback, 0, sizeof(readback));
-    if (!psramBB.readData03(candidate, readback, (uint32_t)TEST_N)) {
-      Console.printf("  chip %u: read-after-restore failed at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-      allOk = false;
-      continue;
-    }
-    bool restored = true;
-    for (size_t i = 0; i < TEST_N; ++i)
-      if (readback[i] != orig[i]) {
-        restored = false;
-        break;
-      }
-    if (!restored) {
-      Console.printf("  chip %u: restore verification mismatch at 0x%08X (DATA MAY BE CORRUPTED!)\n", (unsigned)bank, (unsigned)candidate);
-      allOk = false;
-      continue;
-    }
-    Console.printf("  chip %u: write-restore OK at 0x%08X\n", (unsigned)bank, (unsigned)candidate);
-    yield();
+
+    if ((i & 7) == 0) yield();
   }
-  Console.printf("PSRAM: %s\n", allOk ? "ALL OK\n" : "SOME FAILURES\n");
-  return allOk;
+
+  // Ensure final 100% printed for allocation stage
+  if (percentNextAlloc <= 100) {
+    while (percentNextAlloc <= 100) {
+      Console.printf("Alloc progress: %u%%\n", (unsigned)percentNextAlloc);
+      percentNextAlloc += UPDATE_STEP_PERCENT;
+    }
+  }
+
+  Console.println("Allocation complete");
+
+  // Stage B: Write data into each slot sequentially
+  uint8_t page[PAGE];
+  uint8_t readbuf[PAGE];
+
+  uint64_t totalToWrite = approxFree;
+  uint64_t totalWritten = 0;
+  uint32_t globalNextPct = UPDATE_STEP_PERCENT;
+
+  Console.println("Stage: Writing data into slots");
+
+  for (uint32_t i = 0; i < createdSlots; ++i) {
+    snprintf(slotName, sizeof(slotName), ".span_part_%03u", (unsigned)i);
+    // Obtain slot address and capacity
+    uint32_t addr = 0, sz = 0, cap = 0;
+    if (!activeFs.getFileInfo(slotName, addr, sz, cap)) {
+      Console.printf("getFileInfo failed for slot %s\n", slotName);
+      return false;
+    }
+
+    uint32_t toWrite = cap;
+    if (toWrite > approxFree - totalWritten) toWrite = (uint32_t)(approxFree - totalWritten);
+    if (toWrite == 0) {
+      totalWritten = approxFree;
+      break;
+    }
+
+    Console.printf("Slot %u: addr=0x%08X cap=%u write=%u\n", (unsigned)i, (unsigned)addr, (unsigned)cap, (unsigned)toWrite);
+
+    uint32_t slotWritten = 0;
+
+    while (slotWritten < toWrite) {
+      uint32_t n = (toWrite - slotWritten) >= PAGE ? PAGE : (toWrite - slotWritten);
+
+      // deterministic pattern
+      for (uint32_t k = 0; k < n; ++k) {
+        page[k] = (uint8_t)(0xA5 ^ (uint8_t)i ^ (uint8_t)((slotWritten + k) & 0xFF));
+      }
+
+      if (!psramBB.writeData02(addr + slotWritten, page, n)) {
+        Console.printf("  write failed for slot %u at offset %u\n", (unsigned)i, (unsigned)slotWritten);
+        return false;
+      }
+
+      if (VERIFY_READBACK) {
+        memset(readbuf, 0, sizeof(readbuf));
+        if (!psramBB.readData03(addr + slotWritten, readbuf, n)) {
+          Console.printf("  readback failed for slot %u at offset %u\n", (unsigned)i, (unsigned)slotWritten);
+          return false;
+        }
+        if (memcmp(readbuf, page, n) != 0) {
+          Console.printf("  verify mismatch slot %u offset %u\n", (unsigned)i, (unsigned)slotWritten);
+          return false;
+        }
+      }
+
+      slotWritten += n;
+      totalWritten += n;
+
+      uint32_t slotPct = (uint32_t)(((uint64_t)slotWritten * 100u) / (uint64_t)toWrite);
+      if (slotPct > 100) slotPct = 100;
+      uint32_t globalPct = (uint32_t)(((uint64_t)totalWritten * 100u) / (uint64_t)totalToWrite);
+      if (globalPct > 100) globalPct = 100;
+
+      // newline progress
+      Console.printf("Global: %u%%, Slot %03u: %u%%, offset=%u, written=%u\n",
+                     (unsigned)globalPct, (unsigned)i, (unsigned)slotPct, (unsigned)slotWritten, (unsigned)slotWritten);
+
+      if ((slotWritten % SECT) == 0) yield();
+    }
+
+    Console.printf("Slot %03u complete: written=%u\n", (unsigned)i, (unsigned)toWrite);
+  }
+
+  // Ensure global 100% printed
+  while (globalNextPct <= 100) {
+    Console.printf("Global: %u%%\n", (unsigned)globalNextPct);
+    globalNextPct += UPDATE_STEP_PERCENT;
+  }
+
+  Console.println("PSRAM multi-slot smoke test complete.");
+  Console.printf("Total bytes written (approx): %llu\n", (unsigned long long)totalWritten);
+  return true;
 }
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
@@ -1021,7 +1065,6 @@ static void printHelp() {
   Console.println("  wipebootloader               - erase chip then reboot to bootloader (DANGEROUS to FS)");
   Console.println("  meminfo                      - show heap/stack info");
   Console.println("  psramsmoketest               - safe, non-destructive PSRAM test (prefers FS-free region)");
-  Console.println("  psramsmoketestunsafe         - low-level testing for PSRAM (DANGEROUS to FS)");
   Console.println("  bg [status|query]            - query background job status");
   Console.println("  bg kill|cancel [force]       - cancel background job; 'force' may reset core1 (platform-dependent)");
   Console.println("  reboot                       - reboot the MCU");
@@ -1329,9 +1372,6 @@ static void handleCommand(char* line) {
     Console.printf("Used PSRAM Heap:   %d bytes\n", rp2040.getUsedPSRAMHeap());
     Console.printf("Free Stack:        %d bytes\n", rp2040.getFreeStack());
     psramBB.printCapacityReport();
-  } else if (!strcmp(t0, "psramsmoketestunsafe")) {
-    psramBB.printCapacityReport();
-    psramSmokeTest();
   } else if (!strcmp(t0, "psramsmoketest")) {
     psramBB.printCapacityReport();
     psramSafeSmokeTest();
@@ -1433,11 +1473,11 @@ void setup() {
   delay(20);
   Serial.println("System booting..");
   // Initialize TFT Console
-  Console.tftAttach(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST,
-                    /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true,
-                    /*mosi=*/PIN_TFT_MOSI, /*sck=*/PIN_TFT_SCK, /*spiHz=*/62500000);
-  Console.tftSetTextSize(1);
-  Console.tftSetColors(0xFFFF, 0x0000);  // white on black
+  if (CONSOLE_TFT_ATTACH) {
+    Console.tftAttach(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST, /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true, /*mosi=*/PIN_TFT_MOSI, /*sck=*/PIN_TFT_SCK, /*spiHz=*/62500000);
+    Console.tftSetTextSize(1);
+    Console.tftSetColors(0xFFFF, 0x0000);  // white on black
+  }
   Console.begin();
   // Initialize flash
   flashBB.begin();

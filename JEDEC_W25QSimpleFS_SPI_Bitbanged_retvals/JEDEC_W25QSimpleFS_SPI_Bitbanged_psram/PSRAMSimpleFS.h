@@ -320,7 +320,7 @@ private:
   PSRAMBitbang& _psram;
   uint32_t _capacity;
 
-  static const size_t MAX_FILES = 64;
+  static const size_t MAX_FILES = 2048;
   FileInfo _files[MAX_FILES];
   size_t _fileCount;
   uint32_t _dirWriteOffset;
