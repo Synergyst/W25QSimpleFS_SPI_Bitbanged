@@ -18,27 +18,30 @@
   Notes:
   - If you later want Direct CS or 74HC138+74HC595, keep this file as-is and switch in code later.
 */
+
+// ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
+#include <SPI.h>
 
-// ------- Select PSRAM transport here -------
-// Comment this line to use bit-bang; leave it defined to use FastSPI adapter
-//#define PSRAM_USE_FASTSPI 1
-
-// Flash stays bit-bang
+// FLASH on HW-SPI via W25QBitbang's HW path
+#define W25Q_USE_HW_SPI 1
+#define W25Q_SPI_INSTANCE SPI1
+#define W25Q_SPI_CLOCK_HZ 20000000UL
 #include "W25QBitbang.h"
 #include "W25QSimpleFS.h"
 
-// PSRAM bus selection
-#if defined(PSRAM_USE_FASTSPI)
-#include "FastSPI_DMA.h"
-#include "FastSPIAdapter.h"
-// Tell PSRAMMulti to use FastSPIAdapter for its underlying bus
-#define PSRAM_AGGREGATE_BUS FastSPIAdapter
-#include "PSRAMMulti.h"
+// PSRAM transport
+#define USE_PSRAM_HW_SPI 1
+#if USE_PSRAM_HW_SPI
+#define PSRAM_SPI_INSTANCE SPI1
+#include "SPIHWAdapter.h"
+#define PSRAM_AGGREGATE_BUS SPIHWAdapter
 #else
 #include "PSRAMBitbang.h"
-#include "PSRAMMulti.h"
+// Default PSRAM_AGGREGATE_BUS remains PSRAMBitbang via PSRAMMulti.h
 #endif
+
+#include "PSRAMMulti.h"
 
 #include "blob_mailbox_config.h"
 #include "blob_ret42.h"
@@ -52,17 +55,17 @@ static ConsolePrint Console;  // Console wrapper
 #define FS_SECTOR_SIZE 4096
 
 // ========== bitbang pin definitions (flash) ==========
-const uint8_t PIN_FLASH_MISO = 11;  // GP11
+const uint8_t PIN_FLASH_MISO = 12;  // GP12
 const uint8_t PIN_FLASH_CS = 28;    // GP28
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
-const uint8_t PIN_FLASH_MOSI = 12;  // GP12
+const uint8_t PIN_FLASH_MOSI = 11;  // GP11
 
 // ========== bitbang pin definitions (psram) ==========
-const bool PSRAM_ENABLE_QPI = false;      // Should we enable the PSRAM QPI-mode?
-const uint8_t PSRAM_CLOCK_DELAY_US = 20;  // Small delay helps ensure decoder/address settle before asserting EN
-const uint8_t PIN_PSRAM_MISO = 11;        // GP11
-const uint8_t PIN_PSRAM_MOSI = 12;        // GP12
-const uint8_t PIN_PSRAM_SCK = 10;         // GP10
+const bool PSRAM_ENABLE_QPI = false;     // Should we enable the PSRAM QPI-mode?
+const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // Small delay helps ensure decoder/address settle before asserting EN
+const uint8_t PIN_PSRAM_MISO = 12;       // GP12
+const uint8_t PIN_PSRAM_MOSI = 11;       // GP11
+const uint8_t PIN_PSRAM_SCK = 10;        // GP10
 //const uint8_t PIN_PSRAM_IO2 = ;  // only used if QPI enabled
 //const uint8_t PIN_PSRAM_IO3 = ;  // only used if QPI enabled
 
