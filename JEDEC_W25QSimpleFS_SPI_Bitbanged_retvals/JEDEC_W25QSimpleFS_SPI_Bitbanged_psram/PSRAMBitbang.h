@@ -1,8 +1,7 @@
 /*
   PSRAMBitbang.h - Single-header, header-only bit-banged SPI helper for PSRAM
-  (unchanged from prior release; included for completeness)
+  (RP2040 SIO fast-path optimized when available)
 */
-
 #ifndef PSRAMBITBANG_H
 #define PSRAMBITBANG_H
 
@@ -10,6 +9,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Default pin fallbacks (can be overridden via -D or before include) */
 #ifndef PSRAM_PIN_CS
 #define PSRAM_PIN_CS 9
 #endif
@@ -36,6 +36,18 @@
 #define PSRAM_CMD_WRITE_ENABLE 0x06
 #endif
 
+/* Enable RP2040 SIO fast-path when compiling for RP2040-like Arduino cores.
+   This macro can be overridden by defining BB_USE_RP2040_SIO=0 to force
+   the portable (digitalWrite/digitalRead) implementation. */
+#if (defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_RASPBERRY_PI_PICO) || defined(ARDUINO_GENERIC_RP2040)) && !defined(BB_USE_RP2040_SIO)
+#define BB_USE_RP2040_SIO 1
+#endif
+
+#ifdef BB_USE_RP2040_SIO
+// RP2040-specific low-level GPIO access
+#include "hardware/structs/sio.h"
+#endif
+
 class PSRAMBitbang {
 public:
   PSRAMBitbang(uint8_t pin_cs = PSRAM_PIN_CS,
@@ -49,7 +61,11 @@ public:
       _pinIO2(255),
       _pinIO3(255),
       _useQuad(false),
-      _halfCycleDelayUs(1) {}
+      _halfCycleDelayUs(1) {
+#ifdef BB_USE_RP2040_SIO
+    _maskCS = _maskMISO = _maskMOSI = _maskSCK = 0;
+#endif
+  }
 
   inline void begin() {
     pinMode(_pinCS, OUTPUT);
@@ -61,29 +77,69 @@ public:
     digitalWrite(_pinMOSI, LOW);
     if (_pinIO2 != 255) pinMode(_pinIO2, INPUT);
     if (_pinIO3 != 255) pinMode(_pinIO3, INPUT);
+
+#ifdef BB_USE_RP2040_SIO
+    // Precompute bit masks for fast SIO operations.
+    // Shift only valid when pins < 32 (RP2040 GPIO range). If user used a large number,
+    // mask becomes UB; we assume sane pins for RP2040 usage.
+    _maskCS = (1u << _pinCS);
+    _maskMISO = (1u << _pinMISO);
+    _maskMOSI = (1u << _pinMOSI);
+    _maskSCK = (1u << _pinSCK);
+#endif
   }
 
   inline void setClockDelayUs(uint8_t halfCycleDelayUs) {
     _halfCycleDelayUs = halfCycleDelayUs;
   }
+
   inline void setExtraDataPins(uint8_t io2, uint8_t io3) {
     _pinIO2 = io2;
     _pinIO3 = io3;
     if (_pinIO2 != 255) pinMode(_pinIO2, INPUT);
     if (_pinIO3 != 255) pinMode(_pinIO3, INPUT);
   }
+
   inline void setModeQuad(bool enable) {
     _useQuad = enable;
   }
 
   inline void csLow() {
+#ifdef BB_USE_RP2040_SIO
+    sio_hw->gpio_clr = _maskCS;
+#else
     digitalWrite(_pinCS, LOW);
-  }
-  inline void csHigh() {
-    digitalWrite(_pinCS, HIGH);
+#endif
   }
 
+  inline void csHigh() {
+#ifdef BB_USE_RP2040_SIO
+    sio_hw->gpio_set = _maskCS;
+#else
+    digitalWrite(_pinCS, HIGH);
+#endif
+  }
+
+  // Single-byte transfer (full-duplex). Fast-path uses RP2040 SIO when halfCycleDelayUs == 0.
   inline uint8_t transfer(uint8_t tx) {
+#ifdef BB_USE_RP2040_SIO
+    if (_halfCycleDelayUs == 0) {
+      uint8_t rx = 0;
+      // Mode 0: sample MISO on rising edge after driving MOSI, clock idle low.
+      for (int bit = 7; bit >= 0; --bit) {
+        if (tx & (1u << bit)) sio_hw->gpio_set = _maskMOSI;
+        else sio_hw->gpio_clr = _maskMOSI;
+        // push clock high
+        sio_hw->gpio_set = _maskSCK;
+        // sample MISO
+        rx = (uint8_t)((rx << 1) | ((sio_hw->gpio_in & _maskMISO) ? 1u : 0u));
+        // bring clock low
+        sio_hw->gpio_clr = _maskSCK;
+      }
+      return rx;
+    }
+#endif
+    // Fallback portable implementation (with optional microsecond delays).
     uint8_t rx = 0;
     for (int bit = 7; bit >= 0; --bit) {
       digitalWrite(_pinMOSI, (tx >> bit) & 1);
@@ -97,6 +153,7 @@ public:
     return rx;
   }
 
+  // Buffer transfer (txbuf may be nullptr to send 0x00, rxbuf may be nullptr to discard)
   inline void transfer(const uint8_t *txbuf, uint8_t *rxbuf, size_t len) {
     for (size_t i = 0; i < len; ++i) {
       uint8_t t = txbuf ? txbuf[i] : 0x00;
@@ -217,6 +274,11 @@ private:
   uint8_t _pinIO2, _pinIO3;
   bool _useQuad;
   volatile uint8_t _halfCycleDelayUs;
+
+#ifdef BB_USE_RP2040_SIO
+  // Precomputed SIO masks for fast register writes/reads
+  uint32_t _maskCS, _maskMISO, _maskMOSI, _maskSCK;
+#endif
 };
 
 #endif  // PSRAMBITBANG_H

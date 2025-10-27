@@ -5,7 +5,6 @@
       0) Direct CS pins (one GPIO per PSRAM chip)
       1) 74HC138-only: Address A0/A1(/A2) + single enable (G2A/G2B)
       2) 74HC138 + 74HC595: A0/A1/EN driven by 595 via MOSI/SCK + LATCH
-
   74HC138 quick wiring (single-decoder, 4 chips; outputs are ACTIVE-LOW):
     Pin 16 VCC -> 3.3V
     Pin  8 GND -> GND
@@ -20,7 +19,6 @@
     Pin 13 Y2  -> PSRAM CS2 (plus 10k pull-up to 3.3V)
     Pin 12 Y3  -> PSRAM CS3 (plus 10k pull-up to 3.3V)
     Decoupling: 0.1 µF close to pin 16/8.
-
   Safe sequence to select a bank:
     1) EN inactive (HIGH on G2A/G2B)
     2) Set A0/A1 address for target bank
@@ -30,6 +28,13 @@
 */
 #ifndef PSRAMMULTI_H
 #define PSRAMMULTI_H
+
+// Allow overriding the underlying SPI/bitbang bus type used inside PSRAMAggregateDevice.
+// Default remains PSRAMBitbang to preserve original behavior. If you want to use the
+// FastSPIAdapter, define PSRAM_AGGREGATE_BUS to FastSPIAdapter BEFORE including PSRAMMulti.h.
+#ifndef PSRAM_AGGREGATE_BUS
+#define PSRAM_AGGREGATE_BUS PSRAMBitbang
+#endif
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -60,7 +65,7 @@ public:
       _halfCycleDelayUs(1), _useQuad(false), _io2(255), _io3(255),
       _mode(CSSelMode::Direct),
       _decEn(255), _decA0(255), _decA1(255), _decA2(255), _decEnActiveLow(true),
-      _srLatch(255), _srMapA0(0), _srMapA1(1), _srMapEN(2), _srEnActiveLow(true) {}
+      _srLatch(255), _srMapA0(-1), _srMapA1(-1), _srMapEN(-1), _srEnActiveLow(true) {}
 
   // Direct mode constructor with CS pin array
   PSRAMAggregateDevice(const uint8_t* csPins, size_t count,
@@ -72,18 +77,6 @@ public:
     _mode = CSSelMode::Direct;
     for (size_t i = 0; i < count; ++i) addChip(csPins[i]);
   }
-
-#if __cplusplus >= 201103L
-  PSRAMAggregateDevice(std::initializer_list<uint8_t> csList,
-                       uint8_t pin_miso,
-                       uint8_t pin_mosi,
-                       uint8_t pin_sck,
-                       uint32_t perChipCapacityBytes)
-    : PSRAMAggregateDevice(pin_miso, pin_mosi, pin_sck, perChipCapacityBytes) {
-    _mode = CSSelMode::Direct;
-    for (uint8_t cs : csList) addChip(cs);
-  }
-#endif
 
   // Add chip for direct mode
   bool addChip(uint8_t csPin) {
@@ -98,7 +91,7 @@ public:
                            uint8_t decEn, uint8_t decA0, uint8_t decA1,
                            uint8_t decA2 = 255,
                            bool enActiveLow = true) {
-    if (chipCount == 0 || chipCount > 8) return false;
+    if (chipCount == 0 || chipCount > PSRAMMULTI_MAX_CHIPS) return false;
     _chipCount = chipCount;
     _mode = CSSelMode::Decoder138;
     _decEn = decEn;
@@ -116,7 +109,7 @@ public:
                                  uint8_t qBitA1 = 1,
                                  uint8_t qBitEN = 2,
                                  bool enActiveLow = true) {
-    if (chipCount == 0 || chipCount > 8) return false;
+    if (chipCount == 0 || chipCount > PSRAMMULTI_MAX_CHIPS) return false;
     if (qBitA0 > 7 || qBitA1 > 7 || qBitEN > 7) return false;
     _chipCount = chipCount;
     _mode = CSSelMode::Decoder138_595;
@@ -128,13 +121,17 @@ public:
     return true;
   }
 
+  // Initialize GPIOs and the underlying bus. Important: decoder pins set first,
+  // then _bus.begin() so hardware SPI adapters are initialized after decoder GPIOs.
   void begin() {
+    // Configure PSRAMAggregateDevice-level GPIOs (address lines, SCK/MOSI/MISO as GPIO)
     pinMode(_pinMOSI, OUTPUT);
     pinMode(_pinSCK, OUTPUT);
     pinMode(_pinMISO, INPUT);
     digitalWrite(_pinSCK, LOW);
     digitalWrite(_pinMOSI, LOW);
 
+    // Configure CS selection scheme pins
     switch (_mode) {
       case CSSelMode::Direct:
         for (uint8_t i = 0; i < _chipCount; ++i) {
@@ -144,58 +141,46 @@ public:
         break;
       case CSSelMode::Decoder138:
         if (_decEn != 255) { pinMode(_decEn, OUTPUT); }
-        if (_decA0 != 255) {
-          pinMode(_decA0, OUTPUT);
-          digitalWrite(_decA0, LOW);
-        }
-        if (_decA1 != 255) {
-          pinMode(_decA1, OUTPUT);
-          digitalWrite(_decA1, LOW);
-        }
-        if (_decA2 != 255) {
-          pinMode(_decA2, OUTPUT);
-          digitalWrite(_decA2, LOW);
-        }
+        if (_decA0 != 255) { pinMode(_decA0, OUTPUT); digitalWrite(_decA0, LOW); }
+        if (_decA1 != 255) { pinMode(_decA1, OUTPUT); digitalWrite(_decA1, LOW); }
+        if (_decA2 != 255) { pinMode(_decA2, OUTPUT); digitalWrite(_decA2, LOW); }
         if (_decEn != 255) digitalWrite(_decEn, _decEnActiveLow ? HIGH : LOW);  // disable
         break;
       case CSSelMode::Decoder138_595:
-        if (_srLatch != 255) {
-          pinMode(_srLatch, OUTPUT);
-          digitalWrite(_srLatch, LOW);
-        }
+        if (_srLatch != 255) { pinMode(_srLatch, OUTPUT); digitalWrite(_srLatch, LOW); }
         srWriteByte(srCompose(0, /*enActive*/ false));
         break;
     }
 
+    // Configure/notify the bus about clock/data pins (adapter may use these)
     _bus.setClockDelayUs(_halfCycleDelayUs);
     if (_io2 != 255 || _io3 != 255) {
       _bus.setExtraDataPins(_io2, _io3);
       _bus.setModeQuad(_useQuad);
     }
+
+    // Initialize the underlying bus now (e.g., hardware SPI). Do this after decoder/GPIO setup.
+    _bus.begin();
   }
 
   void setExtraDataPins(uint8_t io2, uint8_t io3) {
     _io2 = io2;
     _io3 = io3;
   }
+
   void setModeQuad(bool enable) {
     _useQuad = enable;
     _bus.setModeQuad(enable);
   }
+
   void setClockDelayUs(uint8_t halfCycleDelayUs) {
     _halfCycleDelayUs = halfCycleDelayUs;
     _bus.setClockDelayUs(halfCycleDelayUs);
   }
 
-  uint32_t capacity() const {
-    return _perChipCapacity * _chipCount;
-  }
-  uint32_t perChipCapacity() const {
-    return _perChipCapacity;
-  }
-  uint8_t chipCount() const {
-    return _chipCount;
-  }
+  uint32_t capacity() const { return _perChipCapacity * _chipCount; }
+  uint32_t perChipCapacity() const { return _perChipCapacity; }
+  uint8_t chipCount() const { return _chipCount; }
 
   void readJEDEC(uint8_t bank, uint8_t* out, size_t len) {
     if (bank >= _chipCount || !out || len == 0) return;
@@ -390,12 +375,14 @@ private:
     _lastAddr595 = (addr & 0x07);
     return v;
   }
+
   inline void srPulseLatch() {
     if (_srLatch == 255) return;
     digitalWrite(_srLatch, HIGH);
     delayMicroseconds(1);
     digitalWrite(_srLatch, LOW);
   }
+
   inline void srWriteByte(uint8_t v) {
     for (int b = 7; b >= 0; --b) {
       digitalWrite(_pinSCK, LOW);
@@ -407,7 +394,7 @@ private:
     srPulseLatch();
   }
 
-  PSRAMBitbang _bus;
+  PSRAM_AGGREGATE_BUS _bus;
   uint8_t _pinMISO, _pinMOSI, _pinSCK;
   uint8_t _csPins[PSRAMMULTI_MAX_CHIPS];
   uint8_t _chipCount;
@@ -415,20 +402,16 @@ private:
   uint8_t _halfCycleDelayUs;
   bool _useQuad;
   uint8_t _io2, _io3;
-
   CSSelMode _mode;
-
   // 74HC138 fields
   uint8_t _decEn, _decA0, _decA1, _decA2;
   bool _decEnActiveLow;
-
   // 74HC595 fields (for mode 2)
   uint8_t _srLatch;
   int8_t _srMapA0, _srMapA1, _srMapEN;
   bool _srEnActiveLow;
   uint8_t _lastAddr595 = 0;
 };
-
 // -------------------------
 // Generic, header-only FS
 // -------------------------
@@ -442,12 +425,10 @@ public:
   static const uint32_t SECTOR_SIZE = 4096;
   static const uint32_t PAGE_SIZE = 256;
   static const size_t MAX_NAME = 32;
-
   enum class WriteMode : uint8_t {
     ReplaceIfExists = 0,
     FailIfExists = 1
   };
-
   struct FileInfo {
     char name[MAX_NAME + 1];
     uint32_t addr;
@@ -457,7 +438,6 @@ public:
     uint32_t capEnd;
     bool slotSafe;
   };
-
   PSRAMSimpleFS_Generic(Driver& dev, uint32_t capacityBytes)
     : _dev(dev), _capacity(capacityBytes) {
     _fileCount = 0;
@@ -465,7 +445,7 @@ public:
     _nextSeq = 1;
     _dataHead = DATA_START;
   }
-
+  
   bool mount(bool autoFormatIfEmpty = true) {
     if (_capacity == 0 || _capacity <= DATA_START) return false;
     _fileCount = 0;
@@ -527,7 +507,6 @@ public:
     computeCapacities(_dataHead);
     return true;
   }
-
   bool format() {
     const uint32_t PAGE_CHUNK = 256;
     uint8_t tmp[PAGE_CHUNK];
@@ -543,7 +522,6 @@ public:
     computeCapacities(_dataHead);
     return true;
   }
-
   bool wipeChip() {
     if (_capacity == 0) return false;
     const uint32_t CHUNK = 256;
@@ -561,7 +539,6 @@ public:
     computeCapacities(_dataHead);
     return true;
   }
-
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, WriteMode mode = WriteMode::ReplaceIfExists) {
     if (!validName(name) || size > 0xFFFFFFUL) return false;
     if (_dirWriteOffset + ENTRY_SIZE > DIR_SIZE) return false;
@@ -586,7 +563,6 @@ public:
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, ModeT modeOther) {
     return writeFile(name, data, size, (int)modeOther);
   }
-
   bool createFileSlot(const char* name, uint32_t reserveBytes, const uint8_t* initialData = nullptr, uint32_t initialSize = 0) {
     if (!validName(name)) return false;
     if (_dirWriteOffset + ENTRY_SIZE > DIR_SIZE) return false;
@@ -612,7 +588,6 @@ public:
     computeCapacities(_dataHead);
     return true;
   }
-
   bool writeFileInPlace(const char* name, const uint8_t* data, uint32_t size, bool allowReallocate = false) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return false;
@@ -627,7 +602,6 @@ public:
     if (!allowReallocate) return false;
     return writeFile(name, data, size, WriteMode::ReplaceIfExists);
   }
-
   uint32_t readFile(const char* name, uint8_t* buf, uint32_t bufSize) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return 0;
@@ -637,7 +611,6 @@ public:
     _dev.readData03(_files[idx].addr, buf, n);
     return n;
   }
-
   uint32_t readFileRange(const char* name, uint32_t offset, uint8_t* buf, uint32_t len) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return 0;
@@ -648,14 +621,12 @@ public:
     _dev.readData03(_files[idx].addr + offset, buf, len);
     return len;
   }
-
   bool getFileSize(const char* name, uint32_t& sizeOut) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return false;
     sizeOut = _files[idx].size;
     return true;
   }
-
   bool getFileInfo(const char* name, uint32_t& addrOut, uint32_t& sizeOut, uint32_t& capOut) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return false;
@@ -664,12 +635,10 @@ public:
     capOut = (_files[idx].capEnd > _files[idx].addr) ? (_files[idx].capEnd - _files[idx].addr) : 0;
     return true;
   }
-
   bool exists(const char* name) {
     int idx = findIndexByName(name);
     return (idx >= 0 && !_files[idx].deleted);
   }
-
   bool deleteFile(const char* name) {
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return false;
@@ -680,7 +649,6 @@ public:
     computeCapacities(_dataHead);
     return true;
   }
-
   void listFilesToSerial() {
     Serial.println("Files (PSRAM Multi):");
     for (size_t i = 0; i < _fileCount; ++i) {
@@ -691,7 +659,6 @@ public:
       Serial.printf("  \tcap=%u  \tslotSafe=%s\n", (unsigned)cap, _files[i].slotSafe ? "Y" : "N");
     }
   }
-
   size_t fileCount() const {
     size_t n = 0;
     for (size_t i = 0; i < _fileCount; ++i)
@@ -806,4 +773,4 @@ private:
 
 using PSRAMSimpleFS_Multi = PSRAMSimpleFS_Generic<PSRAMAggregateDevice>;
 
-#endif
+#endif  // PSRAMMULTI_H

@@ -5,7 +5,7 @@
   - RP2040 pins (per your wiring):
       GP8 -> 74HC138 pin 1 (A0)
       GP7 -> 74HC138 pin 2 (A1)
-      GP9 -> 74HC138 pins 4 and 5 (G2A and G2B tied together). 10k pull-up to 3.3V.
+      GP9 -> 74HC138 pins 4 and 5 (G2A/G2B tied together). 10k pull-up to 3.3V.
       74HC138 pin 3 (A2) -> GND
       74HC138 pin 6 (G1) -> 3.3V
       74HC138 pin 16 (VCC) -> 3.3V, pin 8 (GND) -> GND
@@ -18,22 +18,35 @@
   Notes:
   - If you later want Direct CS or 74HC138+74HC595, keep this file as-is and switch in code later.
 */
-#define CONSOLE_TFT_ENABLE
-#define CONSOLE_TFT_ATTACH 0
 #include "ConsolePrint.h"
-#include "W25QSimpleFS.h"
+
+// ------- Select PSRAM transport here -------
+// Comment this line to use bit-bang; leave it defined to use FastSPI adapter
+//#define PSRAM_USE_FASTSPI 1
+
+// Flash stays bit-bang
 #include "W25QBitbang.h"
-#include "PSRAMBitbang.h"
-#include "PSRAMSimpleFS.h"
+#include "W25QSimpleFS.h"
+
+// PSRAM bus selection
+#if defined(PSRAM_USE_FASTSPI)
+#include "FastSPI_DMA.h"
+#include "FastSPIAdapter.h"
+// Tell PSRAMMulti to use FastSPIAdapter for its underlying bus
+#define PSRAM_AGGREGATE_BUS FastSPIAdapter
 #include "PSRAMMulti.h"
+#else
+#include "PSRAMBitbang.h"
+#include "PSRAMMulti.h"
+#endif
+
 #include "blob_mailbox_config.h"
 #include "blob_ret42.h"
 #define FILE_RET42 "ret42"
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
-
 struct BlobReg;               // Forward declaration so findBlob can be placed earlier if needed
-static ConsolePrint Console;  // Console/TFT (optional) wrapper
+static ConsolePrint Console;  // Console wrapper
 
 // ========== Static buffer-related compile-time constant (used previously as fs.SECTOR_SIZE) ==========
 #define FS_SECTOR_SIZE 4096
@@ -45,18 +58,14 @@ const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_FLASH_MOSI = 12;  // GP12
 
 // ========== bitbang pin definitions (psram) ==========
-const bool PSRAM_ENABLE_QPI = false;     // Should we enable the PSRAM QPI-mode?
-const uint8_t PSRAM_CLOCK_DELAY_US = 1;  // Small delay helps ensure decoder/address settle before asserting EN
-const uint8_t PIN_PSRAM_MISO = 11;       // GP11
-const uint8_t PIN_PSRAM_MOSI = 12;       // GP12
-const uint8_t PIN_PSRAM_SCK = 10;        // GP10
+const bool PSRAM_ENABLE_QPI = false;      // Should we enable the PSRAM QPI-mode?
+const uint8_t PSRAM_CLOCK_DELAY_US = 20;  // Small delay helps ensure decoder/address settle before asserting EN
+const uint8_t PIN_PSRAM_MISO = 11;        // GP11
+const uint8_t PIN_PSRAM_MOSI = 12;        // GP12
+const uint8_t PIN_PSRAM_SCK = 10;         // GP10
 //const uint8_t PIN_PSRAM_IO2 = ;  // only used if QPI enabled
 //const uint8_t PIN_PSRAM_IO3 = ;  // only used if QPI enabled
-// Direct CS pins (default mode)
-/*const uint8_t PIN_PSRAM_CS0 = 29;
-const uint8_t PIN_PSRAM_CS1 = 9;
-const uint8_t PIN_PSRAM_CS2 = 8;
-const uint8_t PIN_PSRAM_CS3 = 7;*/
+
 // 74HC138 pins (for 138-only default)
 const uint8_t PIN_138_A0 = 8;  // 74HC138 pin 1 (A0)
 const uint8_t PIN_138_A1 = 7;  // 74HC138 pin 2 (A1)
@@ -66,29 +75,6 @@ const uint8_t PIN_138_A2 = 255;  // 255 means "not used"; tie 74HC138 pin 3 (A2)
 // OPTIONAL: 74HC595 latch pin for method 138+595 (SER=MOSI, SRCLK=SCK are reused)
 const uint8_t PIN_595_LATCH = 4;  // 595.RCLK (unused in 138-only mode)
 
-// ========== TFT display pins (SPI via Adafruit ST7789) ==========
-// Wiring for GMT020-02 2.0" TFT SPI on WaveShare RP2040 Zero (if used):
-const uint8_t PIN_TFT_SCK = 10;   // SCL pin
-const uint8_t PIN_TFT_MOSI = 12;  // SDA pin
-const uint8_t PIN_TFT_RST = 14;   // RST pin
-const uint8_t PIN_TFT_DC = 15;    // DC pin
-const uint8_t PIN_TFT_CS = 6;     // CS pin
-const uint8_t PIN_TFT_MISO = 11;  // (unused)
-
-// ========== TFT state ==========
-static bool tft_ready = false;
-static uint16_t tft_w = 240;
-static uint16_t tft_h = 320;
-static uint8_t tft_rot = 1;  // 0..3
-
-// ========== Simple TFT text console mirroring for Serial output ==========
-static uint16_t tft_console_fg = 0xFFFF;  // white
-static uint16_t tft_console_bg = 0x0000;  // black
-static uint8_t tft_console_textsize = 1;
-
-// ========== Adafruit ST7789 instance ==========
-static Adafruit_ST7789 tft = Adafruit_ST7789(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCK, PIN_TFT_RST);
-
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 const size_t PERSIST_LEN = 32;
 enum class StorageBackend {
@@ -97,17 +83,28 @@ enum class StorageBackend {
   PSRAM_BACKEND
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
-W25QSimpleFS fsFlash(flashBB);
+
+// Flash: restore original bitbang flash driver so W25QSimpleFS works unchanged
+/*W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
+W25QSimpleFS fsFlash(flashBB);*/
+
 // Capacity
 constexpr uint8_t PSRAM_NUM_CHIPS = 4;
 constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;  // Example: 8MB per chip.
 constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * PSRAM_NUM_CHIPS;
-// ---------- PSRAM device: choose one of the two constructor styles ----------
-PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // PSRAM aggregate device — 74HC138-only default (bare ctor, configured in setup())
-//PSRAMAggregateDevice psramBB({ CS0, CS1, CS2, CS3 }, PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);  // If using Direct CS
-// If later using 74HC138+74HC595, keep bare ctor and call configureDecoder138Via595 in setup().
+
+// PSRAMAggregateDevice: use concrete class (macro selected underlying bus inside PSRAMMulti.h)
+/*PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
+PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);*/
+
+// Flash (bit-banged)
+W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
+W25QSimpleFS fsFlash(flashBB);
+
+// PSRAM aggregate using PSRAMBitbang (PSRAM_AGGREGATE_BUS defaults to PSRAMBitbang)
+PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
+
 static bool g_dev_mode = true;
 
 // ========== ActiveFS structure ==========
@@ -132,6 +129,7 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
+
 static void bindActiveFs(StorageBackend backend) {
   // Helper to bind either flash or psram into activeFs at runtime
   if (backend == StorageBackend::Flash) {
@@ -247,26 +245,12 @@ static const BlobReg g_blobs[] = {
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
 
-// ========== TFT console helpers to mirror Serial output ==========
-static void tftConsoleBegin() {
-  if (!tft_ready) return;
-  tft.setTextWrap(false);
-  tft.setTextColor(tft_console_fg, tft_console_bg);
-  tft.setTextSize(tft_console_textsize);
-  tft.fillScreen(tft_console_bg);
-  tft.setCursor(0, 0);
-}
-static void tftConsoleClear() {
-  if (!tft_ready) return;
-  tft.fillScreen(tft_console_bg);
-  tft.setCursor(0, 0);
-}
-
 // ========== helpers using Console ==========
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
   Console.print(b, HEX);
 }
+
 // ========== Return mailbox reservation (Scratch) ==========
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
@@ -292,6 +276,7 @@ static void mailboxPrintIfAny() {
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
+
 extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
   constexpr uint32_t N = 64;
@@ -313,16 +298,19 @@ extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
+
 struct ExecJob {
   uintptr_t code;               // raw aligned code address (LSB 0)
   uint32_t size;                // code size (bytes, even)
   uint32_t argc;                // number of int args (0..MAX_EXEC_ARGS)
   int32_t args[MAX_EXEC_ARGS];  // argument values
 };
+
 static volatile ExecJob g_job;
 static volatile int32_t g_result = 0;
 static volatile int32_t g_status = 0;
 static volatile uint32_t g_job_flag = 0;  // 0=idle, 1=ready, 2=running, 3=done
+
 static void core1WorkerPoll() {
   if (g_job_flag != 1u) return;
   __asm volatile("dsb" ::
@@ -352,11 +340,14 @@ static void core1WorkerPoll() {
                    : "memory");
   g_job_flag = 3u;
 }
+
 static volatile uint32_t g_timeout_override_ms = 0;
 static inline uint32_t getTimeout(uint32_t defMs) {
   return g_timeout_override_ms ? g_timeout_override_ms : defMs;
 }
+
 static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut);  // Forward declaration
+
 static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const int32_t* argv, int& retVal, uint32_t timeoutMs = 100) {
   if (g_job_flag != 0u) {
     Console.println("core1 busy");
@@ -394,6 +385,7 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const 
   g_job_flag = 0u;
   return true;
 }
+
 static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& retVal) {
   if (argc < 0) argc = 0;
   if (argc > (int)MAX_EXEC_ARGS) argc = (int)MAX_EXEC_ARGS;
@@ -417,6 +409,7 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   free(raw);
   return true;
 }
+
 // Background execution support (one background job at a time)
 static volatile void* g_bg_raw = nullptr;
 static volatile uint8_t* g_bg_buf = nullptr;
@@ -426,6 +419,7 @@ static volatile uint32_t g_bg_start_ms = 0;
 static volatile uint32_t g_bg_timeout_ms = 0;
 static char g_bg_fname[ActiveFS::MAX_NAME + 1] = { 0 };
 static volatile bool g_bg_cancel_requested = false;
+
 static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBuf, uint32_t sz,
                                 uint32_t argc, const int32_t* argv, uint32_t timeoutMs) {
   if (!fname || !raw || !alignedBuf || sz == 0) return false;
@@ -456,6 +450,7 @@ static bool submitJobBackground(const char* fname, void* raw, uint8_t* alignedBu
                  g_bg_fname, (unsigned)g_job.code, (unsigned)g_job.size);
   return true;
 }
+
 static void pollBackgroundExec() {
   if (!g_bg_active) {
     if (g_job_flag == 3u) {
@@ -527,6 +522,7 @@ static void pollBackgroundExec() {
     }
   }
 }
+
 static inline void mailboxSetCancelFlag(uint8_t v) {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
   mb[0] = v;
@@ -553,17 +549,20 @@ static bool checkNameLen(const char* name) {
   }
   return true;
 }
+
 static void listBlobs() {
   Console.println("Available blobs:");
   for (size_t i = 0; i < g_blobs_count; ++i) {
     Console.printf(" - %s  \t(%d bytes)\n", g_blobs[i].id, g_blobs[i].len);
   }
 }
+
 static const BlobReg* findBlob(const char* id) {
   for (size_t i = 0; i < g_blobs_count; ++i)
     if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
   return nullptr;
 }
+
 static void dumpFileHead(const char* fname, uint32_t count) {
   uint32_t sz = 0;
   if (!activeFs.getFileSize(fname, sz) || sz == 0) {
@@ -593,6 +592,7 @@ static void dumpFileHead(const char* fname, uint32_t count) {
     off += n;
   }
 }
+
 static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut) {
   rawOut = nullptr;
   alignedBuf = nullptr;
@@ -622,6 +622,7 @@ static bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& aligne
   szOut = sz;
   return true;
 }
+
 static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
   if (!activeFs.exists(fname)) {
@@ -676,6 +677,7 @@ static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len,
   Console.println("Failed to update file");
   return false;
 }
+
 static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
   if (activeFs.exists(fname)) {
@@ -690,6 +692,7 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
   Console.println("Auto-create failed");
   return false;
 }
+
 static void autogenBlobWrites() {
   bool allOk = true;
   allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
@@ -697,24 +700,22 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
+
 static bool psramSafeSmokeTest() {
   // Requirements: PSRAM must be the active FS backend for safe behavior
   if (g_storage != StorageBackend::PSRAM_BACKEND) {
     Console.println("psramSafeSmokeTest: active storage is not PSRAM — aborting");
     return false;
   }
-
   // Updated: aim to fill as much of PSRAM as possible (across all 4 banks)
   const uint32_t UPDATE_STEP_PERCENT = 5;  // progress update granularity in percent
   const uint32_t MAX_SLOTS = 2044;         // bump to accommodate large fills
   const uint32_t PAGE = 256;               // write/read granularity
   const bool VERIFY_READBACK = true;       // verify after each chunk
-
   if (UPDATE_STEP_PERCENT == 0 || (100 % UPDATE_STEP_PERCENT) != 0) {
     Console.println("psramSafeSmokeTest: UPDATE_STEP_PERCENT must divide 100 evenly");
     return false;
   }
-
   const uint8_t chips = psramBB.chipCount();
   if (chips == 0) {
     Console.println("\nPSRAM: no PSRAM chips detected");
@@ -723,20 +724,16 @@ static bool psramSafeSmokeTest() {
   const uint32_t perChip = psramBB.perChipCapacity();
   const uint32_t totalCap = psramBB.capacity();
   const uint32_t SECT = ActiveFS::SECTOR_SIZE;
-
   // FS head
   uint32_t fsNext = 0, fsDataStart = 0;
   if (activeFs.nextDataAddr) fsNext = activeFs.nextDataAddr();
   if (activeFs.dataRegionStart) fsDataStart = activeFs.dataRegionStart();
-
   auto alignUp = [](uint32_t v, uint32_t a) -> uint32_t {
     return (v + (a - 1)) & ~(a - 1);
   };
   const uint32_t fsAligned = alignUp(fsNext, SECT);
-
   Console.printf("\nPSRAM multi-slot smoke: chips=%u per_chip=%u total=%u fsNext=%u fsAligned=%u\n",
                  (unsigned)chips, (unsigned)perChip, (unsigned)totalCap, (unsigned)fsNext, (unsigned)fsAligned);
-
   // Compute how much space is effectively free beyond FS (to maximize fill)
   const uint32_t approxFree = (totalCap > fsAligned) ? (totalCap - fsAligned) : 0;
   Console.printf("Plan: allocate approx %u bytes of PSRAM free space\n", (unsigned)approxFree);
@@ -744,7 +741,6 @@ static bool psramSafeSmokeTest() {
     Console.println("PSRAM: no free space beyond FS; smoke test aborted");
     return false;
   }
-
   // Determine allocation strategy
   uint32_t stepsDesired = 100u / UPDATE_STEP_PERCENT;
   if (stepsDesired > MAX_SLOTS) {
@@ -756,7 +752,6 @@ static bool psramSafeSmokeTest() {
   // base reserve per slot (rounded up to SECT)
   uint32_t baseReserve = (approxFree + numSlots - 1) / numSlots;
   baseReserve = alignUp(baseReserve, SECT);
-
   // If baseReserve * numSlots exceeds approxFree, lower numSlots
   while ((uint64_t)baseReserve * numSlots > approxFree && numSlots > 1) {
     --numSlots;
@@ -768,25 +763,20 @@ static bool psramSafeSmokeTest() {
                    (unsigned)numSlots, (unsigned)((uint64_t)baseReserve * numSlots), (unsigned)approxFree);
     return false;
   }
-
   Console.printf("Allocating %u slots of ~%u bytes each (aligned to %u)\n", (unsigned)numSlots, (unsigned)baseReserve, (unsigned)SECT);
-
   // Stage A: Allocate slots incrementally and show allocation progress on new lines
   char slotName[32];
   uint32_t allocatedBytes = 0;
   uint32_t percentNextAlloc = UPDATE_STEP_PERCENT;  // next threshold (1..100)
   uint32_t createdSlots = 0;
-
   // Print initial allocation stage
   Console.println("Stage: Allocate slots");
-
   for (uint32_t i = 0; i < numSlots; ++i) {
     snprintf(slotName, sizeof(slotName), ".span_part_%03u", (unsigned)i);
     // If slot exists already, remove it first (fresh slot)
     if (activeFs.exists && activeFs.exists(slotName)) {
       if (activeFs.deleteFile) activeFs.deleteFile(slotName);
     }
-
     // reserve this slot
     uint32_t reserve = baseReserve;
     uint32_t remainNeeded = (allocatedBytes >= approxFree) ? 0 : (approxFree - allocatedBytes);
@@ -794,27 +784,21 @@ static bool psramSafeSmokeTest() {
       // ensure last slot size is at least SECT and covers remaining
       reserve = alignUp(remainNeeded ? remainNeeded : SECT, SECT);
     }
-
     bool ok = activeFs.createFileSlot(slotName, reserve, nullptr, 0);
     if (!ok) {
       Console.printf("\ncreateFileSlot failed for %s (reserve=%u). Aborting.\n", slotName, (unsigned)reserve);
       return false;
     }
-
     allocatedBytes += reserve;
     ++createdSlots;
-
     uint32_t allocPct = (uint32_t)(((uint64_t)allocatedBytes * 100u) / (uint64_t)approxFree);
     if (allocPct > 100) allocPct = 100;
-
     while (allocPct >= percentNextAlloc && percentNextAlloc <= 100) {
       Console.printf("Alloc progress: %u%%\n", (unsigned)percentNextAlloc);
       percentNextAlloc += UPDATE_STEP_PERCENT;
     }
-
     if ((i & 7) == 0) yield();
   }
-
   // Ensure final 100% printed for allocation stage
   if (percentNextAlloc <= 100) {
     while (percentNextAlloc <= 100) {
@@ -822,19 +806,14 @@ static bool psramSafeSmokeTest() {
       percentNextAlloc += UPDATE_STEP_PERCENT;
     }
   }
-
   Console.println("Allocation complete");
-
   // Stage B: Write data into each slot sequentially
   uint8_t page[PAGE];
   uint8_t readbuf[PAGE];
-
   uint64_t totalToWrite = approxFree;
   uint64_t totalWritten = 0;
   uint32_t globalNextPct = UPDATE_STEP_PERCENT;
-
   Console.println("Stage: Writing data into slots");
-
   for (uint32_t i = 0; i < createdSlots; ++i) {
     snprintf(slotName, sizeof(slotName), ".span_part_%03u", (unsigned)i);
     // Obtain slot address and capacity
@@ -843,31 +822,24 @@ static bool psramSafeSmokeTest() {
       Console.printf("getFileInfo failed for slot %s\n", slotName);
       return false;
     }
-
     uint32_t toWrite = cap;
     if (toWrite > approxFree - totalWritten) toWrite = (uint32_t)(approxFree - totalWritten);
     if (toWrite == 0) {
       totalWritten = approxFree;
       break;
     }
-
     Console.printf("Slot %u: addr=0x%08X cap=%u write=%u\n", (unsigned)i, (unsigned)addr, (unsigned)cap, (unsigned)toWrite);
-
     uint32_t slotWritten = 0;
-
     while (slotWritten < toWrite) {
       uint32_t n = (toWrite - slotWritten) >= PAGE ? PAGE : (toWrite - slotWritten);
-
       // deterministic pattern
       for (uint32_t k = 0; k < n; ++k) {
         page[k] = (uint8_t)(0xA5 ^ (uint8_t)i ^ (uint8_t)((slotWritten + k) & 0xFF));
       }
-
       if (!psramBB.writeData02(addr + slotWritten, page, n)) {
         Console.printf("  write failed for slot %u at offset %u\n", (unsigned)i, (unsigned)slotWritten);
         return false;
       }
-
       if (VERIFY_READBACK) {
         memset(readbuf, 0, sizeof(readbuf));
         if (!psramBB.readData03(addr + slotWritten, readbuf, n)) {
@@ -879,35 +851,29 @@ static bool psramSafeSmokeTest() {
           return false;
         }
       }
-
       slotWritten += n;
       totalWritten += n;
-
       uint32_t slotPct = (uint32_t)(((uint64_t)slotWritten * 100u) / (uint64_t)toWrite);
       if (slotPct > 100) slotPct = 100;
       uint32_t globalPct = (uint32_t)(((uint64_t)totalWritten * 100u) / (uint64_t)totalToWrite);
       if (globalPct > 100) globalPct = 100;
-
       // newline progress
       Console.printf("Global: %u%%, Slot %03u: %u%%, offset=%u, written=%u\n",
                      (unsigned)globalPct, (unsigned)i, (unsigned)slotPct, (unsigned)slotWritten, (unsigned)slotWritten);
-
       if ((slotWritten % SECT) == 0) yield();
     }
-
     Console.printf("Slot %03u complete: written=%u\n", (unsigned)i, (unsigned)toWrite);
   }
-
   // Ensure global 100% printed
   while (globalNextPct <= 100) {
     Console.printf("Global: %u%%\n", (unsigned)globalNextPct);
     globalNextPct += UPDATE_STEP_PERCENT;
   }
-
   Console.println("PSRAM multi-slot smoke test complete.");
   Console.printf("Total bytes written (approx): %llu\n", (unsigned long long)totalWritten);
   return true;
 }
+
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -915,6 +881,7 @@ static inline int hexVal(char c) {
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
 }
+
 static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
@@ -944,6 +911,7 @@ static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   outLen = bytes;
   return true;
 }
+
 static int8_t b64Map[256];
 static void initB64MapOnce() {
   static bool inited = false;
@@ -955,6 +923,7 @@ static void initB64MapOnce() {
   b64Map[(uint8_t)'+'] = 62;
   b64Map[(uint8_t)'/'] = 63;
 }
+
 static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
@@ -1018,6 +987,7 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   outLen = o;
   return true;
 }
+
 static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
   if (!checkNameLen(fname)) return false;
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
@@ -1040,6 +1010,7 @@ static bool readLine() {
   }
   return false;
 }
+
 static int nextToken(char*& p, char*& tok) {
   while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
   if (!*p) {
@@ -1054,6 +1025,7 @@ static int nextToken(char*& p, char*& tok) {
   }
   return 1;
 }
+
 static void printHelp() {
   Console.println("Commands (filename max 32 chars):");
   Console.println("  help                         - this help");
@@ -1085,7 +1057,6 @@ static void printHelp() {
   Console.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Console.println("  puthex <file> <hex>          - upload binary as hex string (single line)");
   Console.println("  putb64 <file> <base64>       - upload binary as base64 (single line)");
-  Console.println("  clear                        - clear TFT and reset console cursor");
   Console.println();
   Console.println("Linux hints:");
   Console.println("  # Base64 (single line, no wraps)  base64 -w0 your.bin");
@@ -1098,6 +1069,7 @@ static void printHelp() {
   Console.println("  - Background jobs: only one background job supported at a time. Use 'bg' to query or cancel.");
   Console.println();
 }
+
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
@@ -1473,9 +1445,6 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
-  } else if (!strcmp(t0, "tft.clear") || !strcmp(t0, "clear")) {
-    tftConsoleClear();
-    Console.println("(TFT cleared)");
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
@@ -1487,21 +1456,17 @@ void setup() {
   while (!Serial) { delay(20); }
   delay(20);
   Serial.println("System booting..");
-  // Initialize TFT Console
-  if (CONSOLE_TFT_ATTACH) {
-    Console.tftAttach(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST, /*w=*/240, /*h=*/320, /*rot=*/1, /*invert=*/true, /*mosi=*/PIN_TFT_MOSI, /*sck=*/PIN_TFT_SCK, /*spiHz=*/62500000);
-    Console.tftSetTextSize(1);
-    Console.tftSetColors(0xFFFF, 0x0000);  // white on black
-  }
+
+  // Initialize Console
   Console.begin();
+
   // Initialize flash
   flashBB.begin();
 
   // ---------- PSRAM CS mode selection ----------
   // 74HC138-only mode (this must be called before psramBB.begin())
   psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
-
-  // Start PSRAM bitbang
+  // Start PSRAM bus (adapter inside PSRAMAggregateDevice will be used)
   psramBB.begin();
   psramBB.setClockDelayUs(PSRAM_CLOCK_DELAY_US);
 
@@ -1518,27 +1483,18 @@ void setup() {
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
 
-  tft.init(tft_w, tft_h);
-  tft.setRotation(tft_rot & 3);
-  tft.setSPISpeed(62500000);
-  tft.invertDisplay(true);
-  tft_ready = true;
-  tft_w = tft.width();
-  tft_h = tft.height();
-  tftConsoleBegin();
-
-  // Optionally probe PSRAM now
-  //psramSafeSmokeTest();
-
   Console.printf("System ready. Type 'help'\n> ");
 }
+
 void setup1() {
   g_job_flag = 0u;
 }
+
 void loop1() {
   core1WorkerPoll();
   tight_loop_contents();
 }
+
 void loop() {
   pollBackgroundExec();  // handle any background job completions/timeouts
   if (readLine()) {

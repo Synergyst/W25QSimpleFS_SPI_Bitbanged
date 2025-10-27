@@ -1,20 +1,46 @@
 #pragma once
+/*
+  W25QBitbang.h - Bit-banged SPI driver for Winbond W25Q-series (mode 0).
+  RP2040 SIO fast-path optimized when available.
+*/
+
+#include <Arduino.h>
+#include <inttypes.h>
+
+#if (defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_RASPBERRY_PI_PICO) || defined(ARDUINO_GENERIC_RP2040)) && !defined(BB_USE_RP2040_SIO)
+#define BB_USE_RP2040_SIO 1
+#endif
+
+#ifdef BB_USE_RP2040_SIO
+#include "hardware/structs/sio.h"
+#endif
 
 // Bit-banged SPI driver for Winbond W25Q-series (mode 0).
 class W25QBitbang {
 public:
   W25QBitbang(uint8_t pinMiso, uint8_t pinCs, uint8_t pinSck, uint8_t pinMosi)
-    : _miso(pinMiso), _cs(pinCs), _sck(pinSck), _mosi(pinMosi) {}
+    : _miso(pinMiso), _cs(pinCs), _sck(pinSck), _mosi(pinMosi) {
+#ifdef BB_USE_RP2040_SIO
+    _maskMISO = _maskCS = _maskSCK = _maskMOSI = 0;
+#endif
+  }
 
   void begin() {
     pinMode(_cs, OUTPUT);
     pinMode(_sck, OUTPUT);
     pinMode(_mosi, OUTPUT);
     pinMode(_miso, INPUT);
-
     digitalWrite(_cs, HIGH);
     digitalWrite(_sck, LOW);
     digitalWrite(_mosi, LOW);
+
+#ifdef BB_USE_RP2040_SIO
+    // Precompute masks for fast SIO operations (assumes GPIO numbers < 32)
+    _maskMISO = (1u << _miso);
+    _maskCS = (1u << _cs);
+    _maskSCK = (1u << _sck);
+    _maskMOSI = (1u << _mosi);
+#endif
   }
 
   // JEDEC ID (0x9F). Returns total capacity in bytes (2^capCode) or 0 on error.
@@ -74,6 +100,18 @@ public:
     return len;
   }
 
+  // Optional faster read (0x0B) with one dummy byte
+  size_t readDataFast0B(uint32_t addr, uint8_t *buf, size_t len) {
+    if (!buf || len == 0) return 0;
+    csLow();
+    xfer(0x0B);
+    sendAddr24(addr);
+    xfer(0x00);  // dummy byte
+    for (size_t i = 0; i < len; ++i) buf[i] = xfer(0x00);
+    csHigh();
+    return len;
+  }
+
   // Page program (0x02), auto-splits at 256-byte boundaries
   bool pageProgram(uint32_t addr, const uint8_t *data, size_t len,
                    uint32_t chunkTimeoutMs = 10) {
@@ -83,17 +121,13 @@ public:
       size_t pageOff = (addr & 0xFF);
       size_t pageSpace = 256 - pageOff;
       size_t chunk = (len - off < pageSpace) ? (len - off) : pageSpace;
-
       if (!writeEnable()) return false;
-
       csLow();
       xfer(0x02);
       sendAddr24(addr);
       for (size_t i = 0; i < chunk; ++i) xfer(data[off + i]);
       csHigh();
-
       if (!waitWhileBusy(chunkTimeoutMs)) return false;
-
       addr += chunk;
       off += chunk;
     }
@@ -121,13 +155,34 @@ private:
   uint8_t _miso, _cs, _sck, _mosi;
 
   inline void csLow() {
+#ifdef BB_USE_RP2040_SIO
+    sio_hw->gpio_clr = _maskCS;
+#else
     digitalWrite(_cs, LOW);
-  }
-  inline void csHigh() {
-    digitalWrite(_cs, HIGH);
+#endif
   }
 
+  inline void csHigh() {
+#ifdef BB_USE_RP2040_SIO
+    sio_hw->gpio_set = _maskCS;
+#else
+    digitalWrite(_cs, HIGH);
+#endif
+  }
+
+  // Fast-path transfer using RP2040 SIO if available; otherwise portable digital I/O.
   inline uint8_t xfer(uint8_t outByte) {
+#ifdef BB_USE_RP2040_SIO
+    uint8_t inByte = 0;
+    for (int8_t bit = 7; bit >= 0; --bit) {
+      if (outByte & (1u << bit)) sio_hw->gpio_set = _maskMOSI;
+      else sio_hw->gpio_clr = _maskMOSI;
+      sio_hw->gpio_set = _maskSCK;
+      inByte = (uint8_t)((inByte << 1) | ((sio_hw->gpio_in & _maskMISO) ? 1u : 0u));
+      sio_hw->gpio_clr = _maskSCK;
+    }
+    return inByte;
+#else
     uint8_t inByte = 0;
     for (int8_t bit = 7; bit >= 0; --bit) {
       digitalWrite(_mosi, (outByte >> bit) & 0x01);
@@ -136,6 +191,7 @@ private:
       digitalWrite(_sck, LOW);
     }
     return inByte;
+#endif
   }
 
   inline void sendAddr24(uint32_t addr) {
@@ -143,4 +199,9 @@ private:
     xfer((uint8_t)(addr >> 8));
     xfer((uint8_t)(addr >> 0));
   }
+
+#ifdef BB_USE_RP2040_SIO
+  // Precomputed masks for RP2040 SIO operations (1 << gpio)
+  uint32_t _maskMISO = 0, _maskCS = 0, _maskSCK = 0, _maskMOSI = 0;
+#endif
 };

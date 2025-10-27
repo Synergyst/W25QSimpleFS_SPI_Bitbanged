@@ -5,6 +5,25 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 
+
+
+// ========== TFT console helpers to mirror Serial output ==========
+/*static void tftConsoleBegin() {
+  if (!tft_ready) return;
+  tft.setTextWrap(false);
+  tft.setTextColor(tft_console_fg, tft_console_bg);
+  tft.setTextSize(tft_console_textsize);
+  tft.fillScreen(tft_console_bg);
+  tft.setCursor(0, 0);
+}
+static void tftConsoleClear() {
+  if (!tft_ready) return;
+  tft.fillScreen(tft_console_bg);
+  tft.setCursor(0, 0);
+}*/
+
+
+
 // Simple callback bundle so we can read from your active FS without depending on its symbol.
 struct TFT_FSCallbacks {
   // Must match your activeFs: bool getFileSize(const char*, uint32_t&)
