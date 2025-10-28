@@ -16,6 +16,10 @@
     - Baud rate is configurable (SOFT_BAUD). Default: 230400.
 */
 #include <Arduino.h>
+
+#include "PSRAMMulti.h"
+#include "rp_selfupdate.h"
+
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
 #define COPROCLANG_MAX_LINES 512
@@ -724,11 +728,39 @@ static void protocolLoop() {
     }
   }
 }
+// ------- rp_selfupdate -------
+static const uint8_t PIN_MISO = 4;    // pin from RP to PSRAM pin-5
+static const uint8_t PIN_MOSI = 3;    // pin from RP to PSRAM pin-2
+static const uint8_t PIN_SCK = 2;     // pin from RP to PSRAM pin-6
+static const uint8_t PIN_DEC_EN = 6;  // 74HC138 G2A/G2B tied together via transistor or directly; active LOW
+static const uint8_t PIN_DEC_A0 = 8;  // 74HC138 address bit 0
+static const uint8_t PIN_DEC_A1 = 7;  // 74HC138 address bit 1
+static const uint8_t BANKS = 4;
+static const uint32_t PER_CHIP_BYTES = 8u * 1024u * 1024u;
+PSRAMAggregateDevice psram(PIN_MISO, PIN_MOSI, PIN_SCK, PER_CHIP_BYTES);
+PSRAMSimpleFS_Multi fs(psram, /*capacityBytes=*/PER_CHIP_BYTES* BANKS);
+const uint8_t PIN_UPDATE = 22;
+volatile bool doUpdate = false;
+void onTrig() {
+  doUpdate = true;
+}
 // ========== Setup and main ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(10); }
   delay(10);
+
+  // Configure decoder selection for 4 banks via 74HC138
+  psram.configureDecoder138(BANKS, PIN_DEC_EN, PIN_DEC_A0, PIN_DEC_A1 /*, A2=255 default*/);
+  psram.begin();
+  // Mount and auto-format if empty (or call fs.format()/fs.wipeChip() explicitly)
+  fs.mount(true);
+  pinMode(PIN_UPDATE, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(PIN_UPDATE), onTrig, RISING);
+  Serial.println("Ready. Put update.bin into PSRAM FS, then pull GP22 HIGH to flash.");
+  // Example: to fully wipe PSRAM FS area for staging:
+  // rpupdfs_wipe_chip(fs);
+
   Serial.println("CoProc (soft-serial) booting...");
   // Allocate protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);

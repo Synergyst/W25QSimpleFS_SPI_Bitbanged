@@ -41,7 +41,6 @@
 #include "PSRAMBitbang.h"
 #endif
 #include "PSRAMMulti.h"
-
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"  // shared single-header protocol
@@ -58,7 +57,6 @@
 #define PIN_COPROC_TX 1  // GP1 (main TX)
 #endif
 static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, TX, non-inverted
-
 // Store ASCII scripts as raw multi-line strings, expose pointer + length.
 #ifndef DECLARE_ASCII_SCRIPT
 #define DECLARE_ASCII_SCRIPT(name, literal) \
@@ -78,19 +76,15 @@ static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, T
 #include "scripts.h"
 #define FILE_BLINKSCRIPT "blinkscript"
 #define FILE_ONSCRIPT "onscript"
-
 struct BlobReg;               // Forward declaration
 static ConsolePrint Console;  // Console wrapper
-
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
-
 // ========== bitbang pin definitions (flash) ==========
 const uint8_t PIN_FLASH_MISO = 12;  // GP12
 const uint8_t PIN_FLASH_CS = 28;    // GP28
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_FLASH_MOSI = 11;  // GP11
-
 // ========== bitbang pin definitions (psram) ==========
 const bool PSRAM_ENABLE_QPI = false;     // Should we enable the PSRAM QPI-mode?
 const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // Small delay helps ensure decoder/address settle before EN
@@ -99,7 +93,6 @@ const uint8_t PIN_PSRAM_MOSI = 11;       // GP11
 const uint8_t PIN_PSRAM_SCK = 10;        // GP10
 //const uint8_t PIN_PSRAM_IO2 = ;  // only used if QPI enabled
 //const uint8_t PIN_PSRAM_IO3 = ;  // only used if QPI enabled
-
 // 74HC138 pins (for 138-only default)
 const uint8_t PIN_138_A0 = 8;  // 74HC138 pin 1 (A0)
 const uint8_t PIN_138_A1 = 7;  // 74HC138 pin 2 (A1)
@@ -108,31 +101,24 @@ const uint8_t PIN_138_EN = 9;  // 74HC138 pins 4+5 (G2A/G2B tied), 10k pull-up t
 const uint8_t PIN_138_A2 = 255;  // 255 means "not used"; tie 74HC138 pin 3 (A2) to GND
 // OPTIONAL: 74HC595 latch pin for method 138+595 (SER=MOSI, SRCLK=SCK are reused)
 const uint8_t PIN_595_LATCH = 4;  // 595.RCLK (unused in 138-only mode)
-
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 const size_t PERSIST_LEN = 32;
-
 enum class StorageBackend {
   // Choose active storage at runtime
   Flash,
   PSRAM_BACKEND
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-
 constexpr uint8_t PSRAM_NUM_CHIPS = 4;
 constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;  // Example: 8MB per chip.
 constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * PSRAM_NUM_CHIPS;
-
 W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
 W25QSimpleFS fsFlash(flashBB);
 PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
-
 static bool g_dev_mode = true;
-
 // Sequence for CoProc protocol
 static uint32_t g_coproc_seq = 1;  // Global sequence for protocol
-
 // ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -155,7 +141,6 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-
 static void bindActiveFs(StorageBackend backend) {
   // Helper to bind either flash or psram into activeFs at runtime
   if (backend == StorageBackend::Flash) {
@@ -258,7 +243,6 @@ static void bindActiveFs(StorageBackend backend) {
     };
   }
 }
-
 // ========== Blob registry ==========
 struct BlobReg {
   const char* id;
@@ -274,17 +258,14 @@ static const BlobReg g_blobs[] = {
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-
 // ========== helpers using Console ==========
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
   Console.print(b, HEX);
 }
-
 // ========== Return mailbox reservation (Scratch) ==========
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
-
 // ========== Mailbox helpers ==========
 static inline void mailboxClearFirstByte() {
   volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
@@ -301,7 +282,6 @@ static void mailboxPrintIfAny() {
   }
   Console.println("\"");
 }
-
 // ========== Core1 execution plumbing (mailbox) ==========
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
@@ -444,7 +424,6 @@ static bool execBlobGeneric(const char* fname, int argc, const int argv[], int& 
   free(raw);
   return true;
 }
-
 // Background execution support (one background job at a time)
 static volatile void* g_bg_raw = nullptr;
 static volatile uint8_t* g_bg_buf = nullptr;
@@ -555,7 +534,6 @@ static void pollBackgroundExec() {
     }
   }
 }
-
 // ========== FS helpers and console ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -889,7 +867,6 @@ static bool psramSafeSmokeTest() {
   Console.printf("Total bytes written (approx): %llu\n", (unsigned long long)totalWritten);
   return true;
 }
-
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -1005,7 +982,6 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
-
 // ========== Co-Processor RPC over Software Serial ==========
 static inline void coprocLinkBegin() {
   coprocLink.begin(COPROC_BAUD);
@@ -1194,7 +1170,7 @@ static bool coprocLoadBuffer(const uint8_t* data, uint32_t len) {
     Console.printf("LOAD_BEGIN failed st=%d\n", st);
     return false;
   }
-  // LOAD_DATA chunks + rolling CRC (seed 0, matches co-proc)
+  // LOAD_DATA chunks + rolling CRC (seed 0)
   const uint32_t CHUNK = 512;
   uint32_t sent = 0;
   uint32_t rollingCrc = 0;  // seed 0
@@ -1284,31 +1260,107 @@ static bool coprocLoadFile(const char* fname) {
 // Execute with args; timeout taken from main device's override (getTimeout())
 static bool coprocExec(const int32_t* argv, uint32_t argc) {
   if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
-
   uint32_t timeoutMs = getTimeout(100000);  // use master’s configured timeout (0 => default 100000 here)
   uint8_t payload[4 + MAX_EXEC_ARGS * 4 + 4];
   size_t off = 0;
-
   // argc
   memcpy(payload + off, &argc, 4);
   off += 4;
-
   // argv
   for (uint32_t i = 0; i < argc; ++i) {
     memcpy(payload + off, &argv[i], 4);
     off += 4;
   }
-
   // timeout_ms (from master)
   memcpy(payload + off, &timeoutMs, 4);
   off += 4;
-
   CoProc::Frame rh;
   uint8_t rbuf[16];
   uint32_t rl = 0;
   int32_t st = 0;
-
   if (!coprocRequestSerial(CoProc::CMD_EXEC, payload, (uint32_t)off, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
+  if (rl < 8) {
+    Console.println("coproc: short EXEC response");
+    return false;
+  }
+  int32_t retCode = 0;
+  memcpy(&st, rbuf + 0, 4);
+  memcpy(&retCode, rbuf + 4, 4);
+  Console.printf("CoProc EXEC: status=%d return=%d\n", (int)st, (int)retCode);
+  return true;
+}
+// New: send CMD_EXEC but with ASCII args mode when tokens indicate (0xFFFF FFFF marker)
+static bool coprocExecTokens(const char* tokens[], uint32_t argc) {
+  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+  uint32_t timeoutMs = getTimeout(100000);
+  // decide whether to use ASCII-arg alternate encoding
+  bool needAscii = false;
+  for (uint32_t i = 0; i < argc; ++i) {
+    const char* s = tokens[i];
+    if (!s || !*s) {
+      needAscii = true;
+      break;
+    }
+    // if starts with 0x or contains non-digit (besides +-) -> ascii
+    if ((s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))) {
+      needAscii = true;
+      break;
+    }
+    for (const char* p = s; *p; ++p) {
+      char c = *p;
+      if ((c >= '0' && c <= '9') || c == '+' || c == '-') continue;
+      needAscii = true;
+      break;
+    }
+    if (needAscii) break;
+  }
+  if (!needAscii) {
+    // fallback to classic binary ints
+    int32_t argv[MAX_EXEC_ARGS];
+    for (uint32_t i = 0; i < argc; ++i) argv[i] = (int32_t)strtol(tokens[i], nullptr, 0);
+    return coprocExec(argv, argc);
+  }
+  // Build ASCII-mode payload: [argc:uint32][marker:0xFFFFFFFF][for each: slen:uint32 + bytes][timeout:uint32]
+  // Compute total size
+  uint32_t total = 4 + 4 + 4 + 4;  // argc + marker + (at least one arg) + timeout; we'll recompute precisely
+  total = 4 + 4;                   // argc + marker
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < argc; ++i) {
+    uint32_t sl = (uint32_t)strlen(tokens[i]);
+    sum += 4 + sl;  // slen + bytes
+  }
+  total += sum + 4;  // + timeout
+  if (total > 8192) {
+    Console.println("coproc exec: args too large");
+    return false;
+  }
+  uint8_t* payload = (uint8_t*)malloc(total);
+  if (!payload) {
+    Console.println("coproc exec: malloc failed");
+    return false;
+  }
+  size_t off = 0;
+  memcpy(payload + off, &argc, 4);
+  off += 4;
+  uint32_t marker = 0xFFFFFFFFu;
+  memcpy(payload + off, &marker, 4);
+  off += 4;
+  for (uint32_t i = 0; i < argc; ++i) {
+    uint32_t sl = (uint32_t)strlen(tokens[i]);
+    memcpy(payload + off, &sl, 4);
+    off += 4;
+    memcpy(payload + off, tokens[i], sl);
+    off += sl;
+  }
+  memcpy(payload + off, &timeoutMs, 4);
+  off += 4;
+  CoProc::Frame rh;
+  uint8_t rbuf[16];
+  uint32_t rl = 0;
+  int32_t st = 0;
+  bool ok = coprocRequestSerial(CoProc::CMD_EXEC, payload, (uint32_t)off, rh, rbuf, sizeof(rbuf), rl, &st);
+  free(payload);
+  if (!ok) return false;
   if (rl < 8) {
     Console.println("coproc: short EXEC response");
     return false;
@@ -1384,7 +1436,6 @@ static bool coprocReset() {
   Console.println("CoProc RESET issued");
   return ok;
 }
-
 // ========== Co-Processor Script RPC over Software Serial ==========
 // Load a script file (text) to the co-processor (SCRIPT_* pipeline)
 static bool coprocScriptLoadFile(const char* fname) {
@@ -1456,7 +1507,6 @@ static bool coprocScriptExec(const int32_t* argv, uint32_t argc) {
   }
   memcpy(payload + off, &timeoutMs, 4);
   off += 4;
-
   CoProc::Frame rh;
   uint8_t rbuf[16];
   uint32_t rl = 0;
@@ -1472,12 +1522,95 @@ static bool coprocScriptExec(const int32_t* argv, uint32_t argc) {
   Console.printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
   return true;
 }
-// One-shot: load script file and exec with args
+// New: send SCRIPT_EXEC with token strings (auto-choose ASCII mode if tokens indicate)
+static bool coprocScriptExecTokens(const char* tokens[], uint32_t argc) {
+  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+  uint32_t timeoutMs = getTimeout(100000);
+  // decide whether to use ASCII-arg alternate encoding
+  bool needAscii = false;
+  for (uint32_t i = 0; i < argc; ++i) {
+    const char* s = tokens[i];
+    if (!s || !*s) {
+      needAscii = true;
+      break;
+    }
+    // if starts with 0x or contains non-digit (besides +-) -> ascii
+    if ((s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))) {
+      needAscii = true;
+      break;
+    }
+    for (const char* p = s; *p; ++p) {
+      char c = *p;
+      if ((c >= '0' && c <= '9') || c == '+' || c == '-') continue;
+      needAscii = true;
+      break;
+    }
+    if (needAscii) break;
+  }
+  if (!needAscii) {
+    // fallback to classic binary ints
+    int32_t argv[MAX_EXEC_ARGS];
+    for (uint32_t i = 0; i < argc; ++i) argv[i] = (int32_t)strtol(tokens[i], nullptr, 0);
+    return coprocScriptExec(argv, argc);
+  }
+  // Build ASCII-mode payload: [argc:uint32][marker:0xFFFFFFFF][for each: slen:uint32 + bytes][timeout:uint32]
+  uint32_t total = 4 + 4;  // argc + marker
+  for (uint32_t i = 0; i < argc; ++i) {
+    uint32_t sl = (uint32_t)strlen(tokens[i]);
+    total += 4 + sl;
+  }
+  total += 4;  // timeout
+  if (total > 8192) {
+    Console.println("coproc script exec: args too large");
+    return false;
+  }
+  uint8_t* payload = (uint8_t*)malloc(total);
+  if (!payload) {
+    Console.println("coproc script exec: malloc failed");
+    return false;
+  }
+  size_t off = 0;
+  memcpy(payload + off, &argc, 4);
+  off += 4;
+  uint32_t marker = 0xFFFFFFFFu;
+  memcpy(payload + off, &marker, 4);
+  off += 4;
+  for (uint32_t i = 0; i < argc; ++i) {
+    uint32_t sl = (uint32_t)strlen(tokens[i]);
+    memcpy(payload + off, &sl, 4);
+    off += 4;
+    memcpy(payload + off, tokens[i], sl);
+    off += sl;
+  }
+  memcpy(payload + off, &timeoutMs, 4);
+  off += 4;
+  CoProc::Frame rh;
+  uint8_t rbuf[16];
+  uint32_t rl = 0;
+  int32_t st = 0;
+  bool ok = coprocRequestSerial(CoProc::CMD_SCRIPT_EXEC, payload, (uint32_t)off, rh, rbuf, sizeof(rbuf), rl, &st);
+  free(payload);
+  if (!ok) return false;
+  if (rl < 8) {
+    Console.println("coproc: short SCRIPT_EXEC response");
+    return false;
+  }
+  int32_t retCode = 0;
+  memcpy(&st, rbuf + 0, 4);
+  memcpy(&retCode, rbuf + 4, 4);
+  Console.printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
+  return true;
+}
+// One-shot: load script file and exec with args (string tokens)
+static bool coprocScriptExecFileTokens(const char* fname, const char* tokens[], uint32_t argc) {
+  if (!coprocScriptLoadFile(fname)) return false;
+  return coprocScriptExecTokens(tokens, argc);
+}
+// One-shot: load script file and exec with int args (backward compat)
 static bool coprocScriptExecFile(const char* fname, const int32_t* argv, uint32_t argc) {
   if (!coprocScriptLoadFile(fname)) return false;
   return coprocScriptExec(argv, argc);
 }
-
 // ========== Serial console / command handling ==========
 static char lineBuf[FS_SECTOR_SIZE];
 static bool readLine() {
@@ -1840,13 +1973,19 @@ static void handleCommand(char* line) {
         Console.println("usage: coproc sexec <file> [a0..aN]");
         return;
       }
-      int32_t argvN[MAX_EXEC_ARGS];
+      // Collect raw token strings (do not convert to int here)
+      const char* tokens[MAX_EXEC_ARGS];
       uint32_t argc = 0;
       char* tok = nullptr;
       while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) {
-        argvN[argc++] = (int32_t)strtol(tok, nullptr, 0);
+        tokens[argc++] = tok;
       }
-      if (!coprocScriptExecFile(fname, argvN, argc)) Console.println("coproc sexec failed");
+      if (!coprocScriptLoadFile(fname)) {
+        Console.println("coproc sexec failed: load failed");
+        return;
+      }
+      // Use tokens-aware send (will choose ASCII mode if needed)
+      if (!coprocScriptExecTokens(tokens, argc)) Console.println("coproc sexec failed");
     } else if (!strcmp(sub, "exec")) {
       // Syntax: coproc exec <file> [a0..aN]
       char* fname = nullptr;
@@ -1854,13 +1993,18 @@ static void handleCommand(char* line) {
         Console.println("usage: coproc exec <file> [a0..aN]");
         return;
       }
-      int32_t argvN[MAX_EXEC_ARGS];
+      const char* tokens[MAX_EXEC_ARGS];
       uint32_t argc = 0;
       char* tok = nullptr;
       while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) {
-        argvN[argc++] = (int32_t)strtol(tok, nullptr, 0);
+        tokens[argc++] = tok;
       }
-      if (!coprocExecFile(fname, argvN, argc)) Console.println("coproc exec failed");
+      // send as tokens-aware (will auto choose ascii vs binary)
+      if (!coprocLoadFile(fname)) {
+        Console.println("coproc exec failed: load failed");
+        return;
+      }
+      if (!coprocExecTokens(tokens, argc)) Console.println("coproc exec failed");
     } else if (!strcmp(sub, "status")) {
       if (!coprocStatus()) Console.println("coproc status failed");
     } else if (!strcmp(sub, "mbox")) {
@@ -1991,20 +2135,16 @@ static void handleCommand(char* line) {
     Console.println("Unknown command. Type 'help'.");
   }
 }
-
 // ========== Setup and main loop ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
   Serial.println("System booting..");
-
   // Initialize Console
   Console.begin();
-
   // Initialize flash
   flashBB.begin();
-
   // ---------- PSRAM CS mode selection ----------
   // 74HC138-only mode (this must be called before psramBB.begin())
   psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
@@ -2016,19 +2156,15 @@ void setup() {
   //   psramBB.setExtraDataPins(PIN_PSRAM_IO2, PIN_PSRAM_IO3);
   //   psramBB.setModeQuad(true);
   // }
-
   bindActiveFs(g_storage);
   bool mounted = (g_storage == StorageBackend::Flash) ? activeFs.mount(true) : activeFs.mount(false);
   if (!mounted) { Console.println("FS mount failed on active storage"); }
-
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-
   // Initialize co-processor software serial link
   coprocLinkBegin();
   Console.printf("Co-Proc serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
                  (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
-
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
