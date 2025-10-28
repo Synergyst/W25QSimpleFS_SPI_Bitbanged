@@ -45,6 +45,7 @@
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"  // shared single-header protocol
+#include "CoProcLang.h"
 #ifndef COPROC_BAUD
 #define COPROC_BAUD 230400
 #endif
@@ -56,11 +57,25 @@
 #endif
 static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, TX, non-inverted
 
+// Store ASCII scripts as raw multi-line strings, expose pointer + length.
+#ifndef DECLARE_ASCII_SCRIPT
+#define DECLARE_ASCII_SCRIPT(name, literal) \
+  static const char name##_ascii[] = literal; \
+  const uint8_t* name = reinterpret_cast<const uint8_t*>(name##_ascii); \
+  const unsigned int name##_len = (unsigned int)(sizeof(name##_ascii) - 1)
+#endif
 #include "blob_mailbox_config.h"
 #include "blob_ret42.h"
 #define FILE_RET42 "ret42"
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
+#include "blob_pwmc2350.h"
+#define FILE_PWMC2350 "pwmc2350"
+#include "blob_retmin.h"
+#define FILE_RETMIN "retmin"
+#include "scripts.h"
+#define FILE_BLINKSCRIPT "blinkscript"
+#define FILE_ONSCRIPT "onscript"
 
 struct BlobReg;               // Forward declaration
 static ConsolePrint Console;  // Console wrapper
@@ -251,6 +266,10 @@ struct BlobReg {
 static const BlobReg g_blobs[] = {
   { FILE_RET42, blob_ret42, blob_ret42_len },
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
+  { FILE_PWMC2350, blob_pwmc, blob_pwmc2350_len },
+  { FILE_RETMIN, blob_retmin, blob_retmin_len },
+  { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
+  { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
 
@@ -374,6 +393,7 @@ static bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const 
   for (uint32_t i = 0; i < argc; ++i) g_job.args[i] = argv[i];
   g_status = 0;
   g_result = 0;
+  unsigned long execTime = millis();
   __asm volatile("dsb" ::
                    : "memory");
   __asm volatile("isb" ::
@@ -688,6 +708,10 @@ static void autogenBlobWrites() {
   bool allOk = true;
   allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
   allOk &= ensureBlobIfMissing(FILE_PWMC, blob_pwmc, blob_pwmc_len);
+  allOk &= ensureBlobIfMissing(FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len);
+  allOk &= ensureBlobIfMissing(FILE_RETMIN, blob_retmin, blob_retmin_len);
+  allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
+  allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
@@ -1127,7 +1151,6 @@ static bool coprocRequestSerial(uint16_t cmd,
   }
   return true;
 }
-
 // Convenience wrappers
 static bool coprocHello() {
   CoProc::Frame rh;
@@ -1256,23 +1279,33 @@ static bool coprocLoadFile(const char* fname) {
   Console.printf("CoProc LOAD OK (%u bytes)\n", (unsigned)size);
   return true;
 }
-// Execute with args and timeout; returns true on transport OK; prints result
-static bool coprocExec(const int32_t* argv, uint32_t argc, uint32_t timeoutMs) {
+// Execute with args; timeout taken from main device's override (getTimeout())
+static bool coprocExec(const int32_t* argv, uint32_t argc) {
   if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+
+  uint32_t timeoutMs = getTimeout(100000);  // use master’s configured timeout (0 => default 100000 here)
   uint8_t payload[4 + MAX_EXEC_ARGS * 4 + 4];
   size_t off = 0;
+
+  // argc
   memcpy(payload + off, &argc, 4);
   off += 4;
+
+  // argv
   for (uint32_t i = 0; i < argc; ++i) {
     memcpy(payload + off, &argv[i], 4);
     off += 4;
   }
+
+  // timeout_ms (from master)
   memcpy(payload + off, &timeoutMs, 4);
   off += 4;
+
   CoProc::Frame rh;
   uint8_t rbuf[16];
   uint32_t rl = 0;
   int32_t st = 0;
+
   if (!coprocRequestSerial(CoProc::CMD_EXEC, payload, (uint32_t)off, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
   if (rl < 8) {
     Console.println("coproc: short EXEC response");
@@ -1282,6 +1315,25 @@ static bool coprocExec(const int32_t* argv, uint32_t argc, uint32_t timeoutMs) {
   memcpy(&st, rbuf + 0, 4);
   memcpy(&retCode, rbuf + 4, 4);
   Console.printf("CoProc EXEC: status=%d return=%d\n", (int)st, (int)retCode);
+  return true;
+}
+// Load a blob file from active FS onto the co-processor, then EXEC with args.
+// Uses master-side timeout (getTimeout()).
+static bool coprocExecFile(const char* fname, const int32_t* argv, uint32_t argc) {
+  if (!fname || !*fname) {
+    Console.println("coproc exec: missing file name");
+    return false;
+  }
+  // Stream the file to the co-processor
+  if (!coprocLoadFile(fname)) {
+    Console.println("coproc exec: LOAD_* failed");
+    return false;
+  }
+  // Execute with provided args and master timeout
+  if (!coprocExec(argv, argc)) {
+    Console.println("coproc exec: EXEC failed");
+    return false;
+  }
   return true;
 }
 static bool coprocStatus() {
@@ -1329,6 +1381,99 @@ static bool coprocReset() {
   bool ok = coprocRequestSerial(CoProc::CMD_RESET, nullptr, 0, rh, buf, sizeof(buf), rl, &st);
   Console.println("CoProc RESET issued");
   return ok;
+}
+
+// ========== Co-Processor Script RPC over Software Serial ==========
+// Load a script file (text) to the co-processor (SCRIPT_* pipeline)
+static bool coprocScriptLoadFile(const char* fname) {
+  if (!activeFs.exists(fname)) {
+    Console.println("coproc script: file not found");
+    return false;
+  }
+  uint32_t size = 0;
+  if (!activeFs.getFileSize(fname, size) || size == 0) {
+    Console.println("coproc script: empty file");
+    return false;
+  }
+  // BEGIN
+  uint8_t b4[4];
+  memcpy(b4, &size, 4);
+  CoProc::Frame rh;
+  uint8_t rbuf[8];
+  uint32_t rl = 0;
+  int32_t st = 0;
+  if (!coprocRequestSerial(CoProc::CMD_SCRIPT_BEGIN, b4, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
+  if (st != CoProc::ST_OK) {
+    Console.printf("SCRIPT_BEGIN failed st=%d\n", st);
+    return false;
+  }
+  // DATA chunks + rolling CRC (seed 0)
+  const uint32_t CHUNK = 512;
+  uint8_t buf[CHUNK];
+  uint32_t offset = 0;
+  uint32_t rollingCrc = 0;
+  while (offset < size) {
+    uint32_t n = (size - offset > CHUNK) ? CHUNK : (size - offset);
+    uint32_t got = activeFs.readFileRange(fname, offset, buf, n);
+    if (got != n) {
+      Console.println("coproc script: read error");
+      return false;
+    }
+    rl = 0;
+    if (!coprocRequestSerial(CoProc::CMD_SCRIPT_DATA, buf, n, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
+    if (st != CoProc::ST_OK && st != CoProc::ST_SIZE) {
+      Console.printf("SCRIPT_DATA st=%d\n", st);
+      return false;
+    }
+    rollingCrc = CoProc::crc32_ieee(buf, n, rollingCrc);
+    offset += n;
+  }
+  // END (send rolling CRC)
+  uint8_t crc4[4];
+  memcpy(crc4, &rollingCrc, 4);
+  rl = 0;
+  if (!coprocRequestSerial(CoProc::CMD_SCRIPT_END, crc4, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
+  if (st != CoProc::ST_OK) {
+    Console.printf("SCRIPT_END failed st=%d\n", st);
+    return false;
+  }
+  Console.printf("CoProc SCRIPT LOAD OK (%u bytes)\n", (unsigned)size);
+  return true;
+}
+// Execute currently loaded script with args (timeout from master setting)
+static bool coprocScriptExec(const int32_t* argv, uint32_t argc) {
+  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+  uint32_t timeoutMs = getTimeout(100000);
+  uint8_t payload[4 + MAX_EXEC_ARGS * 4 + 4];
+  size_t off = 0;
+  memcpy(payload + off, &argc, 4);
+  off += 4;
+  for (uint32_t i = 0; i < argc; ++i) {
+    memcpy(payload + off, &argv[i], 4);
+    off += 4;
+  }
+  memcpy(payload + off, &timeoutMs, 4);
+  off += 4;
+
+  CoProc::Frame rh;
+  uint8_t rbuf[16];
+  uint32_t rl = 0;
+  int32_t st = 0;
+  if (!coprocRequestSerial(CoProc::CMD_SCRIPT_EXEC, payload, (uint32_t)off, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
+  if (rl < 8) {
+    Console.println("coproc: short SCRIPT_EXEC response");
+    return false;
+  }
+  int32_t retCode = 0;
+  memcpy(&st, rbuf + 0, 4);
+  memcpy(&retCode, rbuf + 4, 4);
+  Console.printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
+  return true;
+}
+// One-shot: load script file and exec with args
+static bool coprocScriptExecFile(const char* fname, const int32_t* argv, uint32_t argc) {
+  if (!coprocScriptLoadFile(fname)) return false;
+  return coprocScriptExec(argv, argc);
 }
 
 // ========== Serial console / command handling ==========
@@ -1396,9 +1541,10 @@ static void printHelp() {
   Console.println("Co-Processor (serial RPC) commands:");
   Console.println("  coproc ping                  - HELLO (version/features)");
   Console.println("  coproc info                  - INFO (flags, blob_len, mailbox_max)");
-  Console.println("  coproc load <file>           - LOAD_* the file to co-processor");
-  Console.println("  coproc loadret42             - LOAD_* built-in 'ret42' blob");
-  Console.println("  coproc exec [a0..aN] [tm]    - EXEC with up to 64 ints; optional timeout_ms at end");
+  Console.println("  coproc exec <file> [a0..aN]  - Load <file> from active FS to co-proc and EXEC with args");
+  Console.println("                                 Timeout is taken from 'timeout' setting on the master");
+  Console.println("  coproc sexec <file> [a0..aN] - Load a script file to co-proc and execute once");
+  Console.println("                                 Uses master 'timeout' setting; script may use DELAY/DELAY_US, PINMODE, DWRITE, etc.");
   Console.println("  coproc status                - STATUS (exec_state)");
   Console.println("  coproc mbox [n]              - MAILBOX_RD (read up to n bytes; default 128)");
   Console.println("  coproc cancel                - CANCEL (sets cancel flag)");
@@ -1678,40 +1824,41 @@ static void handleCommand(char* line) {
   } else if (!strcmp(t0, "coproc")) {
     char* sub;
     if (!nextToken(p, sub)) {
-      Console.println("coproc cmds: ping|info|load <file>|loadret42|exec [a0..aN] [timeout_ms]|status|mbox [n]|cancel|reset");
+      Console.println("coproc cmds: ping|info|exec <file> [a0..aN]|status|mbox [n]|cancel|reset");
       return;
     }
     if (!strcmp(sub, "ping")) {
       if (!coprocHello()) Console.println("coproc ping failed");
     } else if (!strcmp(sub, "info")) {
       if (!coprocInfo()) Console.println("coproc info failed");
-    } else if (!strcmp(sub, "load")) {
-      char* fn;
-      if (!nextToken(p, fn)) {
-        Console.println("usage: coproc load <file>");
+    } else if (!strcmp(sub, "sexec")) {
+      // Syntax: coproc sexec <file> [a0..aN]
+      char* fname = nullptr;
+      if (!nextToken(p, fname)) {
+        Console.println("usage: coproc sexec <file> [a0..aN]");
         return;
       }
-      if (!coprocLoadFile(fn)) Console.println("coproc load failed");
-    } else if (!strcmp(sub, "loadret42")) {
-      // Use compiled-in blob FILE_RET42
-      const BlobReg* br = findBlob(FILE_RET42);
-      if (!br) {
-        Console.println("ret42 blob missing");
-      } else if (!coprocLoadBuffer(br->data, br->len)) Console.println("coproc loadret42 failed");
-    } else if (!strcmp(sub, "exec")) {
-      // parse args (ints) and optional timeout at end
       int32_t argvN[MAX_EXEC_ARGS];
       uint32_t argc = 0;
-      uint32_t timeoutMs = 1000;
       char* tok = nullptr;
       while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) {
         argvN[argc++] = (int32_t)strtol(tok, nullptr, 0);
       }
-      if (argc >= 1) {
-        timeoutMs = (uint32_t)argvN[argc - 1];
-        argc--;
+      if (!coprocScriptExecFile(fname, argvN, argc)) Console.println("coproc sexec failed");
+    } else if (!strcmp(sub, "exec")) {
+      // Syntax: coproc exec <file> [a0..aN]
+      char* fname = nullptr;
+      if (!nextToken(p, fname)) {
+        Console.println("usage: coproc exec <file> [a0..aN]");
+        return;
       }
-      if (!coprocExec(argvN, argc, timeoutMs)) Console.println("coproc exec failed");
+      int32_t argvN[MAX_EXEC_ARGS];
+      uint32_t argc = 0;
+      char* tok = nullptr;
+      while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) {
+        argvN[argc++] = (int32_t)strtol(tok, nullptr, 0);
+      }
+      if (!coprocExecFile(fname, argvN, argc)) Console.println("coproc exec failed");
     } else if (!strcmp(sub, "status")) {
       if (!coprocStatus()) Console.println("coproc status failed");
     } else if (!strcmp(sub, "mbox")) {
@@ -1724,7 +1871,7 @@ static void handleCommand(char* line) {
     } else if (!strcmp(sub, "reset")) {
       if (!coprocReset()) Console.println("coproc reset failed (transport)");
     } else {
-      Console.println("usage: coproc ping|info|load <file>|loadret42|exec [a0..aN] [timeout_ms]|status|mbox [n]|cancel|reset");
+      Console.println("usage: coproc ping|info|exec <file> [a0..aN]|status|mbox [n]|cancel|reset");
     }
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();

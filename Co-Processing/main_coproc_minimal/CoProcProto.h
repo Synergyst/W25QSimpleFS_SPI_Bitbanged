@@ -4,6 +4,7 @@
   Single-header RPC protocol for Main<->Co-Processor over framed serial link.
   - Frame: 24B header + payload + CRC32(payload) (CRC=0 if len==0).
   - Requests: HELLO, INFO, LOAD_BEGIN, LOAD_DATA, LOAD_END, EXEC, STATUS, MAILBOX_RD, CANCEL, RESET.
+  - Script Requests: SCRIPT_BEGIN, SCRIPT_DATA, SCRIPT_END, SCRIPT_EXEC (same framing as LOAD_EXEC).
   - Responses: cmd | 0x80, status-first payloads.
 */
 #include <stdint.h>
@@ -18,14 +19,24 @@ static constexpr uint16_t VERSION = 0x0001;
 enum : uint16_t {
   CMD_HELLO = 0x01,
   CMD_INFO = 0x02,
+
+  // Binary blob pipeline
   CMD_LOAD_BEGIN = 0x10,  // req: uint32 total_len
   CMD_LOAD_DATA = 0x11,   // req: raw bytes
   CMD_LOAD_END = 0x12,    // req: uint32 expected_crc32
   CMD_EXEC = 0x20,        // req: uint32 argc, int32 argv[argc], uint32 timeout_ms
+
+  // Status/mailbox/cancel/reset
   CMD_STATUS = 0x21,      // req: -
   CMD_MAILBOX_RD = 0x22,  // req: uint32 max_bytes
   CMD_CANCEL = 0x23,      // req: -
-  CMD_RESET = 0x24        // req: -
+  CMD_RESET = 0x24,       // req: -
+
+  // Script pipeline
+  CMD_SCRIPT_BEGIN = 0x30,  // req: uint32 total_len
+  CMD_SCRIPT_DATA = 0x31,   // req: raw bytes (UTF-8 text)
+  CMD_SCRIPT_END = 0x32,    // req: uint32 expected_crc32
+  CMD_SCRIPT_EXEC = 0x33    // req: uint32 argc, int32 argv[argc], uint32 timeout_ms
 };
 // Status
 enum : int32_t {
@@ -78,11 +89,11 @@ struct Info {
   uint32_t mailbox_max;  // bytes
 };
 #pragma pack(pop)
-// ========== Payload helpers (volatile-safe) ==========
+// ========== Payload helpers ==========
 template<typename T>
 inline bool writePOD(uint8_t* dst, size_t cap, size_t& off, const T& v) {
   using NV = typename std::remove_cv<typename std::remove_reference<T>::type>::type;
-  NV tmp = (NV)v;  // strip const/volatile
+  NV tmp = (NV)v;
   if (off + sizeof(NV) > cap) return false;
   memcpy(dst + off, &tmp, sizeof(NV));
   off += sizeof(NV);
