@@ -548,6 +548,63 @@ struct VM {
       R[r] = analogRead((uint8_t)pin);
       return true;
     }
+    // SHIFTOUT: SHIFTOUT <dataPin> <clockPin> <latchPin> <expr> [bits] [MSBFIRST|LSBFIRST]
+    if (!strcmp(tok, "SHIFTOUT")) {
+      int32_t dataPin, clockPin, latchPin;
+      if (!parseNumber(p, dataPin)) return true;
+      if (!parseNumber(p, clockPin)) return true;
+      if (!parseNumber(p, latchPin)) return true;
+
+      int32_t val;
+      if (!parseExpr(p, val)) return true;
+
+      // optional bit count
+      const char* save_p = p;
+      int bitCount = 8;
+      int32_t tmp;
+      if (parseNumber(p, tmp)) {
+        if (tmp > 0 && tmp <= 32) bitCount = tmp;
+        else bitCount = 8;
+      } else {
+        p = save_p;
+      }
+
+      // Optional bit order token
+      const char* id;
+      size_t idn;
+      bool msbFirst = true;
+      const char* save2 = p;
+      if (parseIdent(p, id, idn)) {
+        if (idn == 8 && stricmp_l(id, "LSBFIRST", 8) == 0) msbFirst = false;
+        else if (idn == 8 && stricmp_l(id, "MSBFIRST", 8) == 0) msbFirst = true;
+        else p = save2;  // unrecognized token; rewind
+      }
+
+      // Ensure pins are outputs (safe)
+      pinMode((uint8_t)dataPin, OUTPUT);
+      pinMode((uint8_t)clockPin, OUTPUT);
+      pinMode((uint8_t)latchPin, OUTPUT);
+
+      // Latch low, shift bits, latch high
+      digitalWrite((uint8_t)latchPin, LOW);
+
+      // Shift bitCount bits (cap to 32)
+      int bits = (bitCount > 32) ? 32 : bitCount;
+      for (int i = 0; i < bits; ++i) {
+        int bitIndex = msbFirst ? (bits - 1 - i) : i;
+        int b = (((uint32_t)val >> bitIndex) & 1) ? HIGH : LOW;
+        digitalWrite((uint8_t)dataPin, b);
+
+        // Clock pulse
+        digitalWrite((uint8_t)clockPin, HIGH);
+        delayMicroseconds(1);  // tweak if you need slower/faster
+        digitalWrite((uint8_t)clockPin, LOW);
+        delayMicroseconds(1);
+      }
+
+      digitalWrite((uint8_t)latchPin, HIGH);
+      return true;
+    }
 
     // Timing
     if (!strcmp(tok, "DELAY")) {

@@ -21,7 +21,6 @@
 #define COPROCLANG_MAX_LINES 512
 #define COPROCLANG_MAX_LABELS 128
 #include "CoProcLang.h"
-
 // ------- Debug toggle -------
 #ifndef COPROC_DEBUG
 #define COPROC_DEBUG 1
@@ -33,17 +32,14 @@
   do { \
   } while (0)
 #endif
-
 // ------- Pins (as requested) -------
 static const uint8_t PIN_RX = 0;  // GP0  (co-processor RX)
 static const uint8_t PIN_TX = 1;  // GP1  (co-processor TX)
-
 // ------- Software serial config -------
 #ifndef SOFT_BAUD
 #define SOFT_BAUD 230400
 #endif
 static SoftwareSerial link(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
-
 // ------- Mailbox / cancel (shared with blob + script) -------
 #ifndef BLOB_MAILBOX_MAX
 #define BLOB_MAILBOX_MAX 256
@@ -51,7 +47,6 @@ static SoftwareSerial link(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
 extern "C" __attribute__((aligned(4)))
 uint8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
 static volatile uint8_t g_cancel_flag = 0;
-
 // ------- Executor plumbing (core1) -------
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
@@ -66,7 +61,6 @@ struct ExecJob {
   volatile int32_t status;
 };
 static ExecJob g_job;
-
 // call_with_args_thumb same as before
 extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
@@ -85,7 +79,6 @@ extern "C" int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
-
 static void core1WorkerPoll() {
   if (!g_job.active) {
     tight_loop_contents();
@@ -104,27 +97,23 @@ static void core1WorkerPoll() {
   g_job.active = 0;
   DBG("[COPROC] EXEC done status=%d result=%d\n", (int)status, (int)result);
 }
-
 // ------- Blob buffer / state -------
 static uint8_t* g_blob = nullptr;
 static uint32_t g_blob_len = 0;
 static uint32_t g_blob_cap = 0;
 static uint32_t g_blob_crc = 0;
 static volatile uint32_t g_exec_state = CoProc::EXEC_IDLE;
-
 // ------- Script buffer / state -------
 static uint8_t* g_script = nullptr;
 static uint32_t g_script_len = 0;
 static uint32_t g_script_cap = 0;
 static uint32_t g_script_crc = 0;
-
 // ------- Transport / protocol buffers -------
 static CoProc::Frame g_reqHdr, g_respHdr;
 static uint8_t* g_reqBuf = nullptr;
 static uint8_t* g_respBuf = nullptr;
 static const uint32_t RESP_MAX = 8192;
 static const uint32_t REQ_MAX = 8192;
-
 // ------- Helpers -------
 static inline void mailboxSetCancel(uint8_t v) {
   g_cancel_flag = v;
@@ -149,7 +138,6 @@ static void freeScript() {
   g_script_crc = 0;
   DBG("[COPROC] script freed\n");
 }
-
 // Read a single byte with timeout (ms). Returns true if a byte was read.
 static bool readByte(uint8_t& b, uint32_t timeoutMs) {
   uint32_t start = millis();
@@ -167,7 +155,6 @@ static bool readByte(uint8_t& b, uint32_t timeoutMs) {
   }
   return false;
 }
-
 // Read exactly n bytes with timeout per byte. Returns true on success.
 static bool readExact(uint8_t* dst, size_t n, uint32_t timeoutPerByteMs) {
   for (size_t i = 0; i < n; ++i) {
@@ -175,7 +162,6 @@ static bool readExact(uint8_t* dst, size_t n, uint32_t timeoutPerByteMs) {
   }
   return true;
 }
-
 // Write all bytes with a global timeout. Returns true on success.
 static bool writeAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
   uint32_t start = millis();
@@ -192,7 +178,55 @@ static bool writeAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
   link.flush();  // ensure pushed out
   return true;
 }
-
+// Small helper: parse ASCII decimal or 0xHEX into int32
+static bool parseAsciiInt(const uint8_t* s, size_t n, int32_t& out) {
+  if (!s || n == 0) return false;
+  const char* p = (const char*)s;
+  size_t i = 0;
+  // skip leading whitespace
+  while (i < n && (p[i] == ' ' || p[i] == '\t' || p[i] == '\r' || p[i] == '\n')) ++i;
+  if (i >= n) return false;
+  bool neg = false;
+  if (p[i] == '+' || p[i] == '-') {
+    neg = (p[i] == '-');
+    ++i;
+  }
+  if (i >= n) return false;
+  // hex?
+  if (i + 1 < n && p[i] == '0' && (p[i + 1] == 'x' || p[i + 1] == 'X')) {
+    i += 2;
+    if (i >= n) return false;
+    uint32_t v = 0;
+    bool saw = false;
+    while (i < n) {
+      char c = p[i];
+      int d = -1;
+      if (c >= '0' && c <= '9') d = c - '0';
+      else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+      else break;
+      saw = true;
+      v = (v << 4) | (uint32_t)d;
+      ++i;
+    }
+    if (!saw) return false;
+    out = neg ? -(int32_t)v : (int32_t)v;
+    return true;
+  }
+  // decimal
+  int32_t v = 0;
+  bool saw = false;
+  while (i < n) {
+    char c = p[i];
+    if (c < '0' || c > '9') break;
+    saw = true;
+    v = v * 10 + (c - '0');
+    ++i;
+  }
+  if (!saw) return false;
+  out = neg ? -v : v;
+  return true;
+}
 // Handlers (build response payloads starting with status)
 static int32_t handleHELLO(uint8_t* out, size_t cap, size_t& off) {
   int32_t status = CoProc::ST_OK;
@@ -210,7 +244,6 @@ static int32_t handleHELLO(uint8_t* out, size_t cap, size_t& off) {
   CoProc::writePOD(out, cap, off, features);
   return status;
 }
-
 static int32_t handleINFO(uint8_t* out, size_t cap, size_t& off) {
   CoProc::Info info{};
   info.impl_flags = 0;
@@ -227,7 +260,6 @@ static int32_t handleINFO(uint8_t* out, size_t cap, size_t& off) {
   CoProc::writePOD(out, cap, off, info);
   return status;
 }
-
 static int32_t handleLOAD_BEGIN(const uint8_t* in, size_t len) {
   size_t off = 0;
   uint32_t total = 0;
@@ -245,7 +277,6 @@ static int32_t handleLOAD_BEGIN(const uint8_t* in, size_t len) {
 #endif
   return CoProc::ST_OK;
 }
-
 static int32_t handleLOAD_DATA(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   if (!g_blob || g_blob_len >= g_blob_cap) return CoProc::ST_STATE;
   uint32_t can = g_blob_cap - g_blob_len;
@@ -263,7 +294,6 @@ static int32_t handleLOAD_DATA(const uint8_t* in, size_t len, uint8_t* out, size
 #endif
   return status;
 }
-
 static int32_t handleLOAD_END(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   size_t p = 0;
   uint32_t expected = 0;
@@ -276,7 +306,6 @@ static int32_t handleLOAD_END(const uint8_t* in, size_t len, uint8_t* out, size_
 #endif
   return status;
 }
-
 static int32_t handleEXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   if (!g_blob || (g_blob_len & 1u)) return CoProc::ST_STATE;
   if (g_job.active) return CoProc::ST_STATE;
@@ -323,7 +352,6 @@ static int32_t handleEXEC(const uint8_t* in, size_t len, uint8_t* out, size_t ca
 #endif
   return g_job.status;
 }
-
 static int32_t handleSTATUS(uint8_t* out, size_t cap, size_t& off) {
   int32_t status = CoProc::ST_OK;
   uint32_t es = g_exec_state;
@@ -334,7 +362,6 @@ static int32_t handleSTATUS(uint8_t* out, size_t cap, size_t& off) {
 #endif
   return status;
 }
-
 static int32_t handleMAILBOX_RD(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   size_t p = 0;
   uint32_t maxb = 0;
@@ -351,7 +378,6 @@ static int32_t handleMAILBOX_RD(const uint8_t* in, size_t len, uint8_t* out, siz
 #endif
   return CoProc::ST_OK;
 }
-
 static int32_t handleCANCEL(uint8_t* out, size_t cap, size_t& off) {
   mailboxSetCancel(1);
   int32_t st = CoProc::ST_OK;
@@ -361,7 +387,6 @@ static int32_t handleCANCEL(uint8_t* out, size_t cap, size_t& off) {
 #endif
   return st;
 }
-
 static int32_t handleRESET() {
 #if COPROC_DEBUG
   DBG("[DBG] RESET\n");
@@ -370,7 +395,6 @@ static int32_t handleRESET() {
   rp2040.reboot();
   return CoProc::ST_OK;
 }
-
 // ------- Script handlers -------
 static int32_t handleSCR_LOAD_BEGIN(const uint8_t* in, size_t len) {
   size_t off = 0;
@@ -388,7 +412,6 @@ static int32_t handleSCR_LOAD_BEGIN(const uint8_t* in, size_t len) {
 #endif
   return CoProc::ST_OK;
 }
-
 static int32_t handleSCR_LOAD_DATA(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   if (!g_script || g_script_len >= g_script_cap) return CoProc::ST_STATE;
   uint32_t can = g_script_cap - g_script_len;
@@ -406,12 +429,16 @@ static int32_t handleSCR_LOAD_DATA(const uint8_t* in, size_t len, uint8_t* out, 
 #endif
   return status;
 }
-
 static int32_t handleSCR_LOAD_END(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   size_t p = 0;
   uint32_t expected = 0;
   if (!CoProc::readPOD(in, len, p, expected)) return CoProc::ST_PARAM;
   int32_t status = (expected == g_script_crc) ? CoProc::ST_OK : CoProc::ST_CRC;
+  // Ensure NUL-termination for script buffer (safety for in-place parser)
+  if (g_script) {
+    uint32_t nulpos = (g_script_len <= g_script_cap) ? g_script_len : g_script_cap;
+    g_script[nulpos] = 0;
+  }
   CoProc::writePOD(out, cap, off, status);
   CoProc::writePOD(out, cap, off, g_script_len);
 #if COPROC_DEBUG
@@ -419,54 +446,70 @@ static int32_t handleSCR_LOAD_END(const uint8_t* in, size_t len, uint8_t* out, s
 #endif
   return status;
 }
-
-/*static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
-  if (!g_script || g_script_len == 0) return CoProc::ST_STATE;
-  size_t p = 0;
-  uint32_t argc = 0, timeout_ms = 0;
-  if (!CoProc::readPOD(in, len, p, argc)) return CoProc::ST_PARAM;
-  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
-  int32_t argv[MAX_EXEC_ARGS] = { 0 };
-  for (uint32_t i = 0; i < argc; ++i) {
-    if (!CoProc::readPOD(in, len, p, argv[i])) return CoProc::ST_PARAM;
-  }
-  (void)CoProc::readPOD(in, len, p, timeout_ms);
-
-  // Prepare interpreter
-  CoProcLang::VM vm;
-  vm.env.mailbox = BLOB_MAILBOX;
-  vm.env.mailbox_max = BLOB_MAILBOX_MAX;
-  vm.env.cancel_flag = &g_cancel_flag;
-
-  g_exec_state = CoProc::EXEC_RUNNING;
-#if COPROC_DEBUG
-  DBG("[DBG] SCRIPT_EXEC start argc=%u timeout=%u\n", (unsigned)argc, (unsigned)timeout_ms);
-#endif
-  int32_t retVal = 0;
-  bool ok = vm.run(g_script, g_script_len, argv, argc, timeout_ms, retVal);
-  mailboxSetCancel(0);
-  g_exec_state = CoProc::EXEC_DONE;
-
-  int32_t st = ok ? (int32_t)CoProc::ST_OK : (int32_t)CoProc::ST_EXEC;
-  CoProc::writePOD(out, cap, off, st);
-  CoProc::writePOD(out, cap, off, (int32_t)retVal);
-#if COPROC_DEBUG
-  DBG("[DBG] SCRIPT_EXEC reply status=%d result=%d\n", (int)st, (int)retVal);
-#endif
-  return st;
-}*/
 static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   if (!g_script || g_script_len == 0) return CoProc::ST_STATE;
-
   size_t p = 0;
   uint32_t argc = 0, timeout_ms = 0;
   if (!CoProc::readPOD(in, len, p, argc)) return CoProc::ST_PARAM;
   if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+
   int32_t argv[MAX_EXEC_ARGS] = { 0 };
-  for (uint32_t i = 0; i < argc; ++i) {
-    if (!CoProc::readPOD(in, len, p, argv[i])) return CoProc::ST_PARAM;
+
+  // Heuristic/mode detection:
+  // - If the next uint32 is 0xFFFFFFFF, interpret as "alternate" mode:
+  //     uint32 marker = 0xFFFFFFFF;
+  //     for each arg: uint32 len; bytes[len] (ASCII string for numeric token)
+  //     uint32 timeout_ms;
+  // - Otherwise, fallback to classic mode: int32 argv[argc] followed by uint32 timeout_ms.
+  if (argc == 0) {
+    // No args: just read timeout and run
+    if (!CoProc::readPOD(in, len, p, timeout_ms)) return CoProc::ST_PARAM;
+  } else {
+    // peek next 4 bytes if available
+    if (p + sizeof(uint32_t) <= len) {
+      uint32_t marker = 0;
+      // safe copy
+      memcpy(&marker, in + p, sizeof(marker));
+      if (marker == 0xFFFFFFFFu) {
+        // Alternate encoding
+        p += sizeof(uint32_t);  // consume marker
+#if COPROC_DEBUG
+        DBG("[DBG] SCRIPT_EXEC: alternate ASCII-args mode detected argc=%u\n", (unsigned)argc);
+#endif
+        for (uint32_t i = 0; i < argc; ++i) {
+          uint32_t slen = 0;
+          if (!CoProc::readPOD(in, len, p, slen)) return CoProc::ST_PARAM;
+          if (slen == 0 || p + slen > len) return CoProc::ST_PARAM;
+          // safety limit: prevent huge allocations; use stack buffer up to 1024 bytes
+          if (slen > 1024) return CoProc::ST_PARAM;
+          uint8_t tmp[1025];
+          memcpy(tmp, in + p, slen);
+          p += slen;
+          int32_t parsed = 0;
+          if (!parseAsciiInt(tmp, slen, parsed)) return CoProc::ST_PARAM;
+          argv[i] = parsed;
+#if COPROC_DEBUG
+          DBG("[DBG] SCRIPT_EXEC arg[%u] ascii='%.*s' -> %d (0x%08X)\n", (unsigned)i, (int)slen, (const char*)tmp, (int)parsed, (unsigned)parsed);
+#endif
+        }
+        if (!CoProc::readPOD(in, len, p, timeout_ms)) return CoProc::ST_PARAM;
+      } else {
+        // Classic encoding: int32 per arg
+#if COPROC_DEBUG
+        DBG("[DBG] SCRIPT_EXEC: classic int32-args mode argc=%u\n", (unsigned)argc);
+#endif
+        for (uint32_t i = 0; i < argc; ++i) {
+          int32_t v = 0;
+          if (!CoProc::readPOD(in, len, p, v)) return CoProc::ST_PARAM;
+          argv[i] = v;
+        }
+        if (!CoProc::readPOD(in, len, p, timeout_ms)) return CoProc::ST_PARAM;
+      }
+    } else {
+      // Not enough bytes to peek marker -> error
+      return CoProc::ST_PARAM;
+    }
   }
-  (void)CoProc::readPOD(in, len, p, timeout_ms);
 
   // Lazily allocate VM once; avoid stack usage and global constructors
   static CoProcLang::VM* s_vm = nullptr;
@@ -478,23 +521,19 @@ static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_
       return CoProc::ST_NOMEM;
     }
   }
-
   s_vm->env.mailbox = BLOB_MAILBOX;
   s_vm->env.mailbox_max = BLOB_MAILBOX_MAX;
   s_vm->env.cancel_flag = &g_cancel_flag;
-
   g_exec_state = CoProc::EXEC_RUNNING;
   int32_t retVal = 0;
   bool ok = s_vm->run(g_script, g_script_len, argv, argc, timeout_ms, retVal);
   mailboxSetCancel(0);
   g_exec_state = CoProc::EXEC_DONE;
-
   int32_t st = ok ? (int32_t)CoProc::ST_OK : (int32_t)CoProc::ST_EXEC;
   CoProc::writePOD(out, cap, off, st);
   CoProc::writePOD(out, cap, off, (int32_t)retVal);
   return st;
 }
-
 // Command names (debug)
 static const char* cmdName(uint16_t c) {
   switch (c) {
@@ -515,7 +554,6 @@ static const char* cmdName(uint16_t c) {
   }
   return "UNKNOWN";
 }
-
 // Build response from request
 static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
                            CoProc::Frame& respH, uint8_t* respBuf, uint32_t& respLen) {
@@ -536,13 +574,11 @@ static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
     case CoProc::CMD_LOAD_DATA: st = handleLOAD_DATA(payload, hdr.len, respBuf, RESP_MAX, off); break;
     case CoProc::CMD_LOAD_END: st = handleLOAD_END(payload, hdr.len, respBuf, RESP_MAX, off); break;
     case CoProc::CMD_EXEC: st = handleEXEC(payload, hdr.len, respBuf, RESP_MAX, off); break;
-
     // Housekeeping
     case CoProc::CMD_STATUS: st = handleSTATUS(respBuf, RESP_MAX, off); break;
     case CoProc::CMD_MAILBOX_RD: st = handleMAILBOX_RD(payload, hdr.len, respBuf, RESP_MAX, off); break;
     case CoProc::CMD_CANCEL: st = handleCANCEL(respBuf, RESP_MAX, off); break;
     case CoProc::CMD_RESET: st = handleRESET(); break;
-
     // Script pipeline
     case CoProc::CMD_SCRIPT_BEGIN:
       st = handleSCR_LOAD_BEGIN(payload, hdr.len);
@@ -557,7 +593,6 @@ static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
     case CoProc::CMD_SCRIPT_EXEC:
       st = handleSCR_EXEC(payload, hdr.len, respBuf, RESP_MAX, off);
       break;
-
     default:
       st = CoProc::ST_BAD_CMD;
       CoProc::writePOD(respBuf, RESP_MAX, off, st);
@@ -570,7 +605,6 @@ static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
   DBG("[DBG] RESP len=%u crc=0x%08X\n", (unsigned)respLen, (unsigned)crc);
 #endif
 }
-
 // ------- Serial protocol helpers -------
 static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
   // Sliding-window scan for MAGIC (little-endian bytes: 'C','P','R','0')
@@ -666,7 +700,6 @@ static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
     }
   }
 }
-
 // ------- Core0: serial protocol loop -------
 static void protocolLoop() {
   for (;;) {
@@ -691,35 +724,28 @@ static void protocolLoop() {
     }
   }
 }
-
 // ========== Setup and main ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(10); }
   delay(10);
   Serial.println("CoProc (soft-serial) booting...");
-
   // Allocate protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);
   g_respBuf = (uint8_t*)malloc(RESP_MAX);
-
   // Initialize software serial link
   link.begin(SOFT_BAUD);
   link.listen();  // ensure active receiver
-
   // initialize executor
   memset(&g_job, 0, sizeof(g_job));
   memset(BLOB_MAILBOX, 0, BLOB_MAILBOX_MAX);
   g_cancel_flag = 0;
   g_exec_state = CoProc::EXEC_IDLE;
-
   Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n", (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
 }
-
 void loop() {
   protocolLoop();  // never returns
 }
-
 // setup1/loop1 for core1 (Philhower)
 void setup1() { /* nothing */
 }

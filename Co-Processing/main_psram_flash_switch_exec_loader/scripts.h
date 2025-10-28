@@ -13,10 +13,8 @@ MBAPP "Blink done"
 RET 7
 )");
 
-DECLARE_ASCII_SCRIPT(blob_onscript, R"(# Toggle GP2 on, return 7
-PINMODE 2 OUT
-DWRITE 2 1
-MBCLR
-MBAPP "Toggled GP2 on"
-RET 7
+DECLARE_ASCII_SCRIPT(blob_onscript, R"(# SER=data pin 18, SRCLK=clock pin 17, RCLK=latch pin 16
+PINMODE 16 OUT; PINMODE 17 OUT; PINMODE 18 OUT
+SHIFTOUT 18 17 16 R0 8 MSBFIRST
+RET R42
 )");
