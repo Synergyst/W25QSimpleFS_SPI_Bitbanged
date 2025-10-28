@@ -18,6 +18,8 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
+#define COPROCLANG_MAX_LINES 512
+#define COPROCLANG_MAX_LABELS 128
 #include "CoProcLang.h"
 
 // ------- Debug toggle -------
@@ -418,7 +420,7 @@ static int32_t handleSCR_LOAD_END(const uint8_t* in, size_t len, uint8_t* out, s
   return status;
 }
 
-static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
+/*static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   if (!g_script || g_script_len == 0) return CoProc::ST_STATE;
   size_t p = 0;
   uint32_t argc = 0, timeout_ms = 0;
@@ -451,6 +453,45 @@ static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_
 #if COPROC_DEBUG
   DBG("[DBG] SCRIPT_EXEC reply status=%d result=%d\n", (int)st, (int)retVal);
 #endif
+  return st;
+}*/
+static int32_t handleSCR_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
+  if (!g_script || g_script_len == 0) return CoProc::ST_STATE;
+
+  size_t p = 0;
+  uint32_t argc = 0, timeout_ms = 0;
+  if (!CoProc::readPOD(in, len, p, argc)) return CoProc::ST_PARAM;
+  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+  int32_t argv[MAX_EXEC_ARGS] = { 0 };
+  for (uint32_t i = 0; i < argc; ++i) {
+    if (!CoProc::readPOD(in, len, p, argv[i])) return CoProc::ST_PARAM;
+  }
+  (void)CoProc::readPOD(in, len, p, timeout_ms);
+
+  // Lazily allocate VM once; avoid stack usage and global constructors
+  static CoProcLang::VM* s_vm = nullptr;
+  if (!s_vm) {
+    s_vm = new CoProcLang::VM();
+    if (!s_vm) {
+      CoProc::writePOD(out, cap, off, (int32_t)CoProc::ST_NOMEM);
+      CoProc::writePOD(out, cap, off, (int32_t)0);
+      return CoProc::ST_NOMEM;
+    }
+  }
+
+  s_vm->env.mailbox = BLOB_MAILBOX;
+  s_vm->env.mailbox_max = BLOB_MAILBOX_MAX;
+  s_vm->env.cancel_flag = &g_cancel_flag;
+
+  g_exec_state = CoProc::EXEC_RUNNING;
+  int32_t retVal = 0;
+  bool ok = s_vm->run(g_script, g_script_len, argv, argc, timeout_ms, retVal);
+  mailboxSetCancel(0);
+  g_exec_state = CoProc::EXEC_DONE;
+
+  int32_t st = ok ? (int32_t)CoProc::ST_OK : (int32_t)CoProc::ST_EXEC;
+  CoProc::writePOD(out, cap, off, st);
+  CoProc::writePOD(out, cap, off, (int32_t)retVal);
   return st;
 }
 
@@ -654,7 +695,7 @@ static void protocolLoop() {
 // ========== Setup and main ==========
 void setup() {
   Serial.begin(115200);
-  // while (!Serial) { delay(10); }
+  while (!Serial) { delay(10); }
   delay(10);
   Serial.println("CoProc (soft-serial) booting...");
 

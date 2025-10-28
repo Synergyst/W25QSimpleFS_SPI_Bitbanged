@@ -45,6 +45,8 @@
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"  // shared single-header protocol
+#define COPROCLANG_MAX_LINES 512
+#define COPROCLANG_MAX_LABELS 128
 #include "CoProcLang.h"
 #ifndef COPROC_BAUD
 #define COPROC_BAUD 230400
