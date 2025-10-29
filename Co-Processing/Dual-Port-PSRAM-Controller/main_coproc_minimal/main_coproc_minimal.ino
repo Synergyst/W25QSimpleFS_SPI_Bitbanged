@@ -431,7 +431,7 @@ static int32_t handleRESET() {
   DBG("[DBG] RESET\n");
 #endif
   delay(10);
-  rp2040.reboot();
+  watchdog_reboot(0, 0, 1500);
   return CoProc::ST_OK;
 }
 
@@ -859,10 +859,9 @@ void onTrig() {
 
 // ========== Setup and main ==========
 void setup() {
-  delay(500);
   Serial.begin();
-  while (!Serial) { delay(500); }
-  delay(500);
+  delay(5000);
+  if (!Serial) delay(1000);
 
   // Configure decoder selection for 4 banks via 74HC138
   /*psram.configureDecoder138(BANKS, PIN_DEC_EN, PIN_DEC_A0, PIN_DEC_A1);

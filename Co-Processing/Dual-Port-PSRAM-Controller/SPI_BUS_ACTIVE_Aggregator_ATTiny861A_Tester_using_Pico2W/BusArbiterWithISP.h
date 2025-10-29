@@ -62,7 +62,12 @@
 #endif
 
 // ================= Additional macros for 74HC32 (BUS_ACTIVE Aggregator) test rig =================
+// By default, we assume you currently drive the Aggregator's PA0 from Pico GP22 (same pad used as ARB_PIN_BUS_ACTIVE).
+// We ALSO assume you can wire the Aggregator's output PB3 to a free Pico input so we can observe it.
+// You can override any of these before including this header to match your wiring.
+//
 // Aggregator CS_n inputs (to ATtiny861A Port A: PA0..PA7) driven from Pico outputs.
+// Defaults chosen to avoid the pins already used by the Arbiter test rig, except PA0 which follows your note (GP22).
 #ifndef AGG_PIN_CS0_OUT
 #define AGG_PIN_CS0_OUT 16  // GP22 as per your note: "drive PA0 from Pico GP22"
 #endif
@@ -90,26 +95,6 @@
 // Aggregator BUS_ACTIVE output (ATtiny861A PB3) observed on a Pico input pin:
 #ifndef AGG_PIN_BUS_IN
 #define AGG_PIN_BUS_IN 8  // default to an available Pico pin (e.g., GP8). Override to match your wiring.
-#endif
-
-// Tuning knobs for Aggregator test timing and drive style
-#ifndef AGG_OPEN_DRAIN
-#define AGG_OPEN_DRAIN 1  // 1 = release CS lines to Hi-Z (recommended with external pull-ups)
-#endif
-#ifndef AGG_IDLE_SETTLE_MS
-#define AGG_IDLE_SETTLE_MS 50  // settle after all CS released
-#endif
-#ifndef AGG_ASSERT_SETTLE_MS
-#define AGG_ASSERT_SETTLE_MS 50  // settle after asserting any CS
-#endif
-#ifndef AGG_RELEASE_SETTLE_MS
-#define AGG_RELEASE_SETTLE_MS 50  // settle after releasing a CS
-#endif
-#ifndef AGG_EDGE_TIMEOUT_MS
-#define AGG_EDGE_TIMEOUT_MS 200  // max time to wait for BUS edge
-#endif
-#ifndef AGG_STRESS_DWELL_US
-#define AGG_STRESS_DWELL_US 1000  // dwell per fuzz iteration
 #endif
 
 namespace ArbiterISP {
@@ -154,7 +139,6 @@ inline void note(const __FlashStringHelper* name) {
     Serial.println(name);
   }
 }
-
 inline void reqA(bool on) {
   digitalWrite(ARB_PIN_REQ_A_OUT, on ? LOW : HIGH);
 }
@@ -467,6 +451,7 @@ inline bool forceOwner(char o) {
 }
 
 // Predict next owner according to firmware rules.
+// owner: 'N','A','B'; prev: 'A' or 'B'; rA/rB/bus: booleans (true = asserted/active).
 inline char predictNext(char owner, char prev, bool rA, bool rB, bool bus) {
   if (owner == 'N') {
     if (rA && !rB) return 'A';
@@ -550,7 +535,9 @@ inline bool runExhaustiveTransitions() {
     for (int oi = 0; oi < 3; ++oi) {
       char ow = owners[oi];
       for (int mask = 0; mask < 8; ++mask) {
+        // Quietly re-establish baseline for this single-step case
         if (!setupPrevQuiet(pv) || !setupOwnerQuiet(ow)) {
+          // Cleanup and skip this case if setup raced; do not mark a FAIL
           reqA(false);
           reqB(false);
           busSet(false);
@@ -560,13 +547,16 @@ inline bool runExhaustiveTransitions() {
                          300);
           continue;
         }
+        // Drive inputs for this step
         bool rA = (mask & 1) != 0;
         bool rB = (mask & 2) != 0;
         bool bus = (mask & 4) != 0;
         reqA(rA);
         reqB(rB);
         busSet(bus);
+        // Predict next owner
         char expectNext = predictNext(ow, pv, rA, rB, bus);
+        // Wait for expected state
         bool got = false;
         if (expectNext == 'N') got = waitCond([]() {
                                  return wantNone();
@@ -587,6 +577,7 @@ inline bool runExhaustiveTransitions() {
         } else {
           expect(true, F("Exhaustive transition OK"));
         }
+        // Clean up for next combo
         reqA(false);
         reqB(false);
         busSet(false);
@@ -628,7 +619,6 @@ public:
 private:
   unsigned long pulseWidth = 1;
 };
-
 static ISP_BitBangSPI ISP_SPI;
 static unsigned int here = 0;
 static uint8_t buff[256];
@@ -857,37 +847,22 @@ inline bool ISP_probeSignature(uint8_t& b0, uint8_t& b1, uint8_t& b2) {
 }
 
 // ========================== Helpers for 74HC32 (Aggregator) testing ==========================
-
 static const uint8_t AGG_CS_PINS[8] = {
   AGG_PIN_CS0_OUT, AGG_PIN_CS1_OUT, AGG_PIN_CS2_OUT, AGG_PIN_CS3_OUT,
   AGG_PIN_CS4_OUT, AGG_PIN_CS5_OUT, AGG_PIN_CS6_OUT, AGG_PIN_CS7_OUT
 };
 
-// Open-drain aware helpers
-inline void agg_releasePin(uint8_t pin) {
-#if AGG_OPEN_DRAIN
-  pinMode(pin, INPUT);  // Hi-Z, no internal pull-up
-#else
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, HIGH);  // push-pull release (not recommended with external pull-ups)
-#endif
-}
-inline void agg_assertPin(uint8_t pin) {
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, LOW);  // active-low assert
-}
-
 // Write one CS_n line (true = assert/active: logic LOW on the wire)
 inline void agg_setCSn(uint8_t idx, bool assertActive) {
   if (idx > 7) return;
-  if (assertActive) agg_assertPin(AGG_CS_PINS[idx]);
-  else agg_releasePin(AGG_CS_PINS[idx]);
+  digitalWrite(AGG_CS_PINS[idx], assertActive ? LOW : HIGH);
 }
 
 // Drive all CS_n according to an 8-bit mask (bit=1 means active/LOW)
 inline void agg_driveMask(uint8_t mask) {
   for (uint8_t i = 0; i < 8; ++i) {
-    ((mask >> i) & 0x1) ? agg_assertPin(AGG_CS_PINS[i]) : agg_releasePin(AGG_CS_PINS[i]);
+    bool active = (mask >> i) & 0x1;
+    agg_setCSn(i, active);
   }
 }
 
@@ -896,10 +871,11 @@ inline bool agg_readBUS() {
   return digitalRead(AGG_PIN_BUS_IN) != 0;
 }
 
-// Initialize Aggregator pins: CS_n released (Hi-Z or HIGH), BUS input as input
+// Initialize Aggregator pins: CS_n outputs HIGH (inactive), BUS input as input
 inline void agg_initPins() {
   for (uint8_t i = 0; i < 8; ++i) {
-    agg_releasePin(AGG_CS_PINS[i]);
+    pinMode(AGG_CS_PINS[i], OUTPUT);
+    digitalWrite(AGG_CS_PINS[i], HIGH);  // inactive (CS_n deasserted)
   }
   pinMode(AGG_PIN_BUS_IN, INPUT);
 }
@@ -917,28 +893,26 @@ inline bool agg_waitBUS(bool wantHigh, uint32_t ms) {
   uint32_t t0 = millis();
   while (millis() - t0 < ms) {
     if (agg_readBUS() == wantHigh) return true;
-    delay(1);
+    delayMicroseconds(50);
   }
-  return (agg_readBUS() == wantHigh);
+  return false;
 }
 
 // Measure propagation from a CS transition to BUS level change.
 // Returns true and writes delta_us on success, false on timeout.
 inline bool agg_measureProp(uint8_t csIdx, bool toActive, uint32_t timeout_us, uint32_t& delta_us) {
-  // Prepare known baseline with generous settles
+  // Prepare known baseline: if measuring rising BUS (toActive=true), ensure all inactive first.
+  // If measuring falling BUS (toActive=false), ensure only csIdx is active first.
   if (toActive) {
     agg_driveMask(0x00);  // all inactive → BUS should be LOW
-    delay(AGG_IDLE_SETTLE_MS);
-    (void)agg_waitBUS(false, AGG_IDLE_SETTLE_MS);
+    (void)agg_waitBUS(false, 5);
   } else {
     agg_driveMask(0x00);
-    delay(AGG_IDLE_SETTLE_MS);
     agg_setCSn(csIdx, true);  // only this asserted → BUS HIGH
-    delay(AGG_ASSERT_SETTLE_MS);
-    (void)agg_waitBUS(true, AGG_ASSERT_SETTLE_MS);
+    (void)agg_waitBUS(true, 5);
   }
 
-  // Now perform transition and time it
+  // Now perform transition
   unsigned long tStart = micros();
   if (toActive) {
     agg_setCSn(csIdx, true);  // assert -> BUS should go HIGH
@@ -1203,7 +1177,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   bool okMx = detail::checkInvariantsWindow(20);
   detail::expect(okMx, F("OWNER_A/B mutual exclusion and signals coherent"));
 
-  // Test 10: IRQ pulse widths (A and B)
+  // Test 10: IRQ pulse widths (A and B). Expected ~2ms in firmware; use tolerant bounds.
   detail::vprintln(F("[POST] Test 10: IRQ pulse widths"));
   (void)detail::settleToNone(300);
   // A
@@ -1241,6 +1215,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   (void)detail::settleToNone(300);
   long fuzzFails = 0;
   for (int i = 0; i < 100; i++) {
+    // Random-ish pattern without requiring a seeded RNG
     uint32_t r = micros();
     bool a = (r & 1);
     bool b = (r & 2);
@@ -1248,9 +1223,11 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     detail::reqA(a);
     detail::reqB(b);
     detail::busSet(bus);
+    // small jitter
     delayMicroseconds(200 + (r & 0x3FF));
     if (!detail::checkInvariantsOnce()) fuzzFails++;
   }
+  // Clean up
   detail::reqA(false);
   detail::reqB(false);
   detail::busSet(false);
@@ -1264,6 +1241,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   // Test 12: Negative IRQ checks on single-side grants
   detail::vprintln(F("[POST] Test 12: Negative IRQ checks on grant"));
   (void)detail::settleToNone(300);
+  // Grant A -> ensure IRQ_B did NOT pulse in the window
   detail::reqA(true);
   (void)detail::waitCond([]() {
     return detail::wantOwner('A');
@@ -1276,6 +1254,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+  // Grant B -> ensure IRQ_A did NOT pulse in the window
   detail::reqB(true);
   (void)detail::waitCond([]() {
     return detail::wantOwner('B');
@@ -1292,9 +1271,12 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   // Test 13: Tie while BUS active (and winner matches PREV tie-bias)
   detail::vprintln(F("[POST] Test 13: Tie while BUS active"));
   (void)detail::settleToNone(300);
+  // Ensure a known PREV state by forcing a release cycle
+  // If PREV=B, A should win the tie; If PREV=A, B should win.
   bool pvB = detail::prevB();
   bool pvA = detail::prevA();
   if (!(pvA ^ pvB)) {
+    // Establish PREV with a quick A cycle
     detail::reqA(true);
     (void)detail::waitCond([]() {
       return detail::wantOwner('A');
@@ -1319,6 +1301,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   detail::expect(tieGrant, F("Tie grants even with BUS active"));
   char expectedWin = pvA ? 'B' : 'A';
   detail::expect(win == expectedWin, F("Tie winner matches PREV bias under BUS active"));
+  // Cleanup
   detail::reqA(false);
   detail::reqB(false);
   detail::busSet(false);
@@ -1330,25 +1313,31 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   // Test 14: Handoff under BUS active (no grant until BUS idle)
   detail::vprintln(F("[POST] Test 14: Handoff under BUS active"));
   (void)detail::settleToNone(300);
+  // A owns
   detail::reqA(true);
   bool gA = detail::waitCond([]() {
     return detail::wantOwner('A');
   },
                              300);
   detail::expect(gA, F("Grant A (setup)"));
+  // B is waiting, BUS is active
   detail::reqB(true);
   detail::busSet(true);
+  // A releases while BUS active -> must still be A (held by BUS gate)
   detail::reqA(false);
   delay(10);
   bool stillA = (detail::ownerChar() == 'A') && detail::oeEnabled();
   detail::expect(stillA, F("BUS active prevents A->NONE on release"));
+  // Now BUS goes idle -> release to NONE then grant B
   detail::busSet(false);
   bool sawNone2 = false, sawB2 = false, irqa2 = false, irqb2 = false;
   detail::observeHandoffTo('B', 60, sawNone2, sawB2, irqa2, irqb2);
   bool toNone = sawNone2;
   bool toB = sawB2;
   detail::expect(toNone && toB, F("Release then grant B after BUS idle"));
+  // Observe IRQ behavior: B should see at least one pulse (release+grant may cause two)
   detail::expect(irqb2, F("IRQ_B observed on handoff"));
+  // Cleanup
   detail::reqB(false);
   (void)detail::waitCond([]() {
     return detail::wantNone();
@@ -1360,7 +1349,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   bool exOk = detail::runExhaustiveTransitions();
   detail::expect(exOk, F("All transitions matched spec"));
 
-  // Test 16 (optional): Forced-timeout detection
+  // Test 16 (optional): Forced-timeout detection (if firmware enables FORCE_TIMEOUT_MS)
   detail::vprintln(F("[POST] Test 16: Forced-timeout (optional, non-failing if absent)"));
   (void)detail::settleToNone(300);
   detail::reqA(true);
@@ -1370,12 +1359,14 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
                                 300);
   if (ft_gA) {
     detail::busSet(true);
+    // Wait up to ~1.5s for a forced drop to NONE (only if feature enabled)
     bool forcedNone = detail::waitCond([]() {
       return detail::wantNone();
     },
                                        1500);
     if (forcedNone) {
       detail::expect(true, F("Forced-timeout: owner disconnected under BUS active"));
+      // Expect both IRQ pulses around forced release (tolerate sampling)
       uint8_t irqa = detail::countRising(ARB_PIN_IRQ_A_IN, 50);
       uint8_t irqb = detail::countRising(ARB_PIN_IRQ_B_IN, 50);
       detail::expect(irqa >= 1 && irqb >= 1, F("IRQ_A & IRQ_B observed on forced release"));
@@ -1385,6 +1376,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   } else {
     detail::note(F("Forced-timeout precondition failed; skipping"));
   }
+  // Cleanup
   detail::reqA(false);
   detail::busSet(false);
   (void)detail::waitCond([]() {
@@ -1404,6 +1396,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   // Recovery probe (only if requested AND failed)
   if (!ok && allowBootselReset) {
     if (verbose) Serial.println(F("[POST] Recovery: reset + ISP signature probe"));
+    // pulse reset
     pinMode(ARB_PIN_TINY_RST, OUTPUT);
     digitalWrite(ARB_PIN_TINY_RST, LOW);
     delay(10);
@@ -1433,6 +1426,7 @@ inline bool runPOST(bool allowBootselReset = false, bool verbose = false) {
   initTestPins();
   if (verbose) Serial.println(F("[POST] Running arbiter validation..."));
   bool ok = runTestSuiteOnce(allowBootselReset, verbose);
+  // leave pins as-is; caller may clean up or enter ISP
   return ok;
 }
 
@@ -1494,8 +1488,11 @@ inline void tinyResetPulse() {
 // explicitly to exercise the Aggregator.
 
 inline void initAggregatorPins() {
+  // If your CS0 shares the ARB_PIN_BUS_ACTIVE pin (default), make sure it's not driven as an output elsewhere.
+  // We'll configure aggregator pins explicitly here.
   detail::agg_initPins();
 }
+
 inline void cleanupAggregatorPins() {
   detail::agg_cleanupPins();
 }
@@ -1506,28 +1503,27 @@ inline bool runHC32EmulatorTestSuiteOnce(bool verbose = false) {
   detail::gVerbose = verbose ? 1 : 0;
   detail::passCnt = detail::failCnt = 0;
 
-  if (verbose) Serial.println(F("[HC32] Init Aggregator pins"));
+  if (verbose) {
+    Serial.println(F("[HC32] Init Aggregator pins"));
+  }
   initAggregatorPins();
 
   // Baseline: all CS_n inactive => BUS must be LOW
   detail::vprintln(F("[HC32] Test 0: Baseline"));
   detail::agg_driveMask(0x00);
-  delay(AGG_IDLE_SETTLE_MS);
-  bool baseLow = detail::agg_waitBUS(false, AGG_IDLE_SETTLE_MS);
+  bool baseLow = !detail::agg_readBUS() || detail::agg_waitBUS(false, 10);
   detail::expect(baseLow, F("BUS=LOW when all CS_n inactive"));
 
   // Test each input individually (active low)
   detail::vprintln(F("[HC32] Test 1: Single-input activation (PA0..PA7)"));
   for (uint8_t i = 0; i < 8; ++i) {
-    detail::agg_driveMask(0x00);
-    delay(AGG_IDLE_SETTLE_MS);
-    detail::agg_setCSn(i, true);
-    delay(AGG_ASSERT_SETTLE_MS);
-    bool busHigh = detail::agg_waitBUS(true, AGG_ASSERT_SETTLE_MS);
+    // Activate only this line
+    detail::agg_driveMask((uint8_t)(1u << i));
+    bool busHigh = detail::agg_waitBUS(true, 10);
     detail::expect(busHigh, F("BUS=HIGH when any CS_n asserted"));
-    detail::agg_setCSn(i, false);
-    delay(AGG_RELEASE_SETTLE_MS);
-    bool busLow = detail::agg_waitBUS(false, AGG_RELEASE_SETTLE_MS);
+    // Release back to all inactive
+    detail::agg_driveMask(0x00);
+    bool busLow = detail::agg_waitBUS(false, 10);
     detail::expect(busLow, F("BUS=LOW when all CS_n released"));
   }
 
@@ -1537,12 +1533,10 @@ inline bool runHC32EmulatorTestSuiteOnce(bool verbose = false) {
     for (uint8_t j = (uint8_t)(i + 1); j < 8; ++j) {
       uint8_t mask = (uint8_t)((1u << i) | (1u << j));
       detail::agg_driveMask(mask);
-      delay(AGG_ASSERT_SETTLE_MS);
-      bool busHigh = detail::agg_waitBUS(true, AGG_ASSERT_SETTLE_MS);
+      bool busHigh = detail::agg_waitBUS(true, 10);
       detail::expect(busHigh, F("BUS=HIGH for any pair asserted"));
       detail::agg_driveMask(0x00);
-      delay(AGG_RELEASE_SETTLE_MS);
-      bool busLow = detail::agg_waitBUS(false, AGG_RELEASE_SETTLE_MS);
+      bool busLow = detail::agg_waitBUS(false, 10);
       detail::expect(busLow, F("BUS=LOW after releasing pair"));
     }
   }
@@ -1551,11 +1545,12 @@ inline bool runHC32EmulatorTestSuiteOnce(bool verbose = false) {
   detail::vprintln(F("[HC32] Test 3: Randomized truth-table verification"));
   uint32_t mismatches = 0;
   for (int k = 0; k < 64; ++k) {
+    // Pseudo-random mask without RNG: use time scrambling
     uint32_t r = micros();
+    // Mix bits to get some entropy across 8 bits
     uint8_t mask = (uint8_t)((r ^ (r >> 7) ^ (r >> 13) ^ (r >> 17)) & 0xFF);
     detail::agg_driveMask(mask);
-    if (mask) delay(AGG_ASSERT_SETTLE_MS);
-    else delay(AGG_RELEASE_SETTLE_MS);
+    delayMicroseconds(5);
     bool expectHigh = (mask != 0);
     bool bus = detail::agg_readBUS();
     if (bus != expectHigh) {
@@ -1569,48 +1564,76 @@ inline bool runHC32EmulatorTestSuiteOnce(bool verbose = false) {
     }
   }
   detail::expect(mismatches == 0, F("BUS == OR(~CS_n[]) across randomized vectors"));
+  // Return to idle
   detail::agg_driveMask(0x00);
-  delay(AGG_IDLE_SETTLE_MS);
+  (void)detail::agg_waitBUS(false, 10);
 
   // Propagation timing (best-effort)
   detail::vprintln(F("[HC32] Test 4: Propagation timing (best-effort, tolerant bounds)"));
   uint32_t tRise = 0, tFall = 0;
-  bool gotRise = detail::agg_measureProp(0 /*PA0*/, true /*toActive*/, (uint32_t)AGG_EDGE_TIMEOUT_MS * 1000UL, tRise);
-  bool gotFall = detail::agg_measureProp(0 /*PA0*/, false /*toInactive*/, (uint32_t)AGG_EDGE_TIMEOUT_MS * 1000UL, tFall);
-  bool tRiseOk = gotRise;
-  bool tFallOk = gotFall;
+  bool gotRise = detail::agg_measureProp(0 /*PA0*/, true /*toActive*/, 2000 /*us*/, tRise);
+  bool gotFall = detail::agg_measureProp(0 /*PA0*/, false /*toInactive*/, 2000 /*us*/, tFall);
+  // The emulator loop is very fast; allow generous bounds to avoid false negatives due to wiring/firmware variations.
+  bool tRiseOk = gotRise && (tRise <= 2000);
+  bool tFallOk = gotFall && (tFall <= 2000);
   detail::expect(gotRise, F("Observed BUS rise after CS_n assert"));
   detail::expect(gotFall, F("Observed BUS fall after CS_n release"));
-  detail::expect(tRiseOk, F("Rise propagation within timeout"));
-  detail::expect(tFallOk, F("Fall propagation within timeout"));
+  detail::expect(tRiseOk, F("Rise propagation within 2 ms"));
+  detail::expect(tFallOk, F("Fall propagation within 2 ms"));
 
-  // Glitch behavior (informational only)
-  detail::vprintln(F("[HC32] Test 5: Glitch behavior (informational)"));
+  // Glitch behavior (informational): very short pulses may or may not be passed depending on optional filter
+  detail::vprintln(F("[HC32] Test 5: Glitch behavior (non-fatal)"));
+  // Ensure idle
   detail::agg_driveMask(0x00);
-  delay(AGG_IDLE_SETTLE_MS);
+  (void)detail::agg_waitBUS(false, 5);
+  // 1 µs pulse on PA0
   unsigned long t0 = micros();
-  detail::agg_setCSn(0, true);   // assert
-  delay(2);                      // 2 ms pulse to be safely visible
+  detail::agg_setCSn(0, true);  // assert
+  delayMicroseconds(1);
   detail::agg_setCSn(0, false);  // release
-  delay(AGG_RELEASE_SETTLE_MS);
-  bool busNow = detail::agg_readBUS();
-  if (busNow) detail::note(F("BUS remained HIGH after 2ms pulse (check release timing)"));
-  else detail::note(F("2ms pulse cleared as expected"));
+  // Sample for a short window to see if BUS went high at least once
+  bool sawHighShort = false;
+  while ((micros() - t0) < 200) {
+    if (detail::agg_readBUS()) {
+      sawHighShort = true;
+      break;
+    }
+  }
+  // 10 µs pulse on PA0 (should almost certainly be visible)
+  detail::agg_driveMask(0x00);
+  (void)detail::agg_waitBUS(false, 5);
+  t0 = micros();
+  detail::agg_setCSn(0, true);
+  delayMicroseconds(10);
+  detail::agg_setCSn(0, false);
+  bool sawHighLong = false;
+  while ((micros() - t0) < 1000) {
+    if (detail::agg_readBUS()) {
+      sawHighLong = true;
+      break;
+    }
+  }
+  // Short pulse is informational; long pulse should be seen
+  if (sawHighShort) detail::note(F("Short 1us pulse appears to pass (filter likely disabled)"));
+  else detail::note(F("Short 1us pulse not observed (filter likely enabled or sampling-limited)"));
+  detail::expect(sawHighLong, F("10us pulse observed on BUS"));
 
-  // Stress: toggle random CS lines with long dwell; assert invariant
+  // Stress: toggle random CS lines rapidly; assert invariant continuously for a window
   detail::vprintln(F("[HC32] Test 6: Stress/invariant sampling"));
   uint32_t invFails = 0;
   unsigned long stressStart = millis();
-  while ((millis() - stressStart) < 200) {  // ~200 ms stress
+  while ((millis() - stressStart) < 100) {  // ~100 ms stress
     uint32_t r = micros();
     uint8_t mask = (uint8_t)((r ^ (r >> 9) ^ (r >> 3)) & 0xFF);
     detail::agg_driveMask(mask);
-    delayMicroseconds(AGG_STRESS_DWELL_US);
+    // small variable dwell
+    delayMicroseconds(50 + (r & 0x7F));
     bool expectHigh2 = (mask != 0);
     if (detail::agg_readBUS() != expectHigh2) invFails++;
   }
+  // Cleanup to idle
   detail::agg_driveMask(0x00);
-  delay(AGG_IDLE_SETTLE_MS);
+  (void)detail::agg_waitBUS(false, 10);
   detail::expect(invFails == 0, F("Invariant BUS == OR(~CS_n[]) held during stress"));
 
   if (verbose) {
@@ -1622,11 +1645,16 @@ inline bool runHC32EmulatorTestSuiteOnce(bool verbose = false) {
   }
 
   bool ok = (detail::failCnt == 0);
+
+  // Do not leave aggregator pins driving unexpectedly
   cleanupAggregatorPins();
+
   return ok;
 }
 
 // Convenience wrapper for aggregator tests (does not alter arbiter pins)
+// Note: If AGG_PIN_CS0_OUT == ARB_PIN_BUS_ACTIVE (default), this function will temporarily
+// drive that pin as a CS output. Make sure the BusArbiter test suite is not active concurrently.
 inline bool runHC32POST(bool verbose = false) {
   if (verbose) Serial.println(F("[HC32] Running 74HC32 emulator validation..."));
   return runHC32EmulatorTestSuiteOnce(verbose);
