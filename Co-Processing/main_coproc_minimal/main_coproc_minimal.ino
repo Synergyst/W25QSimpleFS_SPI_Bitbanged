@@ -773,15 +773,16 @@ void setup() {
   Serial.println("CoProc (soft-serial) booting...");
 
   ArbiterISP::initTestPins();
-  bool ok = ArbiterISP::runTestSuiteOnce();
+  bool ok = ArbiterISP::runTestSuiteOnce(false, true);
   ArbiterISP::cleanupToResetState();
   if (!ok) {
-    Serial.println("P.O.S.T. failed!\nEntering ISP mode, please exit serial console and reprogram MCU!");
+    Serial.println("P.O.S.T. failed!");
+    /*Serial.println("Entering ISP mode, please exit serial console and reprogram MCU!");
     ArbiterISP::enterISPMode();
     while (!BOOTSEL) ArbiterISP::serviceISPOnce();  // inside loop
     delay(2000);
     ArbiterISP::exitISPMode();
-    Serial.println("Exited ISP mode..");
+    Serial.println("Exited ISP mode..");*/
   } else {
     Serial.println("P.O.S.T. success!");
   }
