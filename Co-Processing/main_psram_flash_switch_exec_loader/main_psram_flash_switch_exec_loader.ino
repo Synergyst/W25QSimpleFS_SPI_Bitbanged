@@ -2163,8 +2163,7 @@ void setup() {
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
   // Initialize co-processor software serial link
   coprocLinkBegin();
-  Console.printf("Co-Proc serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
-                 (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
+  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {

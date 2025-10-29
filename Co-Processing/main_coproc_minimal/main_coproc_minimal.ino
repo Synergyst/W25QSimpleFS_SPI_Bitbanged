@@ -17,6 +17,7 @@
 */
 #include <Arduino.h>
 
+#include "BusArbiterWithISP.h"
 #include "PSRAMMulti.h"
 #include "rp_selfupdate.h"
 
@@ -726,13 +727,20 @@ static void protocolLoop() {
         continue;
       }
     }
+    if (BOOTSEL) {
+      Serial.println("Rebooting now..");
+      delay(1500);
+      yield();
+      watchdog_reboot(0, 0, 1500);
+      while (true) tight_loop_contents();
+    }
   }
 }
 // ------- rp_selfupdate -------
-static const uint8_t PIN_MISO = 4;    // pin from RP to PSRAM pin-5
-static const uint8_t PIN_MOSI = 3;    // pin from RP to PSRAM pin-2
-static const uint8_t PIN_SCK = 2;     // pin from RP to PSRAM pin-6
-static const uint8_t PIN_DEC_EN = 6;  // 74HC138 G2A/G2B tied together via transistor or directly; active LOW
+static const uint8_t PIN_MISO = 12;   // pin from RP to PSRAM pin-5
+static const uint8_t PIN_MOSI = 11;   // pin from RP to PSRAM pin-2
+static const uint8_t PIN_SCK = 10;    // pin from RP to PSRAM pin-6
+static const uint8_t PIN_DEC_EN = 9;  // 74HC138 G2A/G2B tied together via transistor or directly; active LOW
 static const uint8_t PIN_DEC_A0 = 8;  // 74HC138 address bit 0
 static const uint8_t PIN_DEC_A1 = 7;  // 74HC138 address bit 1
 static const uint8_t BANKS = 4;
@@ -746,22 +754,38 @@ void onTrig() {
 }
 // ========== Setup and main ==========
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) { delay(10); }
-  delay(10);
+  delay(500);
+  Serial.begin();
+  while (!Serial) { delay(500); }
+  delay(500);
 
   // Configure decoder selection for 4 banks via 74HC138
-  psram.configureDecoder138(BANKS, PIN_DEC_EN, PIN_DEC_A0, PIN_DEC_A1 /*, A2=255 default*/);
+  /*psram.configureDecoder138(BANKS, PIN_DEC_EN, PIN_DEC_A0, PIN_DEC_A1);
   psram.begin();
   // Mount and auto-format if empty (or call fs.format()/fs.wipeChip() explicitly)
   fs.mount(true);
   pinMode(PIN_UPDATE, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(PIN_UPDATE), onTrig, RISING);
-  Serial.println("Ready. Put update.bin into PSRAM FS, then pull GP22 HIGH to flash.");
+  Serial.println("Ready. Put update.bin into PSRAM FS, then pull GP22 HIGH to flash.");*/
   // Example: to fully wipe PSRAM FS area for staging:
   // rpupdfs_wipe_chip(fs);
 
   Serial.println("CoProc (soft-serial) booting...");
+
+  ArbiterISP::initTestPins();
+  bool ok = ArbiterISP::runTestSuiteOnce();
+  ArbiterISP::cleanupToResetState();
+  if (!ok) {
+    Serial.println("P.O.S.T. failed!\nEntering ISP mode, please exit serial console and reprogram MCU!");
+    ArbiterISP::enterISPMode();
+    while (!BOOTSEL) ArbiterISP::serviceISPOnce();  // inside loop
+    delay(2000);
+    ArbiterISP::exitISPMode();
+    Serial.println("Exited ISP mode..");
+  } else {
+    Serial.println("P.O.S.T. success!");
+  }
+
   // Allocate protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);
   g_respBuf = (uint8_t*)malloc(RESP_MAX);
