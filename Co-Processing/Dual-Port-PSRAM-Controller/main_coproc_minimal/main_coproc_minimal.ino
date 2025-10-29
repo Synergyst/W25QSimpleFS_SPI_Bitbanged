@@ -887,6 +887,9 @@ void setup() {
     delay(2000);
     ArbiterISP::exitISPMode();
     Serial.println("Exited ISP mode..");*/
+    Serial.println("Are we possibly testing the 74HC32 emulator..?");
+    bool ok = ArbiterISP::runHC32POST(true);  // verbose = true
+    Serial.println(ok ? F("[74HC32] DUT PASS") : F("[74HC32] DUT FAIL"));
   } else {
     Serial.println("P.O.S.T. success!");
   }

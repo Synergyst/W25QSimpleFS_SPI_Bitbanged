@@ -1,9 +1,11 @@
 #pragma once
 #include <Arduino.h>
+
 // ================= Config macros (override before include if needed) =================
 #ifndef ARB_VERBOSE
 #define ARB_VERBOSE 0  // Only affects POST; ISP is never verbose
 #endif
+
 // Arbiter tester pin map (Pico ↔ ATtiny861A)
 #ifndef ARB_PIN_REQ_A_OUT
 #define ARB_PIN_REQ_A_OUT 16
@@ -41,6 +43,7 @@
 #ifndef ARB_PIN_TINY_RST
 #define ARB_PIN_TINY_RST 12
 #endif
+
 // ArduinoISP (bit-banged) pins
 #ifndef ARB_ISP_RESET
 #define ARB_ISP_RESET ARB_PIN_TINY_RST
@@ -57,11 +60,51 @@
 #ifndef ARB_ISP_SPI_CLOCK_HZ
 #define ARB_ISP_SPI_CLOCK_HZ (1000000 / 6)  // ~166 kHz
 #endif
+
+// ================= Additional macros for 74HC32 (BUS_ACTIVE Aggregator) test rig =================
+// By default, we assume you currently drive the Aggregator's PA0 from Pico GP22 (same pad used as ARB_PIN_BUS_ACTIVE).
+// We ALSO assume you can wire the Aggregator's output PB3 to a free Pico input so we can observe it.
+// You can override any of these before including this header to match your wiring.
+//
+// Aggregator CS_n inputs (to ATtiny861A Port A: PA0..PA7) driven from Pico outputs.
+// Defaults chosen to avoid the pins already used by the Arbiter test rig, except PA0 which follows your note (GP22).
+#ifndef AGG_PIN_CS0_OUT
+#define AGG_PIN_CS0_OUT 16  // GP22 as per your note: "drive PA0 from Pico GP22"
+#endif
+#ifndef AGG_PIN_CS1_OUT
+#define AGG_PIN_CS1_OUT 17
+#endif
+#ifndef AGG_PIN_CS2_OUT
+#define AGG_PIN_CS2_OUT 22
+#endif
+#ifndef AGG_PIN_CS3_OUT
+#define AGG_PIN_CS3_OUT 13
+#endif
+#ifndef AGG_PIN_CS4_OUT
+#define AGG_PIN_CS4_OUT 15
+#endif
+#ifndef AGG_PIN_CS5_OUT
+#define AGG_PIN_CS5_OUT 8
+#endif
+#ifndef AGG_PIN_CS6_OUT
+#define AGG_PIN_CS6_OUT 9
+#endif
+#ifndef AGG_PIN_CS7_OUT
+#define AGG_PIN_CS7_OUT 6
+#endif
+// Aggregator BUS_ACTIVE output (ATtiny861A PB3) observed on a Pico input pin:
+#ifndef AGG_PIN_BUS_IN
+#define AGG_PIN_BUS_IN 18  // default to an available Pico pin (e.g., GP26). Override to match your wiring.
+#endif
+
 namespace ArbiterISP {
+
 inline bool bootsel() {
   return BOOTSEL;
 }  // you already mapped BOOTSEL in your sketch
+
 namespace detail {
+
 // -------- POST verbosity (runtime) --------
 static uint8_t gVerbose = (ARB_VERBOSE != 0);
 inline bool chatty() {
@@ -79,6 +122,7 @@ inline void vprintC(char c) {
 inline void toResetState(uint8_t pin) {
   pinMode(pin, INPUT);
 }
+
 // -------- Test helpers/state --------
 static int passCnt = 0, failCnt = 0;
 inline void expect(bool ok, const __FlashStringHelper* name) {
@@ -176,6 +220,7 @@ inline void printStatus(const __FlashStringHelper* tag) {
   Serial.print(F(" BUS="));
   Serial.println(digitalRead(ARB_PIN_BUS_ACTIVE) ? F("ACTIVE") : F("IDLE"));
 }
+
 // Count rising edges on a pin within a time window (polling ~100 µs)
 inline uint8_t countRising(uint8_t pin, uint32_t window_ms) {
   bool last = digitalRead(pin);
@@ -189,6 +234,7 @@ inline uint8_t countRising(uint8_t pin, uint32_t window_ms) {
   }
   return edges;
 }
+
 // Measure one high pulse width (µs) on pin; waits for rise up to timeout_ms.
 // Returns true on success and writes width_us.
 inline bool measurePulseWidthHigh(uint8_t pin, uint32_t timeout_ms, uint32_t& width_us) {
@@ -212,6 +258,7 @@ inline bool measurePulseWidthHigh(uint8_t pin, uint32_t timeout_ms, uint32_t& wi
   }
   return false;
 }
+
 // Wait for PREV to be a specific one-hot value ('A' or 'B')
 inline bool waitPrevIs(char p, uint32_t ms = 300) {
   uint32_t t0 = millis();
@@ -224,6 +271,7 @@ inline bool waitPrevIs(char p, uint32_t ms = 300) {
   }
   return false;
 }
+
 // Observe a release->handoff sequence and concurrently sample IRQ edges.
 // target: 'A' or 'B'; records whether we saw NONE, then target owner, and if IRQ pulses occurred.
 inline void observeHandoffTo(char target, uint32_t max_ms, bool& sawNone, bool& sawTarget, bool& irqa, bool& irqb) {
@@ -250,6 +298,7 @@ inline void observeHandoffTo(char target, uint32_t max_ms, bool& sawNone, bool& 
     delayMicroseconds(100);
   }
 }
+
 // Sanity: drive both REQs low, BUS idle, wait OWNER=N and OE disabled
 inline bool settleToNone(uint32_t ms = 500) {
   reqA(false);
@@ -262,6 +311,7 @@ inline bool settleToNone(uint32_t ms = 500) {
   },
                   ms);
 }
+
 // Check invariants at the current instant, return true if all hold.
 inline bool checkInvariantsOnce() {
   bool ok = true;
@@ -282,6 +332,7 @@ inline bool checkInvariantsOnce() {
   if ((int)prevA() + (int)prevB() != 1) ok = false;
   return ok;
 }
+
 // Sample invariants repeatedly for window_ms
 inline bool checkInvariantsWindow(uint32_t window_ms) {
   uint32_t t0 = millis();
@@ -291,6 +342,7 @@ inline bool checkInvariantsWindow(uint32_t window_ms) {
   }
   return true;
 }
+
 // Best-effort timing sample around a grant to target ('A' or 'B')
 // Prints a brief trace when verbose; does not fail tests (sampling-limited).
 inline void traceGrantTiming(char target) {
@@ -332,8 +384,8 @@ inline void traceGrantTiming(char target) {
   }
   Serial.println();
 }
+
 // ----------------------- Added helpers for stronger coverage -----------------------
-// Force prevOwner to target ('A' or 'B') by performing a grant+release cycle.
 inline bool forcePrev(char target) {
   (void)settleToNone(300);
   if (target == 'A') {
@@ -368,6 +420,7 @@ inline bool forcePrev(char target) {
     return ok;
   }
 }
+
 // Ensure current owner is 'A' or 'B' (or 'N' for none).
 inline bool forceOwner(char o) {
   (void)settleToNone(300);
@@ -396,6 +449,7 @@ inline bool forceOwner(char o) {
     return n;
   }
 }
+
 // Predict next owner according to firmware rules.
 // owner: 'N','A','B'; prev: 'A' or 'B'; rA/rB/bus: booleans (true = asserted/active).
 inline char predictNext(char owner, char prev, bool rA, bool rB, bool bus) {
@@ -412,18 +466,17 @@ inline char predictNext(char owner, char prev, bool rA, bool rB, bool bus) {
     return 'B';
   }
 }
+
 // Read current owner as 'N','A','B'
 inline char readOwnerChar() {
   return ownerChar();
 }
+
 // Exhaustive transition test.
-// For each prev in {A,B}, owner in {N,A,B}, inputs in {rA,rB,bus}∈2^3,
-// re-establish (prev,owner), apply inputs, and assert next owner == predicted.
 inline bool runExhaustiveTransitions() {
   bool allOk = true;
   const char prevs[2] = { 'A', 'B' };
   const char owners[3] = { 'N', 'A', 'B' };
-
   auto setupPrevQuiet = [](char pv) -> bool {
     (void)settleToNone(300);
     if (pv == 'A') {
@@ -454,7 +507,6 @@ inline bool runExhaustiveTransitions() {
       return g && r && pvOk;
     }
   };
-
   auto setupOwnerQuiet = [](char ow) -> bool {
     (void)settleToNone(300);
     if (ow == 'A') {
@@ -478,7 +530,6 @@ inline bool runExhaustiveTransitions() {
                       300);
     }
   };
-
   for (int pi = 0; pi < 2; ++pi) {
     char pv = prevs[pi];
     for (int oi = 0; oi < 3; ++oi) {
@@ -496,7 +547,6 @@ inline bool runExhaustiveTransitions() {
                          300);
           continue;
         }
-
         // Drive inputs for this step
         bool rA = (mask & 1) != 0;
         bool rB = (mask & 2) != 0;
@@ -504,10 +554,8 @@ inline bool runExhaustiveTransitions() {
         reqA(rA);
         reqB(rB);
         busSet(bus);
-
         // Predict next owner
         char expectNext = predictNext(ow, pv, rA, rB, bus);
-
         // Wait for expected state
         bool got = false;
         if (expectNext == 'N') got = waitCond([]() {
@@ -522,7 +570,6 @@ inline bool runExhaustiveTransitions() {
                return wantOwner('B');
              },
                             300);
-
         if (!got) {
           allOk = false;
           expect(false, F("Exhaustive transition mismatch"));
@@ -530,7 +577,6 @@ inline bool runExhaustiveTransitions() {
         } else {
           expect(true, F("Exhaustive transition OK"));
         }
-
         // Clean up for next combo
         reqA(false);
         reqB(false);
@@ -544,6 +590,7 @@ inline bool runExhaustiveTransitions() {
   }
   return allOk;
 }
+
 // -------- ISP engine (bit-banged) — PROTOCOL BYTES ONLY (no extra prints) --------
 class ISP_BitBangSPI {
 public:
@@ -576,6 +623,7 @@ static ISP_BitBangSPI ISP_SPI;
 static unsigned int here = 0;
 static uint8_t buff[256];
 constexpr uint8_t STK_OK = 0x10, STK_FAILED = 0x11, STK_UNKNOWN = 0x12, STK_INSYNC = 0x14, STK_NOSYNC = 0x15, CRC_EOP = 0x20;
+
 inline uint8_t ISP_getch() {
   while (!Serial.available())
     ;
@@ -650,6 +698,7 @@ inline unsigned int page_mask(uint16_t ps) {
   if (ps == 256) return 0xFFFFFF80;
   return 0xFFFFFFFF;
 }
+
 // STK handler (single command)
 inline void ISP_serviceOnce() {
   if (!Serial.available()) return;
@@ -750,7 +799,9 @@ inline void ISP_serviceOnce() {
             here++;
           }
         } else if (mem == 'E') {
-          for (int i = 0; i < len; i++) { Serial.write(ISP_tx4(0xA0, ((here * 2 + i) >> 8) & 0xFF, (here * 2 + i) & 0xFF, 0xFF)); }
+          for (int i = 0; i < len; i++) {
+            Serial.write(ISP_tx4(0xA0, ((here * 2 + i) >> 8) & 0xFF, (here * 2 + i) & 0xFF, 0xFF));
+          }
         }
         Serial.write(STK_OK);
       }
@@ -781,6 +832,7 @@ inline void ISP_serviceOnce() {
       break;
   }
 }
+
 // Minimal direct signature probe (used by recovery test)
 inline bool ISP_probeSignature(uint8_t& b0, uint8_t& b1, uint8_t& b2) {
   pinMode(ARB_ISP_SCK, OUTPUT);
@@ -793,7 +845,97 @@ inline bool ISP_probeSignature(uint8_t& b0, uint8_t& b1, uint8_t& b2) {
   ISP_endPmode();
   return (b0 == 0x1E && b1 == 0x93 && b2 == 0x0D);  // ATtiny861(A)
 }
+
+// ========================== Helpers for 74HC32 (Aggregator) testing ==========================
+static const uint8_t AGG_CS_PINS[8] = {
+  AGG_PIN_CS0_OUT, AGG_PIN_CS1_OUT, AGG_PIN_CS2_OUT, AGG_PIN_CS3_OUT,
+  AGG_PIN_CS4_OUT, AGG_PIN_CS5_OUT, AGG_PIN_CS6_OUT, AGG_PIN_CS7_OUT
+};
+
+// Write one CS_n line (true = assert/active: logic LOW on the wire)
+inline void agg_setCSn(uint8_t idx, bool assertActive) {
+  if (idx > 7) return;
+  digitalWrite(AGG_CS_PINS[idx], assertActive ? LOW : HIGH);
+}
+
+// Drive all CS_n according to an 8-bit mask (bit=1 means active/LOW)
+inline void agg_driveMask(uint8_t mask) {
+  for (uint8_t i = 0; i < 8; ++i) {
+    bool active = (mask >> i) & 0x1;
+    agg_setCSn(i, active);
+  }
+}
+
+// Read Aggregator BUS_ACTIVE output (active-HIGH = any CS_n low)
+inline bool agg_readBUS() {
+  return digitalRead(AGG_PIN_BUS_IN) != 0;
+}
+
+// Initialize Aggregator pins: CS_n outputs HIGH (inactive), BUS input as input
+inline void agg_initPins() {
+  for (uint8_t i = 0; i < 8; ++i) {
+    pinMode(AGG_CS_PINS[i], OUTPUT);
+    digitalWrite(AGG_CS_PINS[i], HIGH);  // inactive (CS_n deasserted)
+  }
+  pinMode(AGG_PIN_BUS_IN, INPUT);
+}
+
+// Return all aggregator-related pins to Hi-Z
+inline void agg_cleanupPins() {
+  for (uint8_t i = 0; i < 8; ++i) {
+    toResetState(AGG_CS_PINS[i]);
+  }
+  toResetState(AGG_PIN_BUS_IN);
+}
+
+// Wait helpers for Aggregator BUS
+inline bool agg_waitBUS(bool wantHigh, uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    if (agg_readBUS() == wantHigh) return true;
+    delayMicroseconds(50);
+  }
+  return false;
+}
+
+// Measure propagation from a CS transition to BUS level change.
+// Returns true and writes delta_us on success, false on timeout.
+inline bool agg_measureProp(uint8_t csIdx, bool toActive, uint32_t timeout_us, uint32_t& delta_us) {
+  // Prepare known baseline: if measuring rising BUS (toActive=true), ensure all inactive first.
+  // If measuring falling BUS (toActive=false), ensure only csIdx is active first.
+  if (toActive) {
+    agg_driveMask(0x00);  // all inactive → BUS should be LOW
+    (void)agg_waitBUS(false, 5);
+  } else {
+    agg_driveMask(0x00);
+    agg_setCSn(csIdx, true);  // only this asserted → BUS HIGH
+    (void)agg_waitBUS(true, 5);
+  }
+
+  // Now perform transition
+  unsigned long tStart = micros();
+  if (toActive) {
+    agg_setCSn(csIdx, true);  // assert -> BUS should go HIGH
+    while ((micros() - tStart) < timeout_us) {
+      if (agg_readBUS()) {
+        delta_us = (uint32_t)(micros() - tStart);
+        return true;
+      }
+    }
+  } else {
+    agg_setCSn(csIdx, false);  // deassert -> BUS should go LOW
+    while ((micros() - tStart) < timeout_us) {
+      if (!agg_readBUS()) {
+        delta_us = (uint32_t)(micros() - tStart);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 }  // namespace detail
+
 // ============================== Public API =================================
 inline void initTestPins() {
   pinMode(ARB_PIN_REQ_A_OUT, OUTPUT);
@@ -812,6 +954,7 @@ inline void initTestPins() {
   pinMode(ARB_PIN_BUS_ACTIVE, OUTPUT);
   detail::busSet(false);
 }
+
 // POST validator (verbose only affects POST). If allowBootselReset and POST fails,
 // perform a recovery probe: reset + ISP signature read (prints result when verbose).
 inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = false) {
@@ -826,6 +969,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     delay(50);
   }
   detail::passCnt = detail::failCnt = 0;
+
   // Test 0: baseline
   detail::vprintln(F("[POST] Test 0: baseline idle"));
   detail::reqA(false);
@@ -839,6 +983,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   detail::expect(ok0, F("Idle: OWNER=NONE, OE=DIS"));
   // Baseline PREV indicates initial tie-bias (firmware starts prev=B -> A wins first tie)
   detail::expect(detail::prevB() && !detail::prevA(), F("Baseline PREV=B one-hot"));
+
   // Test 1: grant A + release
   detail::vprintln(F("[POST] Test 1: grant A (idle)+release"));
   detail::reqA(true);
@@ -860,6 +1005,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   detail::printStatus(F("After release A"));
   detail::expect(ok1r, F("Release A -> NONE"));
   detail::expect(irqArel && irqBrel, F("IRQ_A & IRQ_B on release"));
+
   // Test 2: grant B, BUS gated release
   detail::vprintln(F("[POST] Test 2: grant B, BUS-active gate"));
   detail::reqB(true);
@@ -881,6 +1027,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
                                300);
   detail::printStatus(F("After BUS idle"));
   detail::expect(ok2r, F("Release after BUS idle"));
+
   // Test 3: tie/round-robin
   detail::vprintln(F("[POST] Test 3: tie -> round-robin"));
   detail::reqA(true);
@@ -914,6 +1061,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                    300);
+
   // ================= Additional robustness tests =================
   // Test 4: PREV_* indicators track last non-NONE owner
   detail::vprintln(F("[POST] Test 4: PREV_* indicators"));
@@ -944,6 +1092,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
                                300);
   bool prevOkB = detail::waitPrevIs('B', 200);
   detail::expect(t4rB && prevOkB, F("After release, PREV=B"));
+
   // Test 5: IRQ_B pulses on grant B
   detail::vprintln(F("[POST] Test 5: IRQ_B on grant B"));
   (void)detail::settleToNone(300);
@@ -959,6 +1108,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 6: Non-preemption (A cannot steal while B holds)
   detail::vprintln(F("[POST] Test 6: Non-preemption"));
   (void)detail::settleToNone(300);
@@ -981,6 +1131,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 7: Immediate handoff when peer is already requesting
   detail::vprintln(F("[POST] Test 7: Immediate handoff A->B"));
   (void)detail::settleToNone(300);
@@ -1003,6 +1154,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 8: Grant under BUS active (BUS only gates release)
   detail::vprintln(F("[POST] Test 8: Grant while BUS active"));
   (void)detail::settleToNone(300);
@@ -1019,10 +1171,12 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 9: Mutual exclusion and coherence invariants (short window)
   detail::vprintln(F("[POST] Test 9: Mutual exclusion and coherence"));
   bool okMx = detail::checkInvariantsWindow(20);
   detail::expect(okMx, F("OWNER_A/B mutual exclusion and signals coherent"));
+
   // Test 10: IRQ pulse widths (A and B). Expected ~2ms in firmware; use tolerant bounds.
   detail::vprintln(F("[POST] Test 10: IRQ pulse widths"));
   (void)detail::settleToNone(300);
@@ -1050,10 +1204,12 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Timing trace (best-effort, informational only)
   detail::vprintln(F("[POST] Trace: grant timing best-effort"));
   detail::traceGrantTiming('A');
   detail::traceGrantTiming('B');
+
   // Test 11: Quick stress — rapid toggles while checking invariants
   detail::vprintln(F("[POST] Test 11: Quick stress / invariants"));
   (void)detail::settleToNone(300);
@@ -1080,6 +1236,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   },
                          300);
   detail::expect(fuzzFails == 0, F("Stress invariants held"));
+
   // ----------------------- Added tests for stronger coverage -----------------------
   // Test 12: Negative IRQ checks on single-side grants
   detail::vprintln(F("[POST] Test 12: Negative IRQ checks on grant"));
@@ -1110,6 +1267,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 13: Tie while BUS active (and winner matches PREV tie-bias)
   detail::vprintln(F("[POST] Test 13: Tie while BUS active"));
   (void)detail::settleToNone(300);
@@ -1151,6 +1309,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 14: Handoff under BUS active (no grant until BUS idle)
   detail::vprintln(F("[POST] Test 14: Handoff under BUS active"));
   (void)detail::settleToNone(300);
@@ -1184,10 +1343,12 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   // Test 15: Exhaustive next-state transitions
   detail::vprintln(F("[POST] Test 15: Exhaustive transition coverage (this will take a while..)"));
   bool exOk = detail::runExhaustiveTransitions();
   detail::expect(exOk, F("All transitions matched spec"));
+
   // Test 16 (optional): Forced-timeout detection (if firmware enables FORCE_TIMEOUT_MS)
   detail::vprintln(F("[POST] Test 16: Forced-timeout (optional, non-failing if absent)"));
   (void)detail::settleToNone(300);
@@ -1222,6 +1383,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     return detail::wantNone();
   },
                          300);
+
   if (verbose) {
     Serial.print(F("[POST] Summary: "));
     Serial.print(detail::passCnt);
@@ -1230,6 +1392,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
     Serial.println(F(" FAIL"));
   }
   const bool ok = (detail::failCnt == 0);
+
   // Recovery probe (only if requested AND failed)
   if (!ok && allowBootselReset) {
     if (verbose) Serial.println(F("[POST] Recovery: reset + ISP signature probe"));
@@ -1256,6 +1419,7 @@ inline bool runTestSuiteOnce(bool allowBootselReset = false, bool verbose = fals
   }
   return ok;
 }
+
 // Convenience POST wrapper
 inline bool runPOST(bool allowBootselReset = false, bool verbose = false) {
   if (verbose) Serial.println(F("Booting system.."));
@@ -1265,6 +1429,7 @@ inline bool runPOST(bool allowBootselReset = false, bool verbose = false) {
   // leave pins as-is; caller may clean up or enter ISP
   return ok;
 }
+
 // Reset all to Hi-Z
 inline void cleanupToResetState() {
   detail::toResetState(ARB_PIN_REQ_A_OUT);
@@ -1284,6 +1449,7 @@ inline void cleanupToResetState() {
   detail::toResetState(ARB_ISP_SCK);
   detail::toResetState(ARB_ISP_RESET);
 }
+
 // ISP mode API (Protocol bytes only; no extra prints)
 inline void enterISPMode() {
   cleanupToResetState();
@@ -1298,6 +1464,7 @@ inline void exitISPMode() {
   detail::ISP_endPmode();
   cleanupToResetState();
 }
+
 // Tiny reset helper
 inline void tinyResetPulse() {
   pinMode(ARB_PIN_TINY_RST, OUTPUT);
@@ -1306,4 +1473,191 @@ inline void tinyResetPulse() {
   pinMode(ARB_PIN_TINY_RST, INPUT);
   delay(50);
 }
+
+// ============================== 74HC32 Emulator (BUS_ACTIVE Aggregator) Tests ==============================
+//
+// These tests are completely separate from the BusArbiter POST. They validate the
+// ATTiny861A BUS_ACTIVE Aggregator v0.1 sketch, which asserts BUS_ACTIVE (PB3 HIGH)
+// if any CS_n input on Port A (PA0..PA7) is low.
+//
+// Wiring defaults (override via AGG_* macros above before including this header):
+// - PA0..PA7 ← Pico outputs AGG_PIN_CS0_OUT..AGG_PIN_CS7_OUT
+// - PB3 → Pico input AGG_PIN_BUS_IN
+//
+// IMPORTANT: By default, only the BusArbiter tests run. Call runHC32EmulatorTestSuiteOnce()
+// explicitly to exercise the Aggregator.
+
+inline void initAggregatorPins() {
+  // If your CS0 shares the ARB_PIN_BUS_ACTIVE pin (default), make sure it's not driven as an output elsewhere.
+  // We'll configure aggregator pins explicitly here.
+  detail::agg_initPins();
+}
+
+inline void cleanupAggregatorPins() {
+  detail::agg_cleanupPins();
+}
+
+// Thorough test suite for the 74HC32 emulator (Aggregator).
+// Returns true if all checks pass. Verbose controls diagnostic prints.
+inline bool runHC32EmulatorTestSuiteOnce(bool verbose = false) {
+  detail::gVerbose = verbose ? 1 : 0;
+  detail::passCnt = detail::failCnt = 0;
+
+  if (verbose) {
+    Serial.println(F("[HC32] Init Aggregator pins"));
+  }
+  initAggregatorPins();
+
+  // Baseline: all CS_n inactive => BUS must be LOW
+  detail::vprintln(F("[HC32] Test 0: Baseline"));
+  detail::agg_driveMask(0x00);
+  bool baseLow = !detail::agg_readBUS() || detail::agg_waitBUS(false, 10);
+  detail::expect(baseLow, F("BUS=LOW when all CS_n inactive"));
+
+  // Test each input individually (active low)
+  detail::vprintln(F("[HC32] Test 1: Single-input activation (PA0..PA7)"));
+  for (uint8_t i = 0; i < 8; ++i) {
+    // Activate only this line
+    detail::agg_driveMask((uint8_t)(1u << i));
+    bool busHigh = detail::agg_waitBUS(true, 10);
+    detail::expect(busHigh, F("BUS=HIGH when any CS_n asserted"));
+    // Release back to all inactive
+    detail::agg_driveMask(0x00);
+    bool busLow = detail::agg_waitBUS(false, 10);
+    detail::expect(busLow, F("BUS=LOW when all CS_n released"));
+  }
+
+  // Pairwise combinations
+  detail::vprintln(F("[HC32] Test 2: Pairwise combinations"));
+  for (uint8_t i = 0; i < 8; ++i) {
+    for (uint8_t j = (uint8_t)(i + 1); j < 8; ++j) {
+      uint8_t mask = (uint8_t)((1u << i) | (1u << j));
+      detail::agg_driveMask(mask);
+      bool busHigh = detail::agg_waitBUS(true, 10);
+      detail::expect(busHigh, F("BUS=HIGH for any pair asserted"));
+      detail::agg_driveMask(0x00);
+      bool busLow = detail::agg_waitBUS(false, 10);
+      detail::expect(busLow, F("BUS=LOW after releasing pair"));
+    }
+  }
+
+  // Randomized truth-table verification across 8 inputs
+  detail::vprintln(F("[HC32] Test 3: Randomized truth-table verification"));
+  uint32_t mismatches = 0;
+  for (int k = 0; k < 64; ++k) {
+    // Pseudo-random mask without RNG: use time scrambling
+    uint32_t r = micros();
+    // Mix bits to get some entropy across 8 bits
+    uint8_t mask = (uint8_t)((r ^ (r >> 7) ^ (r >> 13) ^ (r >> 17)) & 0xFF);
+    detail::agg_driveMask(mask);
+    delayMicroseconds(5);
+    bool expectHigh = (mask != 0);
+    bool bus = detail::agg_readBUS();
+    if (bus != expectHigh) {
+      mismatches++;
+      if (verbose) {
+        Serial.print(F("[HC32] Mismatch: mask="));
+        Serial.print(mask, BIN);
+        Serial.print(F(" BUS="));
+        Serial.println(bus ? F("HIGH") : F("LOW"));
+      }
+    }
+  }
+  detail::expect(mismatches == 0, F("BUS == OR(~CS_n[]) across randomized vectors"));
+  // Return to idle
+  detail::agg_driveMask(0x00);
+  (void)detail::agg_waitBUS(false, 10);
+
+  // Propagation timing (best-effort)
+  detail::vprintln(F("[HC32] Test 4: Propagation timing (best-effort, tolerant bounds)"));
+  uint32_t tRise = 0, tFall = 0;
+  bool gotRise = detail::agg_measureProp(0 /*PA0*/, true /*toActive*/, 2000 /*us*/, tRise);
+  bool gotFall = detail::agg_measureProp(0 /*PA0*/, false /*toInactive*/, 2000 /*us*/, tFall);
+  // The emulator loop is very fast; allow generous bounds to avoid false negatives due to wiring/firmware variations.
+  bool tRiseOk = gotRise && (tRise <= 2000);
+  bool tFallOk = gotFall && (tFall <= 2000);
+  detail::expect(gotRise, F("Observed BUS rise after CS_n assert"));
+  detail::expect(gotFall, F("Observed BUS fall after CS_n release"));
+  detail::expect(tRiseOk, F("Rise propagation within 2 ms"));
+  detail::expect(tFallOk, F("Fall propagation within 2 ms"));
+
+  // Glitch behavior (informational): very short pulses may or may not be passed depending on optional filter
+  detail::vprintln(F("[HC32] Test 5: Glitch behavior (non-fatal)"));
+  // Ensure idle
+  detail::agg_driveMask(0x00);
+  (void)detail::agg_waitBUS(false, 5);
+  // 1 µs pulse on PA0
+  unsigned long t0 = micros();
+  detail::agg_setCSn(0, true);  // assert
+  delayMicroseconds(1);
+  detail::agg_setCSn(0, false);  // release
+  // Sample for a short window to see if BUS went high at least once
+  bool sawHighShort = false;
+  while ((micros() - t0) < 200) {
+    if (detail::agg_readBUS()) {
+      sawHighShort = true;
+      break;
+    }
+  }
+  // 10 µs pulse on PA0 (should almost certainly be visible)
+  detail::agg_driveMask(0x00);
+  (void)detail::agg_waitBUS(false, 5);
+  t0 = micros();
+  detail::agg_setCSn(0, true);
+  delayMicroseconds(10);
+  detail::agg_setCSn(0, false);
+  bool sawHighLong = false;
+  while ((micros() - t0) < 1000) {
+    if (detail::agg_readBUS()) {
+      sawHighLong = true;
+      break;
+    }
+  }
+  // Short pulse is informational; long pulse should be seen
+  if (sawHighShort) detail::note(F("Short 1us pulse appears to pass (filter likely disabled)"));
+  else detail::note(F("Short 1us pulse not observed (filter likely enabled or sampling-limited)"));
+  detail::expect(sawHighLong, F("10us pulse observed on BUS"));
+
+  // Stress: toggle random CS lines rapidly; assert invariant continuously for a window
+  detail::vprintln(F("[HC32] Test 6: Stress/invariant sampling"));
+  uint32_t invFails = 0;
+  unsigned long stressStart = millis();
+  while ((millis() - stressStart) < 100) {  // ~100 ms stress
+    uint32_t r = micros();
+    uint8_t mask = (uint8_t)((r ^ (r >> 9) ^ (r >> 3)) & 0xFF);
+    detail::agg_driveMask(mask);
+    // small variable dwell
+    delayMicroseconds(50 + (r & 0x7F));
+    bool expectHigh2 = (mask != 0);
+    if (detail::agg_readBUS() != expectHigh2) invFails++;
+  }
+  // Cleanup to idle
+  detail::agg_driveMask(0x00);
+  (void)detail::agg_waitBUS(false, 10);
+  detail::expect(invFails == 0, F("Invariant BUS == OR(~CS_n[]) held during stress"));
+
+  if (verbose) {
+    Serial.print(F("[HC32] Summary: "));
+    Serial.print(detail::passCnt);
+    Serial.print(F(" PASS, "));
+    Serial.print(detail::failCnt);
+    Serial.println(F(" FAIL"));
+  }
+
+  bool ok = (detail::failCnt == 0);
+
+  // Do not leave aggregator pins driving unexpectedly
+  cleanupAggregatorPins();
+
+  return ok;
+}
+
+// Convenience wrapper for aggregator tests (does not alter arbiter pins)
+// Note: If AGG_PIN_CS0_OUT == ARB_PIN_BUS_ACTIVE (default), this function will temporarily
+// drive that pin as a CS output. Make sure the BusArbiter test suite is not active concurrently.
+inline bool runHC32POST(bool verbose = false) {
+  if (verbose) Serial.println(F("[HC32] Running 74HC32 emulator validation..."));
+  return runHC32EmulatorTestSuiteOnce(verbose);
+}
+
 }  // namespace ArbiterISP
