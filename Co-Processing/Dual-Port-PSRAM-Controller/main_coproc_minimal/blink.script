@@ -1,0 +1,13 @@
+# Blink GP2 three times, 200ms on, 150ms off, return 7
+PINMODE 2 OUT
+LET R0 0
+LOOP:
+DWRITE 2 1
+DELAY 200
+DWRITE 2 0
+DELAY 150
+ADD R0 1
+IF R0 < 3 GOTO LOOP
+MBCLR
+MBAPP "Blink done"
+RET 7
