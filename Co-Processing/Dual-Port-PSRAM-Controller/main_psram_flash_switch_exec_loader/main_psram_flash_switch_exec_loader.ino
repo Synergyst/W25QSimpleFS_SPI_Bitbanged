@@ -62,6 +62,8 @@ struct BlobReg;               // Forward declaration
 static ConsolePrint Console;  // Console wrapper
 // ------- MC Compiiler -------
 #include "MCCompiler.h"
+// ------- Text Editor -------
+#include "TextEditor.h"
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
 // ========== bitbang pin definitions (flash) ==========
@@ -241,8 +243,7 @@ static void printHexByte(uint8_t b) {
   Console.print(b, HEX);
 }
 // ========== Return mailbox reservation (Scratch) ==========
-extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
-int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
+extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
 // ================= New: ExecHost header =================
 #include "ExecHost.h"
 static ExecHost Exec;
@@ -663,7 +664,6 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
-
 // ========== New: compile Tiny-C source file -> raw Thumb binary on FS ==========
 static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos) {
   const size_t CONTEXT = 40;
@@ -682,7 +682,6 @@ static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos)
   Console.println("^");
   Console.println("-------------------");
 }
-
 static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
   if (!checkNameLen(srcName) || !checkNameLen(dstName)) return false;
   if (!activeFs.exists(srcName)) {
@@ -708,7 +707,6 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     return false;
   }
   srcBuf[srcSize] = 0;
-
   // Prepare output buffer (rough upper bound: small compiler, but be generous)
   uint32_t outCap = (srcSize * 12u) + 256u;  // tiny code generator; literals pool small
   if (outCap < 512u) outCap = 512u;
@@ -718,7 +716,6 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     free(srcBuf);
     return false;
   }
-
   MCCompiler comp;
   size_t outSize = 0;
   MCCompiler::Result r = comp.compile(srcBuf, srcSize, outBuf, outCap, &outSize);
@@ -732,7 +729,6 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     free(srcBuf);
     return false;
   }
-
   // Write to destination file
   bool ok = writeBinaryToFS(dstName, outBuf, (uint32_t)outSize);
   if (ok) {
@@ -747,12 +743,10 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
   } else {
     Console.println("compile: write failed");
   }
-
   free(outBuf);
   free(srcBuf);
   return ok;
 }
-
 // ===================== Co-Processor RPC helpers (for CMD_FUNC) =====================
 static uint32_t g_coproc_seq = 1;
 static bool coprocWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
@@ -919,8 +913,8 @@ static bool readLine() {
   static size_t pos = 0;
   while (Serial.available()) {
     char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
+    //if (c == '\r') continue;
+    if (c == '\n' || c== '\r') {
       lineBuf[pos] = 0;
       pos = 0;
       return true;
@@ -943,6 +937,343 @@ static int nextToken(char*& p, char*& tok) {
   }
   return 1;
 }
+// ----------------- New editor integration (text + hex) -----------------
+//
+// We implement simple interactive editors that use activeFs for file I/O and Console for I/O.
+// They are intentionally minimal (ED-like) but integrate with your ActiveFS implementation.
+// They are blocking (synchronously read Serial) while active; they poll Exec.pollBackground()
+// occasionally to keep background processing alive.
+//
+// Hotkey: Ctrl-C (ASCII 3) will exit the editor immediately (acts like :q).
+//
+#define EDIT_MAX_TEXT_LINES 512
+#define EDIT_MAX_LINE_LEN 128
+#define EDIT_MAX_BIN_BYTES 4096
+
+static int editorReadLine(char* out, int max) {
+  // Blocks until newline received or Ctrl-C (ASCII 3).
+  // Returns:
+  //  -1 on Ctrl-C (immediate)
+  //   0 on error / no input (shouldn't happen)
+  //  >0 length of line (no newline, nul-terminated)
+  int pos = 0;
+  while (true) {
+    // Keep background tasks alive while waiting for input
+    Exec.pollBackground();
+    if (Serial.available()) {
+      int c = Serial.read();
+      if (c < 0) continue;
+      if (c == 3) {  // Ctrl-C
+        return -1;
+      }
+      if (c == '\r') continue;
+      if (c == '\n') {
+        out[pos] = '\0';
+        return pos;
+      }
+      if (pos + 1 < max) {
+        out[pos++] = (char)c;
+      } else {
+        // drop extra chars
+      }
+    } else {
+      tight_loop_contents();
+      yield();
+    }
+  }
+  return 0;
+}
+
+static void printCurrentTextBufferToConsole(char bufLines[EDIT_MAX_TEXT_LINES][EDIT_MAX_LINE_LEN], int lineCount) {
+  for (int i = 0; i < lineCount; ++i) {
+    Console.printf("%d: %s\n", i + 1, bufLines[i]);
+  }
+}
+
+static bool launchTextEditorInteractive(const char* path) {
+  if (!checkNameLen(path)) return false;
+  // Load file (if exists)
+  char lines[EDIT_MAX_TEXT_LINES][EDIT_MAX_LINE_LEN];
+  int lineCount = 0;
+  if (activeFs.exists(path)) {
+    uint32_t sz = 0;
+    if (!activeFs.getFileSize(path, sz)) {
+      Console.println("edit: getFileSize failed");
+      return false;
+    }
+    if (sz > 0) {
+      char* tmp = (char*)malloc((size_t)sz + 1);
+      if (!tmp) {
+        Console.println("edit: malloc failed");
+        return false;
+      }
+      uint32_t got = activeFs.readFile(path, (uint8_t*)tmp, sz);
+      if (got != sz) {
+        Console.println("edit: readFile failed");
+        free(tmp);
+        return false;
+      }
+      tmp[sz] = '\0';
+      // Split into lines
+      char* p = tmp;
+      while (*p && lineCount < EDIT_MAX_TEXT_LINES) {
+        char* eol = p;
+        while (*eol && *eol != '\n' && *eol != '\r') ++eol;
+        int len = (int)(eol - p);
+        if (len >= EDIT_MAX_LINE_LEN) len = EDIT_MAX_LINE_LEN - 1;
+        memcpy(lines[lineCount], p, len);
+        lines[lineCount][len] = '\0';
+        ++lineCount;
+        // skip newline(s)
+        while (*eol == '\n' || *eol == '\r') ++eol;
+        p = eol;
+      }
+      free(tmp);
+    }
+  } else {
+    // start with empty buffer
+    lineCount = 0;
+  }
+
+  Console.printf(": text editor (file: %s). Commands: :q, :w <path>, :p, :a, :i N, :d N, :h\n", path);
+  Console.println("  Ctrl-C to exit editor immediately");
+  char inbuf[256];
+  while (true) {
+    Console.print("ed> ");
+    int r = editorReadLine(inbuf, sizeof(inbuf));
+    if (r < 0) {
+      Console.println("^C detected, exiting editor.");
+      return true;
+    }
+    if (r == 0) continue;
+    if (inbuf[0] == ':') {
+      const char* cmd = inbuf + 1;
+      if (!strcmp(cmd, "q") || !strcmp(cmd, "quit")) {
+        Console.println("Exiting text editor.");
+        return true;
+      } else if (!strcmp(cmd, "h") || !strcmp(cmd, "help")) {
+        Console.println(
+          "Text Editor commands:\n"
+          "  :q or :quit        - exit editor (without saving)\n"
+          "  :w <path>          - save text to path\n"
+          "  :p                 - print current content\n"
+          "  :a                 - append lines until '.' on a line\n"
+          "  :i N               - insert after line N; then lines until '.'\n"
+          "  :d N               - delete line N (1-based)\n"
+          "  :h or :help        - show this help\n"
+          "Ctrl-C exits editor immediately.\n");
+      } else if (!strncmp(cmd, "w ", 2)) {
+        const char* pathArg = cmd + 2;
+        // join lines into single buffer
+        // compute total size
+        uint32_t total = 0;
+        for (int i = 0; i < lineCount; ++i) total += (uint32_t)strlen(lines[i]) + 1;  // +1 for '\n'
+        uint8_t* out = (uint8_t*)malloc(total ? total : 1);
+        if (!out) {
+          Console.println("Failed to allocate buffer to save");
+        } else {
+          uint32_t off = 0;
+          for (int i = 0; i < lineCount; ++i) {
+            size_t L = strlen(lines[i]);
+            memcpy(out + off, lines[i], L);
+            off += (uint32_t)L;
+            out[off++] = '\n';
+          }
+          bool ok = activeFs.writeFile(pathArg, out, off, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
+          free(out);
+          Console.print(ok ? "Saved text to " : "Failed to save text to ");
+          Console.println(pathArg);
+        }
+      } else if (!strcmp(cmd, "p")) {
+        printCurrentTextBufferToConsole(lines, lineCount);
+      } else if (!strcmp(cmd, "a")) {
+        Console.println("Enter text to append. End with a single '.' on a line.");
+        while (true) {
+          Console.print("> ");
+          int r2 = editorReadLine(inbuf, sizeof(inbuf));
+          if (r2 < 0) {
+            Console.println("^C detected, abort append.");
+            break;
+          }
+          if (r2 == 0) continue;
+          if (!strcmp(inbuf, ".")) break;
+          if (lineCount >= EDIT_MAX_TEXT_LINES) {
+            Console.println("Text buffer full; cannot append more lines.");
+            break;
+          }
+          strncpy(lines[lineCount], inbuf, EDIT_MAX_LINE_LEN - 1);
+          lines[lineCount][EDIT_MAX_LINE_LEN - 1] = '\0';
+          lineCount++;
+        }
+      } else if (!strncmp(cmd, "i ", 2)) {
+        int after = atoi(cmd + 2);
+        if (after < 0) after = 0;
+        if (after > lineCount) after = lineCount;
+        Console.println("Enter lines to insert; end with '.' on a line.");
+        char temp[EDIT_MAX_TEXT_LINES][EDIT_MAX_LINE_LEN];
+        int addCnt = 0;
+        while (true) {
+          Console.print("> ");
+          int r2 = editorReadLine(inbuf, sizeof(inbuf));
+          if (r2 < 0) {
+            Console.println("^C detected, abort insert.");
+            break;
+          }
+          if (r2 == 0) continue;
+          if (!strcmp(inbuf, ".")) break;
+          if (addCnt >= EDIT_MAX_TEXT_LINES) {
+            Console.println("Insert buffer full; stopping.");
+            break;
+          }
+          strncpy(temp[addCnt], inbuf, EDIT_MAX_LINE_LEN - 1);
+          temp[addCnt][EDIT_MAX_LINE_LEN - 1] = '\0';
+          addCnt++;
+        }
+        if (addCnt > 0) {
+          if (lineCount + addCnt > EDIT_MAX_TEXT_LINES) {
+            Console.println("Not enough space to insert lines.");
+          } else {
+            int insertPos = after;  // 0-based
+            for (int k = lineCount - 1; k >= insertPos; --k) {
+              strncpy(lines[k + addCnt], lines[k], EDIT_MAX_LINE_LEN);
+              lines[k + addCnt][EDIT_MAX_LINE_LEN - 1] = '\0';
+            }
+            for (int j = 0; j < addCnt; ++j) {
+              strncpy(lines[insertPos + j], temp[j], EDIT_MAX_LINE_LEN);
+              lines[insertPos + j][EDIT_MAX_LINE_LEN - 1] = '\0';
+            }
+            lineCount += addCnt;
+          }
+        }
+      } else if (!strncmp(cmd, "d ", 2)) {
+        int del = atoi(cmd + 2);
+        if (del >= 1 && del <= lineCount) {
+          int idx = del - 1;
+          for (int t = idx; t < lineCount - 1; ++t) {
+            strncpy(lines[t], lines[t + 1], EDIT_MAX_LINE_LEN);
+            lines[t][EDIT_MAX_LINE_LEN - 1] = '\0';
+          }
+          lineCount--;
+          lines[lineCount][0] = '\0';
+        } else {
+          Console.println("Invalid line number to delete.");
+        }
+      } else {
+        Console.println("Unknown command. Type :h for help.");
+      }
+    } else {
+      if (lineCount >= EDIT_MAX_TEXT_LINES) {
+        Console.println("Text buffer full; cannot add more lines.");
+      } else {
+        strncpy(lines[lineCount], inbuf, EDIT_MAX_LINE_LEN - 1);
+        lines[lineCount][EDIT_MAX_LINE_LEN - 1] = '\0';
+        lineCount++;
+      }
+    }
+  }
+  // unreachable
+  return true;
+}
+
+static bool launchHexEditorInteractive(const char* path) {
+  if (!checkNameLen(path)) return false;
+  uint8_t buf[EDIT_MAX_BIN_BYTES];
+  uint32_t len = 0;
+  if (activeFs.exists(path)) {
+    uint32_t sz = 0;
+    if (!activeFs.getFileSize(path, sz)) {
+      Console.println("hexedit: getFileSize failed");
+      return false;
+    }
+    if (sz > EDIT_MAX_BIN_BYTES) {
+      Console.println("hexedit: file too large to load into editor buffer");
+      return false;
+    }
+    uint32_t got = activeFs.readFile(path, buf, sz);
+    if (got != sz) {
+      Console.println("hexedit: readFile failed");
+      return false;
+    }
+    len = sz;
+  } else {
+    len = 0;  // start empty
+  }
+
+  Console.printf(": hex editor (file: %s). Commands: show, set, fill, save <path>, q\n", path);
+  Console.println("  Ctrl-C to exit hex editor immediately");
+  char inbuf[128];
+  while (true) {
+    Console.print("hex> ");
+    int r = editorReadLine(inbuf, sizeof(inbuf));
+    if (r < 0) {
+      Console.println("^C detected, exiting hex editor.");
+      return true;
+    }
+    if (r == 0) continue;
+    if (!strcmp(inbuf, "q") || !strcmp(inbuf, "quit") || !strcmp(inbuf, "exit")) {
+      Console.println("Exiting hex editor.");
+      return true;
+    }
+    if (!strcmp(inbuf, "help")) {
+      Console.println(
+        "Hex Editor commands:\n"
+        "  show                 - dump buffer (16 bytes/line)\n"
+        "  set <off> <hex>      - set byte at offset (dec) to hex value (e.g., 1A)\n"
+        "  fill <s> <n> <hex>   - fill [s, s+n) with value hex\n"
+        "  save <path>          - write binary buffer to path\n"
+        "  q                    - quit (no auto-save)\n"
+        "Ctrl-C exits editor immediately.\n");
+      continue;
+    }
+    if (!strcmp(inbuf, "show")) {
+      for (size_t i = 0; i < len; i += 16) {
+        Console.printf("%06u: ", (unsigned)i);
+        for (size_t j = 0; j < 16 && (i + j) < len; ++j) {
+          if (j) Console.print(' ');
+          uint8_t b = buf[i + j];
+          if (b < 0x10) Console.print('0');
+          Console.print(b, HEX);
+        }
+        Console.println();
+      }
+      continue;
+    }
+    if (!strncmp(inbuf, "set ", 4)) {
+      int off = 0;
+      unsigned v = 0;
+      if (sscanf(inbuf + 4, "%d %x", &off, &v) != 2 || v > 0xFF || off < 0 || (size_t)off >= len) {
+        Console.println("Usage: set <offset> <hex>");
+        continue;
+      }
+      buf[off] = (uint8_t)v;
+      Console.println("OK");
+      continue;
+    }
+    if (!strncmp(inbuf, "fill ", 5)) {
+      int s = 0, n = 0;
+      unsigned v = 0;
+      if (sscanf(inbuf + 5, "%d %d %x", &s, &n, &v) != 3 || v > 0xFF || s < 0 || n < 0 || (size_t)(s + n) > len) {
+        Console.println("Usage: fill <start> <len> <hex>");
+        continue;
+      }
+      for (int i = 0; i < n; ++i) buf[s + i] = (uint8_t)v;
+      Console.println("OK");
+      continue;
+    }
+    if (!strncmp(inbuf, "save ", 5)) {
+      const char* pathArg = inbuf + 5;
+      bool ok = activeFs.writeFile(pathArg, buf, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
+      Console.print(ok ? "Saved hex buffer to " : "Failed to save to ");
+      Console.println(pathArg);
+      continue;
+    }
+    Console.println("Unknown command. Type 'help'.");
+  }
+  // unreachable
+  return true;
+}
+// ----------------- End editor integration -----------------
+
 static void printHelp() {
   Console.println("Commands (filename max 32 chars):");
   Console.println("  help                         - this help");
@@ -975,6 +1306,13 @@ static void printHelp() {
   Console.println("  puthex <file> <hex>          - upload binary as hex string (single line)");
   Console.println("  putb64 <file> <base64>       - upload binary as base64 (single line)");
   Console.println("  cc <src> <dst>               - compile Tiny-C source file to raw ARM Thumb-1 binary");
+  Console.println();
+  Console.println("Editor commands (text/hex editors use ActiveFS):");
+  Console.println("  edit <file>                  - open simple ED-like text editor for <file>");
+  Console.println("                                 commands in editor: :q, :w <path>, :p, :a, :i N, :d N, :h");
+  Console.println("                                 Ctrl-C exits the editor immediately.");
+  Console.println("  hexedit <file>               - open simple hex editor for <file>");
+  Console.println("                                 commands in editor: show, set, fill, save <path>, q");
   Console.println();
   Console.println("Co-Processor (serial RPC) commands:");
   Console.println("  coproc ping                  - HELLO (version/features)");
@@ -1470,6 +1808,26 @@ static void handleCommand(char* line) {
     if (!compileTinyCFileToFile(src, dst)) {
       Console.println("cc: failed");
     }
+  } else if (!strcmp(t0, "edit")) {
+    char* fn;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: edit <file>");
+      return;
+    }
+    if (!checkNameLen(fn)) return;
+    Console.printf("Opening text editor for '%s'...\n", fn);
+    launchTextEditorInteractive(fn);
+    Console.println("Returned to console.");
+  } else if (!strcmp(t0, "hexedit")) {
+    char* fn;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: hexedit <file>");
+      return;
+    }
+    if (!checkNameLen(fn)) return;
+    Console.printf("Opening hex editor for '%s'...\n", fn);
+    launchHexEditorInteractive(fn);
+    Console.println("Returned to console.");
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
