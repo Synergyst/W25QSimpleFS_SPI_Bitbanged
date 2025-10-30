@@ -62,15 +62,18 @@ struct BlobReg;               // Forward declaration
 static ConsolePrint Console;  // Console wrapper
 // ------- MC Compiiler -------
 #include "MCCompiler.h"
-// ------- Text Editor -------
+// ------- Text Editor (legacy header; not used directly now) -------
 #include "TextEditor.h"
+
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
+
 // ========== bitbang pin definitions (flash) ==========
 const uint8_t PIN_FLASH_MISO = 12;  // GP12
 const uint8_t PIN_FLASH_CS = 28;    // GP28
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_FLASH_MOSI = 11;  // GP11
+
 // ========== bitbang pin definitions (psram) ==========
 const bool PSRAM_ENABLE_QPI = false;     // Should we enable the PSRAM QPI-mode?
 const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // Small delay helps ensure decoder/address settle before EN
@@ -83,6 +86,7 @@ const uint8_t PIN_138_A1 = 7;     // 74HC138 pin 2 (A1)
 const uint8_t PIN_138_EN = 9;     // 74HC138 pins 4+5 (G2A/G2B tied), 10k pull-up to 3.3V
 const uint8_t PIN_138_A2 = 255;   // 255 means "not used"; tie 74HC138 pin 3 (A2) to GND
 const uint8_t PIN_595_LATCH = 4;  // 595.RCLK (unused in 138-only mode)
+
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 const size_t PERSIST_LEN = 32;
 enum class StorageBackend {
@@ -98,6 +102,7 @@ W25QSimpleFS fsFlash(flashBB);
 PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
 static bool g_dev_mode = true;
+
 // ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -120,6 +125,7 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
+
 static void bindActiveFs(StorageBackend backend) {
   if (backend == StorageBackend::Flash) {
     activeFs.mount = [](bool b) {
@@ -221,6 +227,7 @@ static void bindActiveFs(StorageBackend backend) {
     };
   }
 }
+
 // ========== Blob registry ==========
 struct BlobReg {
   const char* id;
@@ -237,16 +244,21 @@ static const BlobReg g_blobs[] = {
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
+
 // ========== helpers using Console ==========
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
   Console.print(b, HEX);
 }
+
 // ========== Return mailbox reservation (Scratch) ==========
-extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
+extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
+int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
+
 // ================= New: ExecHost header =================
 #include "ExecHost.h"
 static ExecHost Exec;
+
 // Helper to supply Exec with current FS function pointers
 static void updateExecFsTable() {
   ExecFSTable t{};
@@ -261,6 +273,7 @@ static void updateExecFsTable() {
   t.deleteFile = activeFs.deleteFile;
   Exec.attachFS(t);
 }
+
 // ========== FS helpers and console (unchanged) ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -394,6 +407,7 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
+
 // ========== PSRAM smoke test (unchanged) ==========
 static bool psramSafeSmokeTest() {
   if (g_storage != StorageBackend::PSRAM_BACKEND) {
@@ -403,7 +417,6 @@ static bool psramSafeSmokeTest() {
   const uint32_t UPDATE_STEP_PERCENT = 5;
   const uint32_t MAX_SLOTS = 2044;
   const uint32_t PAGE = 256;
-  const bool VERIFY_READBACK = true;  // kept local
   if (UPDATE_STEP_PERCENT == 0 || (100 % UPDATE_STEP_PERCENT) != 0) {
     Console.println("psramSafeSmokeTest: UPDATE_STEP_PERCENT must divide 100 evenly");
     return false;
@@ -518,16 +531,14 @@ static bool psramSafeSmokeTest() {
         Console.printf("  write failed for slot %u at offset %u\n", (unsigned)i, (unsigned)slotWritten);
         return false;
       }
-      if (true) {
-        memset(readbuf, 0, sizeof(readbuf));
-        if (!psramBB.readData03(addr + slotWritten, readbuf, n)) {
-          Console.printf("  readback failed for slot %u at offset %u\n", (unsigned)i, (unsigned)slotWritten);
-          return false;
-        }
-        if (memcmp(readbuf, page, n) != 0) {
-          Console.printf("  verify mismatch slot %u offset %u\n", (unsigned)i, (unsigned)slotWritten);
-          return false;
-        }
+      memset(readbuf, 0, sizeof(readbuf));
+      if (!psramBB.readData03(addr + slotWritten, readbuf, n)) {
+        Console.printf("  readback failed for slot %u at offset %u\n", (unsigned)i, (unsigned)slotWritten);
+        return false;
+      }
+      if (memcmp(readbuf, page, n) != 0) {
+        Console.printf("  verify mismatch slot %u offset %u\n", (unsigned)i, (unsigned)slotWritten);
+        return false;
       }
       slotWritten += n;
       totalWritten += n;
@@ -549,6 +560,7 @@ static bool psramSafeSmokeTest() {
   Console.printf("Total bytes written (approx): %llu\n", (unsigned long long)totalWritten);
   return true;
 }
+
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -664,6 +676,7 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
+
 // ========== New: compile Tiny-C source file -> raw Thumb binary on FS ==========
 static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos) {
   const size_t CONTEXT = 40;
@@ -707,8 +720,8 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     return false;
   }
   srcBuf[srcSize] = 0;
-  // Prepare output buffer (rough upper bound: small compiler, but be generous)
-  uint32_t outCap = (srcSize * 12u) + 256u;  // tiny code generator; literals pool small
+  // Prepare output buffer
+  uint32_t outCap = (srcSize * 12u) + 256u;
   if (outCap < 512u) outCap = 512u;
   uint8_t* outBuf = (uint8_t*)malloc(outCap);
   if (!outBuf) {
@@ -747,6 +760,7 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
   free(srcBuf);
   return ok;
 }
+
 // ===================== Co-Processor RPC helpers (for CMD_FUNC) =====================
 static uint32_t g_coproc_seq = 1;
 static bool coprocWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
@@ -862,7 +876,6 @@ static bool coprocCallFunc(const char* name, const int32_t* argv, uint32_t argc,
       uint8_t buf[16];
       if (resp.len > sizeof(buf)) {
         Console.println("coproc func: resp too large");
-        // Drain anyway
         uint32_t left = resp.len;
         uint8_t sink[32];
         while (left) {
@@ -907,22 +920,65 @@ static bool coprocCallFunc(const char* name, const int32_t* argv, uint32_t argc,
     }
   }
 }
+
 // ========== Serial console / command handling ==========
+
+// Cooked console line input with echo, backspace handling, and CR/LF normalization.
+// This fixes lack of echo in terminal emulators and supports Windows CRLF.
 static char lineBuf[FS_SECTOR_SIZE];
 static bool readLine() {
   static size_t pos = 0;
   while (Serial.available()) {
-    char c = (char)Serial.read();
-    //if (c == '\r') continue;
-    if (c == '\n' || c== '\r') {
+    int ic = Serial.read();
+    if (ic < 0) break;
+    char c = (char)ic;
+
+    // Handle Windows CRLF and Unix LF
+    if (c == '\r' || c == '\n') {
+      // Swallow paired LF after CR for Windows
+      if (c == '\r') {
+        if (Serial.available()) {
+          int p = Serial.peek();
+          if (p == '\n') Serial.read();
+        }
+      }
+      // Echo newline to terminal
+      Serial.write('\r');
+      Serial.write('\n');
       lineBuf[pos] = 0;
       pos = 0;
       return true;
     }
-    if (pos + 1 < sizeof(lineBuf)) lineBuf[pos++] = c;
+
+    // Backspace / Delete
+    if ((c == 0x08) || (c == 0x7F)) {
+      if (pos > 0) {
+        pos--;
+        // Erase char visually: backspace, space, backspace
+        Serial.write('\b');
+        Serial.write(' ');
+        Serial.write('\b');
+      }
+      continue;
+    }
+
+    // Printable ASCII
+    if (c >= 32 && c <= 126) {
+      if (pos + 1 < sizeof(lineBuf)) {
+        lineBuf[pos++] = c;
+        Serial.write(c);  // echo
+      } else {
+        // Optional: bell on overflow
+        Serial.write('\a');
+      }
+      continue;
+    }
+
+    // Ignore other control bytes
   }
   return false;
 }
+
 static int nextToken(char*& p, char*& tok) {
   while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
   if (!*p) {
@@ -937,342 +993,524 @@ static int nextToken(char*& p, char*& tok) {
   }
   return 1;
 }
-// ----------------- New editor integration (text + hex) -----------------
-//
-// We implement simple interactive editors that use activeFs for file I/O and Console for I/O.
-// They are intentionally minimal (ED-like) but integrate with your ActiveFS implementation.
-// They are blocking (synchronously read Serial) while active; they poll Exec.pollBackground()
-// occasionally to keep background processing alive.
-//
-// Hotkey: Ctrl-C (ASCII 3) will exit the editor immediately (acts like :q).
-//
-#define EDIT_MAX_TEXT_LINES 512
-#define EDIT_MAX_LINE_LEN 128
-#define EDIT_MAX_BIN_BYTES 4096
 
-static int editorReadLine(char* out, int max) {
-  // Blocks until newline received or Ctrl-C (ASCII 3).
-  // Returns:
-  //  -1 on Ctrl-C (immediate)
-  //   0 on error / no input (shouldn't happen)
-  //  >0 length of line (no newline, nul-terminated)
-  int pos = 0;
-  while (true) {
-    // Keep background tasks alive while waiting for input
-    Exec.pollBackground();
-    if (Serial.available()) {
-      int c = Serial.read();
-      if (c < 0) continue;
-      if (c == 3) {  // Ctrl-C
-        return -1;
-      }
-      if (c == '\r') continue;
-      if (c == '\n') {
-        out[pos] = '\0';
-        return pos;
-      }
-      if (pos + 1 < max) {
-        out[pos++] = (char)c;
-      } else {
-        // drop extra chars
-      }
+// ----------------- Nano-like editor integration -----------------
+namespace Term {
+static inline void write(const char* s) {
+  if (s) Serial.print(s);
+}
+static inline void writeChar(char c) {
+  Serial.write((uint8_t)c);
+}
+static inline void clear() {
+  write("\x1b[2J\x1b[H");
+}
+static inline void hideCursor() {
+  write("\x1b[?25l");
+}
+static inline void showCursor() {
+  write("\x1b[?25h");
+}
+static inline void move(int row1, int col1) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", row1, col1);
+  write(buf);
+}
+static inline void clrEol() {
+  write("\x1b[K");
+}
+static inline void invertOn() {
+  write("\x1b[7m");
+}
+static inline void invertOff() {
+  write("\x1b[0m");
+}
+}
+
+struct NanoEditor {
+  static const int MAX_LINES = 512;
+  static const int MAX_COLS = 256;    // allow longer lines than console view
+  static const int SCREEN_ROWS = 24;  // assume 80x24 terminal
+  static const int SCREEN_COLS = 80;
+
+  char lines[MAX_LINES][MAX_COLS];
+  int lineCount = 0;
+  int cx = 0;       // cursor x in current line (column, 0-based)
+  int cy = 0;       // cursor y (line index, 0-based)
+  int rowOff = 0;   // topmost visible line
+  int colOff = 0;   // leftmost visible column
+  int prefCol = 0;  // preferred column for up/down
+  bool modified = false;
+  char filename[ActiveFS::MAX_NAME + 1];
+
+  // Load file (UTF-8 treated as bytes)
+  bool load(const char* path) {
+    filename[0] = 0;
+    if (path) {
+      strncpy(filename, path, sizeof(filename) - 1);
+      filename[sizeof(filename) - 1] = 0;
+    }
+    lineCount = 0;
+    if (!path || !activeFs.exists(path)) {
+      lineCount = 1;
+      lines[0][0] = 0;
+      cx = cy = rowOff = colOff = prefCol = 0;
+      modified = false;
+      return true;
+    }
+    uint32_t sz = 0;
+    if (!activeFs.getFileSize(path, sz)) return false;
+    char* tmp = (char*)malloc(sz + 1);
+    if (!tmp) return false;
+    uint32_t got = activeFs.readFile(path, (uint8_t*)tmp, sz);
+    if (got != sz) {
+      free(tmp);
+      return false;
+    }
+    tmp[sz] = 0;
+    char* p = tmp;
+    while (*p && lineCount < MAX_LINES) {
+      char* e = p;
+      while (*e && *e != '\n' && *e != '\r') ++e;
+      int L = (int)(e - p);
+      if (L >= MAX_COLS) L = MAX_COLS - 1;
+      memcpy(lines[lineCount], p, L);
+      lines[lineCount][L] = 0;
+      lineCount++;
+      while (*e == '\n' || *e == '\r') ++e;
+      p = e;
+    }
+    if (lineCount == 0) {
+      lineCount = 1;
+      lines[0][0] = 0;
+    }
+    free(tmp);
+    cx = cy = rowOff = colOff = prefCol = 0;
+    modified = false;
+    return true;
+  }
+
+  // Save to ActiveFS
+  bool saveAs(const char* path) {
+    if (!path || !checkNameLen(path)) return false;
+    // join lines
+    uint32_t total = 0;
+    for (int i = 0; i < lineCount; ++i) total += (uint32_t)strlen(lines[i]) + 1;
+    uint8_t* out = (uint8_t*)malloc(total ? total : 1);
+    if (!out) return false;
+    uint32_t off = 0;
+    for (int i = 0; i < lineCount; ++i) {
+      size_t L = strlen(lines[i]);
+      memcpy(out + off, lines[i], L);
+      off += (uint32_t)L;
+      out[off++] = '\n';
+    }
+    bool ok = activeFs.writeFile(path, out, off, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
+    free(out);
+    if (ok) {
+      strncpy(filename, path, sizeof(filename) - 1);
+      filename[sizeof(filename) - 1] = 0;
+      modified = false;
+    }
+    return ok;
+  }
+
+  // UI
+  void drawStatus(const char* msg) {
+    Term::move(SCREEN_ROWS - 1, 1);
+    Term::invertOn();
+    // status line
+    char status[128];
+    snprintf(status, sizeof(status), " %s %s  Ln %d, Col %d  %s",
+             "Nano-like Editor",
+             filename[0] ? filename : "[No Name]",
+             cy + 1, cx + 1,
+             modified ? "(modified)" : "");
+    Serial.print(status);
+    Term::clrEol();
+    Term::invertOff();
+    // help bar
+    Term::move(SCREEN_ROWS, 1);
+    Serial.print("^X Exit  ^C Pos  Arrows Move  Backspace/Delete Edit  Enter Newline");
+    Term::clrEol();
+    // message (overlay above help bar if provided)
+    if (msg && *msg) {
+      Term::move(SCREEN_ROWS - 2, 1);
+      Serial.print(msg);
+      Term::clrEol();
     } else {
+      Term::move(SCREEN_ROWS - 2, 1);
+      Term::clrEol();
+    }
+  }
+  void drawRows() {
+    // Draw from row 1 to SCREEN_ROWS-2 (reserve bottom 2 rows for bars)
+    int usable = SCREEN_ROWS - 2;
+    for (int i = 0; i < usable; ++i) {
+      int fileRow = rowOff + i;
+      Term::move(1 + i, 1);
+      Term::clrEol();
+      if (fileRow >= lineCount) {
+        Serial.print("~");
+      } else {
+        const char* s = lines[fileRow];
+        int len = (int)strlen(s);
+        if (len > colOff) {
+          const char* p = s + colOff;
+          int toShow = len - colOff;
+          if (toShow < 0) toShow = 0;
+          if (toShow > SCREEN_COLS) toShow = SCREEN_COLS;
+          Serial.write((const uint8_t*)p, toShow);
+        }
+      }
+    }
+  }
+  void refresh(const char* msg = nullptr) {
+    Term::hideCursor();
+    Term::move(1, 1);
+    drawRows();
+    drawStatus(msg);
+    // place cursor
+    int crow = cy - rowOff + 1;
+    int ccol = cx - colOff + 1;
+    if (crow < 1) crow = 1;
+    if (ccol < 1) ccol = 1;
+    if (crow > SCREEN_ROWS - 2) crow = SCREEN_ROWS - 2;
+    if (ccol > SCREEN_COLS) ccol = SCREEN_COLS;
+    Term::move(crow, ccol);
+    Term::showCursor();
+  }
+
+  // Editing actions
+  void moveLeft() {
+    if (cx > 0) {
+      cx--;
+      prefCol = cx;
+      return;
+    }
+    if (cy > 0) {
+      cy--;
+      cx = (int)strlen(lines[cy]);
+      prefCol = cx;
+      if (rowOff > cy) rowOff = cy;
+      ensureCursorVisible();
+    }
+  }
+  void moveRight() {
+    int L = (int)strlen(lines[cy]);
+    if (cx < L) {
+      cx++;
+      prefCol = cx;
+      ensureCursorVisible();
+      return;
+    }
+    if (cy + 1 < lineCount) {
+      cy++;
+      cx = 0;
+      prefCol = cx;
+      ensureCursorVisible();
+    }
+  }
+  void moveUp() {
+    if (cy > 0) cy--;
+    int L = (int)strlen(lines[cy]);
+    if (prefCol > L) cx = L;
+    else cx = prefCol;
+    ensureCursorVisible();
+  }
+  void moveDown() {
+    if (cy + 1 < lineCount) cy++;
+    int L = (int)strlen(lines[cy]);
+    if (prefCol > L) cx = L;
+    else cx = prefCol;
+    ensureCursorVisible();
+  }
+  void ensureCursorVisible() {
+    // Horizontal
+    if (cx < colOff) colOff = cx;
+    if (cx >= colOff + SCREEN_COLS) colOff = cx - SCREEN_COLS + 1;
+    // Vertical
+    if (cy < rowOff) rowOff = cy;
+    if (cy >= rowOff + (SCREEN_ROWS - 2)) rowOff = cy - (SCREEN_ROWS - 2) + 1;
+  }
+  void insertChar(char c) {
+    char* line = lines[cy];
+    int L = (int)strlen(line);
+    if (L >= MAX_COLS - 1) return;  // full, ignore
+    if (cx > L) cx = L;
+    // shift right
+    for (int i = L; i >= cx; --i) line[i + 1] = line[i];
+    line[cx] = c;
+    cx++;
+    prefCol = cx;
+    modified = true;
+    ensureCursorVisible();
+  }
+  void backspace() {
+    if (cx > 0) {
+      char* line = lines[cy];
+      int L = (int)strlen(line);
+      for (int i = cx - 1; i < L; ++i) line[i] = line[i + 1];
+      cx--;
+      prefCol = cx;
+      modified = true;
+      return;
+    }
+    // at start of line: join with previous if any
+    if (cy > 0) {
+      int prevL = (int)strlen(lines[cy - 1]);
+      int curL = (int)strlen(lines[cy]);
+      int canCopy = min(MAX_COLS - 1 - prevL, curL);
+      // append as much as fits
+      memcpy(lines[cy - 1] + prevL, lines[cy], canCopy);
+      lines[cy - 1][prevL + canCopy] = 0;
+      // remove this line
+      for (int i = cy; i < lineCount - 1; ++i) {
+        strcpy(lines[i], lines[i + 1]);
+      }
+      lineCount--;
+      cy--;
+      cx = prevL;
+      prefCol = cx;
+      modified = true;
+      ensureCursorVisible();
+    }
+  }
+  void delChar() {
+    char* line = lines[cy];
+    int L = (int)strlen(line);
+    if (cx < L) {
+      for (int i = cx; i < L; ++i) line[i] = line[i + 1];
+      modified = true;
+      return;
+    }
+    // at end of line: join with next line
+    if (cy + 1 < lineCount) {
+      int curL = (int)strlen(lines[cy]);
+      int nextL = (int)strlen(lines[cy + 1]);
+      int canCopy = min(MAX_COLS - 1 - curL, nextL);
+      memcpy(lines[cy] + curL, lines[cy + 1], canCopy);
+      lines[cy][curL + canCopy] = 0;
+      // shift lines up
+      for (int i = cy + 1; i < lineCount - 1; ++i) {
+        strcpy(lines[i], lines[i + 1]);
+      }
+      lineCount--;
+      modified = true;
+    }
+  }
+  void newline() {
+    if (lineCount >= MAX_LINES) return;
+    char* line = lines[cy];
+    int L = (int)strlen(line);
+    // split at cx
+    char tail[MAX_COLS];
+    int tailLen = (cx < L) ? (L - cx) : 0;
+    if (tailLen > 0) {
+      memcpy(tail, line + cx, tailLen);
+    }
+    tail[tailLen] = 0;
+    line[cx] = 0;  // truncate current
+    // shift lines down to insert
+    for (int i = lineCount; i > cy + 1; --i) {
+      strcpy(lines[i], lines[i - 1]);
+    }
+    strcpy(lines[cy + 1], tail);
+    lineCount++;
+    cy++;
+    cx = 0;
+    prefCol = 0;
+    modified = true;
+    ensureCursorVisible();
+  }
+
+  // read a key, parsing ESC sequences for arrows and delete
+  int readKey() {
+    for (;;) {
+      if (Serial.available() > 0) {
+        int ch = Serial.read();
+        if (ch == '\r') {
+          // swallow optional '\n'
+          if (Serial.available() && Serial.peek() == '\n') Serial.read();
+          return '\n';
+        }
+        if (ch == 0x1B) {  // ESC
+          // parse CSI
+          while (!Serial.available()) {
+            Exec.pollBackground();
+            tight_loop_contents();
+            yield();
+          }
+          int ch1 = Serial.read();
+          if (ch1 == '[') {
+            while (!Serial.available()) {
+              Exec.pollBackground();
+              tight_loop_contents();
+              yield();
+            }
+            int ch2 = Serial.read();
+            if (ch2 == 'A') return 1000;  // up
+            if (ch2 == 'B') return 1001;  // down
+            if (ch2 == 'C') return 1002;  // right
+            if (ch2 == 'D') return 1003;  // left
+            if (ch2 == '3') {
+              // expect ~
+              while (!Serial.available()) {
+                Exec.pollBackground();
+                tight_loop_contents();
+                yield();
+              }
+              int tilde = Serial.read();
+              if (tilde == '~') return 1004;  // delete
+            }
+            // ignore other CSI
+            return -1;
+          } else {
+            // lone ESC or other sequences: ignore
+            return -1;
+          }
+        }
+        return ch;
+      }
+      Exec.pollBackground();
       tight_loop_contents();
       yield();
     }
   }
-  return 0;
-}
 
-static void printCurrentTextBufferToConsole(char bufLines[EDIT_MAX_TEXT_LINES][EDIT_MAX_LINE_LEN], int lineCount) {
-  for (int i = 0; i < lineCount; ++i) {
-    Console.printf("%d: %s\n", i + 1, bufLines[i]);
+  // prompt Yes/No, returns 1 for yes, 0 for no, -1 for cancel (Esc)
+  int promptYesNo(const char* q) {
+    refresh(q);
+    for (;;) {
+      int k = readKey();
+      if (k == 'y' || k == 'Y') return 1;
+      if (k == 'n' || k == 'N') return 0;
+      if (k == 27) return -1;
+    }
   }
-}
-
-static bool launchTextEditorInteractive(const char* path) {
-  if (!checkNameLen(path)) return false;
-  // Load file (if exists)
-  char lines[EDIT_MAX_TEXT_LINES][EDIT_MAX_LINE_LEN];
-  int lineCount = 0;
-  if (activeFs.exists(path)) {
-    uint32_t sz = 0;
-    if (!activeFs.getFileSize(path, sz)) {
-      Console.println("edit: getFileSize failed");
-      return false;
-    }
-    if (sz > 0) {
-      char* tmp = (char*)malloc((size_t)sz + 1);
-      if (!tmp) {
-        Console.println("edit: malloc failed");
-        return false;
-      }
-      uint32_t got = activeFs.readFile(path, (uint8_t*)tmp, sz);
-      if (got != sz) {
-        Console.println("edit: readFile failed");
-        free(tmp);
-        return false;
-      }
-      tmp[sz] = '\0';
-      // Split into lines
-      char* p = tmp;
-      while (*p && lineCount < EDIT_MAX_TEXT_LINES) {
-        char* eol = p;
-        while (*eol && *eol != '\n' && *eol != '\r') ++eol;
-        int len = (int)(eol - p);
-        if (len >= EDIT_MAX_LINE_LEN) len = EDIT_MAX_LINE_LEN - 1;
-        memcpy(lines[lineCount], p, len);
-        lines[lineCount][len] = '\0';
-        ++lineCount;
-        // skip newline(s)
-        while (*eol == '\n' || *eol == '\r') ++eol;
-        p = eol;
-      }
-      free(tmp);
-    }
-  } else {
-    // start with empty buffer
-    lineCount = 0;
-  }
-
-  Console.printf(": text editor (file: %s). Commands: :q, :w <path>, :p, :a, :i N, :d N, :h\n", path);
-  Console.println("  Ctrl-C to exit editor immediately");
-  char inbuf[256];
-  while (true) {
-    Console.print("ed> ");
-    int r = editorReadLine(inbuf, sizeof(inbuf));
-    if (r < 0) {
-      Console.println("^C detected, exiting editor.");
-      return true;
-    }
-    if (r == 0) continue;
-    if (inbuf[0] == ':') {
-      const char* cmd = inbuf + 1;
-      if (!strcmp(cmd, "q") || !strcmp(cmd, "quit")) {
-        Console.println("Exiting text editor.");
+  // prompt for filename (default shown), return true if got a name in out
+  bool promptFilename(char* out, size_t outCap) {
+    char buf[ActiveFS::MAX_NAME + 1];
+    buf[0] = 0;
+    if (filename[0]) strncpy(buf, filename, sizeof(buf) - 1);
+    size_t len = strlen(buf);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "File Name to Write: %s", buf);
+    refresh(msg);
+    for (;;) {
+      int k = readKey();
+      if (k == '\n') {
+        if (len == 0) return false;
+        strncpy(out, buf, outCap - 1);
+        out[outCap - 1] = 0;
         return true;
-      } else if (!strcmp(cmd, "h") || !strcmp(cmd, "help")) {
-        Console.println(
-          "Text Editor commands:\n"
-          "  :q or :quit        - exit editor (without saving)\n"
-          "  :w <path>          - save text to path\n"
-          "  :p                 - print current content\n"
-          "  :a                 - append lines until '.' on a line\n"
-          "  :i N               - insert after line N; then lines until '.'\n"
-          "  :d N               - delete line N (1-based)\n"
-          "  :h or :help        - show this help\n"
-          "Ctrl-C exits editor immediately.\n");
-      } else if (!strncmp(cmd, "w ", 2)) {
-        const char* pathArg = cmd + 2;
-        // join lines into single buffer
-        // compute total size
-        uint32_t total = 0;
-        for (int i = 0; i < lineCount; ++i) total += (uint32_t)strlen(lines[i]) + 1;  // +1 for '\n'
-        uint8_t* out = (uint8_t*)malloc(total ? total : 1);
-        if (!out) {
-          Console.println("Failed to allocate buffer to save");
-        } else {
-          uint32_t off = 0;
-          for (int i = 0; i < lineCount; ++i) {
-            size_t L = strlen(lines[i]);
-            memcpy(out + off, lines[i], L);
-            off += (uint32_t)L;
-            out[off++] = '\n';
-          }
-          bool ok = activeFs.writeFile(pathArg, out, off, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
-          free(out);
-          Console.print(ok ? "Saved text to " : "Failed to save text to ");
-          Console.println(pathArg);
+      } else if (k == 27) {
+        return false;
+      } else if (k == 0x08 || k == 0x7F) {
+        if (len > 0) {
+          buf[--len] = 0;
         }
-      } else if (!strcmp(cmd, "p")) {
-        printCurrentTextBufferToConsole(lines, lineCount);
-      } else if (!strcmp(cmd, "a")) {
-        Console.println("Enter text to append. End with a single '.' on a line.");
-        while (true) {
-          Console.print("> ");
-          int r2 = editorReadLine(inbuf, sizeof(inbuf));
-          if (r2 < 0) {
-            Console.println("^C detected, abort append.");
-            break;
-          }
-          if (r2 == 0) continue;
-          if (!strcmp(inbuf, ".")) break;
-          if (lineCount >= EDIT_MAX_TEXT_LINES) {
-            Console.println("Text buffer full; cannot append more lines.");
-            break;
-          }
-          strncpy(lines[lineCount], inbuf, EDIT_MAX_LINE_LEN - 1);
-          lines[lineCount][EDIT_MAX_LINE_LEN - 1] = '\0';
-          lineCount++;
+      } else if (k >= 32 && k <= 126) {
+        if (len + 1 < sizeof(buf)) {
+          buf[len++] = (char)k;
+          buf[len] = 0;
         }
-      } else if (!strncmp(cmd, "i ", 2)) {
-        int after = atoi(cmd + 2);
-        if (after < 0) after = 0;
-        if (after > lineCount) after = lineCount;
-        Console.println("Enter lines to insert; end with '.' on a line.");
-        char temp[EDIT_MAX_TEXT_LINES][EDIT_MAX_LINE_LEN];
-        int addCnt = 0;
-        while (true) {
-          Console.print("> ");
-          int r2 = editorReadLine(inbuf, sizeof(inbuf));
-          if (r2 < 0) {
-            Console.println("^C detected, abort insert.");
-            break;
+      }
+      snprintf(msg, sizeof(msg), "File Name to Write: %s", buf);
+      refresh(msg);
+    }
+  }
+
+  bool run() {
+    Term::clear();
+    refresh("Welcome to Nano-like editor. ^X exit, ^C cursor pos");
+    for (;;) {
+      int k = readKey();
+      if (k == 3) {  // Ctrl-C -> show pos
+        char m[64];
+        snprintf(m, sizeof(m), "Cursor position: Ln %d, Col %d", cy + 1, cx + 1);
+        refresh(m);
+        continue;
+      }
+      if (k == 24) {  // Ctrl-X -> prompt save then exit
+        int ans = modified ? promptYesNo("Save modified buffer? (Y/N)") : 0;
+        if (ans == 1) {
+          char outname[ActiveFS::MAX_NAME + 1];
+          if (!promptFilename(outname, sizeof(outname))) {
+            refresh("Save canceled.");
+            continue;  // cancel save, stay
           }
-          if (r2 == 0) continue;
-          if (!strcmp(inbuf, ".")) break;
-          if (addCnt >= EDIT_MAX_TEXT_LINES) {
-            Console.println("Insert buffer full; stopping.");
-            break;
+          if (!checkNameLen(outname)) {
+            refresh("Error: filename too long.");
+            continue;
           }
-          strncpy(temp[addCnt], inbuf, EDIT_MAX_LINE_LEN - 1);
-          temp[addCnt][EDIT_MAX_LINE_LEN - 1] = '\0';
-          addCnt++;
-        }
-        if (addCnt > 0) {
-          if (lineCount + addCnt > EDIT_MAX_TEXT_LINES) {
-            Console.println("Not enough space to insert lines.");
+          if (saveAs(outname)) {
+            refresh("Wrote file. Exiting.");
           } else {
-            int insertPos = after;  // 0-based
-            for (int k = lineCount - 1; k >= insertPos; --k) {
-              strncpy(lines[k + addCnt], lines[k], EDIT_MAX_LINE_LEN);
-              lines[k + addCnt][EDIT_MAX_LINE_LEN - 1] = '\0';
-            }
-            for (int j = 0; j < addCnt; ++j) {
-              strncpy(lines[insertPos + j], temp[j], EDIT_MAX_LINE_LEN);
-              lines[insertPos + j][EDIT_MAX_LINE_LEN - 1] = '\0';
-            }
-            lineCount += addCnt;
+            refresh("Write failed! Press any key to continue.");
+            (void)readKey();
           }
         }
-      } else if (!strncmp(cmd, "d ", 2)) {
-        int del = atoi(cmd + 2);
-        if (del >= 1 && del <= lineCount) {
-          int idx = del - 1;
-          for (int t = idx; t < lineCount - 1; ++t) {
-            strncpy(lines[t], lines[t + 1], EDIT_MAX_LINE_LEN);
-            lines[t][EDIT_MAX_LINE_LEN - 1] = '\0';
-          }
-          lineCount--;
-          lines[lineCount][0] = '\0';
-        } else {
-          Console.println("Invalid line number to delete.");
-        }
-      } else {
-        Console.println("Unknown command. Type :h for help.");
+        // if ans == 0 (No) or not modified, exit without saving
+        Term::clear();
+        Term::showCursor();
+        return true;
       }
-    } else {
-      if (lineCount >= EDIT_MAX_TEXT_LINES) {
-        Console.println("Text buffer full; cannot add more lines.");
-      } else {
-        strncpy(lines[lineCount], inbuf, EDIT_MAX_LINE_LEN - 1);
-        lines[lineCount][EDIT_MAX_LINE_LEN - 1] = '\0';
-        lineCount++;
-      }
-    }
-  }
-  // unreachable
-  return true;
-}
-
-static bool launchHexEditorInteractive(const char* path) {
-  if (!checkNameLen(path)) return false;
-  uint8_t buf[EDIT_MAX_BIN_BYTES];
-  uint32_t len = 0;
-  if (activeFs.exists(path)) {
-    uint32_t sz = 0;
-    if (!activeFs.getFileSize(path, sz)) {
-      Console.println("hexedit: getFileSize failed");
-      return false;
-    }
-    if (sz > EDIT_MAX_BIN_BYTES) {
-      Console.println("hexedit: file too large to load into editor buffer");
-      return false;
-    }
-    uint32_t got = activeFs.readFile(path, buf, sz);
-    if (got != sz) {
-      Console.println("hexedit: readFile failed");
-      return false;
-    }
-    len = sz;
-  } else {
-    len = 0;  // start empty
-  }
-
-  Console.printf(": hex editor (file: %s). Commands: show, set, fill, save <path>, q\n", path);
-  Console.println("  Ctrl-C to exit hex editor immediately");
-  char inbuf[128];
-  while (true) {
-    Console.print("hex> ");
-    int r = editorReadLine(inbuf, sizeof(inbuf));
-    if (r < 0) {
-      Console.println("^C detected, exiting hex editor.");
-      return true;
-    }
-    if (r == 0) continue;
-    if (!strcmp(inbuf, "q") || !strcmp(inbuf, "quit") || !strcmp(inbuf, "exit")) {
-      Console.println("Exiting hex editor.");
-      return true;
-    }
-    if (!strcmp(inbuf, "help")) {
-      Console.println(
-        "Hex Editor commands:\n"
-        "  show                 - dump buffer (16 bytes/line)\n"
-        "  set <off> <hex>      - set byte at offset (dec) to hex value (e.g., 1A)\n"
-        "  fill <s> <n> <hex>   - fill [s, s+n) with value hex\n"
-        "  save <path>          - write binary buffer to path\n"
-        "  q                    - quit (no auto-save)\n"
-        "Ctrl-C exits editor immediately.\n");
-      continue;
-    }
-    if (!strcmp(inbuf, "show")) {
-      for (size_t i = 0; i < len; i += 16) {
-        Console.printf("%06u: ", (unsigned)i);
-        for (size_t j = 0; j < 16 && (i + j) < len; ++j) {
-          if (j) Console.print(' ');
-          uint8_t b = buf[i + j];
-          if (b < 0x10) Console.print('0');
-          Console.print(b, HEX);
-        }
-        Console.println();
-      }
-      continue;
-    }
-    if (!strncmp(inbuf, "set ", 4)) {
-      int off = 0;
-      unsigned v = 0;
-      if (sscanf(inbuf + 4, "%d %x", &off, &v) != 2 || v > 0xFF || off < 0 || (size_t)off >= len) {
-        Console.println("Usage: set <offset> <hex>");
+      if (k == '\n') {
+        newline();
+        refresh(nullptr);
         continue;
       }
-      buf[off] = (uint8_t)v;
-      Console.println("OK");
-      continue;
-    }
-    if (!strncmp(inbuf, "fill ", 5)) {
-      int s = 0, n = 0;
-      unsigned v = 0;
-      if (sscanf(inbuf + 5, "%d %d %x", &s, &n, &v) != 3 || v > 0xFF || s < 0 || n < 0 || (size_t)(s + n) > len) {
-        Console.println("Usage: fill <start> <len> <hex>");
+      if (k == 1000) {
+        moveUp();
+        refresh(nullptr);
         continue;
       }
-      for (int i = 0; i < n; ++i) buf[s + i] = (uint8_t)v;
-      Console.println("OK");
-      continue;
+      if (k == 1001) {
+        moveDown();
+        refresh(nullptr);
+        continue;
+      }
+      if (k == 1002) {
+        moveRight();
+        refresh(nullptr);
+        continue;
+      }
+      if (k == 1003) {
+        moveLeft();
+        refresh(nullptr);
+        continue;
+      }
+      if (k == 1004) {
+        delChar();
+        refresh(nullptr);
+        continue;
+      }
+      if (k == 0x08 || k == 0x7F) {
+        backspace();
+        refresh(nullptr);
+        continue;
+      }
+      if (k >= 32 && k <= 126) {
+        insertChar((char)k);
+        refresh(nullptr);
+        continue;
+      }
+      // ignore other keys
     }
-    if (!strncmp(inbuf, "save ", 5)) {
-      const char* pathArg = inbuf + 5;
-      bool ok = activeFs.writeFile(pathArg, buf, len, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists));
-      Console.print(ok ? "Saved hex buffer to " : "Failed to save to ");
-      Console.println(pathArg);
-      continue;
-    }
-    Console.println("Unknown command. Type 'help'.");
   }
-  // unreachable
-  return true;
+};
+
+static bool runNanoEditor(const char* path) {
+  NanoEditor ed;
+  if (!ed.load(path)) {
+    Console.println("nano: load failed");
+    return false;
+  }
+  bool ok = ed.run();
+  return ok;
 }
-// ----------------- End editor integration -----------------
+// ----------------- End Nano-like editor -----------------
 
 static void printHelp() {
   Console.println("Commands (filename max 32 chars):");
@@ -1307,12 +1545,12 @@ static void printHelp() {
   Console.println("  putb64 <file> <base64>       - upload binary as base64 (single line)");
   Console.println("  cc <src> <dst>               - compile Tiny-C source file to raw ARM Thumb-1 binary");
   Console.println();
-  Console.println("Editor commands (text/hex editors use ActiveFS):");
-  Console.println("  edit <file>                  - open simple ED-like text editor for <file>");
-  Console.println("                                 commands in editor: :q, :w <path>, :p, :a, :i N, :d N, :h");
-  Console.println("                                 Ctrl-C exits the editor immediately.");
-  Console.println("  hexedit <file>               - open simple hex editor for <file>");
-  Console.println("                                 commands in editor: show, set, fill, save <path>, q");
+  Console.println("Editor (Nano-style) commands:");
+  Console.println("  nano <file>                  - open Nano-like editor for <file> (ActiveFS-backed)");
+  Console.println("  edit <file>                  - alias for 'nano'");
+  Console.println("    Keys in editor:");
+  Console.println("      Arrows: move   Backspace/Delete: edit   Enter: newline");
+  Console.println("      Ctrl+C: show cursor position   Ctrl+X: prompt to save and exit");
   Console.println();
   Console.println("Co-Processor (serial RPC) commands:");
   Console.println("  coproc ping                  - HELLO (version/features)");
@@ -1340,12 +1578,26 @@ static void printHelp() {
   Console.println("  - Background jobs: only one background job supported at a time. Use 'bg' to query or cancel.");
   Console.println();
 }
+
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
   if (!nextToken(p, t0)) return;
+
   if (!strcmp(t0, "help")) {
     printHelp();
+
+  } else if (!strcmp(t0, "nano") || !strcmp(t0, "edit")) {
+    char* fn;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: nano <file>");
+      return;
+    }
+    if (!checkNameLen(fn)) return;
+    Console.printf("Opening editor for '%s'...\n", fn);
+    runNanoEditor(fn);
+    Console.println("Returned to console.");
+
   } else if (!strcmp(t0, "storage")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1370,6 +1622,7 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: storage [flash|psram]");
     }
+
   } else if (!strcmp(t0, "mode")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1384,6 +1637,7 @@ static void handleCommand(char* line) {
       g_dev_mode = false;
       Console.println("mode=prod");
     } else Console.println("usage: mode [dev|prod]");
+
   } else if (!strcmp(t0, "persist")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1428,10 +1682,13 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: persist [read|write]");
     }
+
   } else if (!strcmp(t0, "autogen")) {
     autogenBlobWrites();
+
   } else if (!strcmp(t0, "files")) {
     activeFs.listFilesToSerial();
+
   } else if (!strcmp(t0, "info")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1448,6 +1705,7 @@ static void handleCommand(char* line) {
       Console.print(" cap=");
       Console.println(c);
     } else Console.println("not found");
+
   } else if (!strcmp(t0, "dump")) {
     char* fn;
     char* nstr;
@@ -1456,6 +1714,7 @@ static void handleCommand(char* line) {
       return;
     }
     dumpFileHead(fn, (uint32_t)strtoul(nstr, nullptr, 0));
+
   } else if (!strcmp(t0, "mkSlot")) {
     char* fn;
     char* nstr;
@@ -1467,6 +1726,7 @@ static void handleCommand(char* line) {
     uint32_t res = (uint32_t)strtoul(nstr, nullptr, 0);
     if (activeFs.createFileSlot(fn, res, nullptr, 0)) Console.println("slot created");
     else Console.println("mkSlot failed");
+
   } else if (!strcmp(t0, "writeblob")) {
     char* fn;
     char* bid;
@@ -1482,6 +1742,7 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
+
   } else if (!strcmp(t0, "exec")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1533,6 +1794,7 @@ static void handleCommand(char* line) {
         free(raw);
       }
     }
+
   } else if (!strcmp(t0, "bg")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1574,11 +1836,6 @@ static void handleCommand(char* line) {
       if (Exec.core1JobFlag() == 2u) {
         if (Exec.requestCancelRunningBackground()) {
           Console.println("Cancellation requested (mailbox flag set). If blob cooperates, it will stop shortly.");
-#if 0
-          if (sub && strcmp(sub, "force") == 0) {
-            Console.println("Force kill not implemented in this build.");
-          }
-#endif
         } else {
           Console.println("No running BG job to cancel");
         }
@@ -1588,6 +1845,7 @@ static void handleCommand(char* line) {
     } else {
       Console.println("bg: usage: bg [status|query] | bg kill|cancel [force]");
     }
+
   } else if (!strcmp(t0, "coproc")) {
     char* sub;
     if (!nextToken(p, sub)) {
@@ -1684,8 +1942,10 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: coproc ping|info|exec <file> [a0..aN]|sexec <file> [a0..aN]|func <name> [a0..aN]|status|mbox [n]|cancel|reset");
     }
+
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
+
   } else if (!strcmp(t0, "timeout")) {
     char* msStr;
     if (!nextToken(p, msStr)) {
@@ -1699,6 +1959,7 @@ static void handleCommand(char* line) {
       Console.print(ms);
       Console.println(" ms");
     }
+
   } else if (!strcmp(t0, "meminfo")) {
     Console.println();
     Console.printf("Total Heap:        %d bytes\n", rp2040.getTotalHeap());
@@ -1709,14 +1970,17 @@ static void handleCommand(char* line) {
     Console.printf("Used PSRAM Heap:   %d bytes\n", rp2040.getUsedPSRAMHeap());
     Console.printf("Free Stack:        %d bytes\n", rp2040.getFreeStack());
     psramBB.printCapacityReport();
+
   } else if (!strcmp(t0, "psramsmoketest")) {
     psramBB.printCapacityReport();
     psramSafeSmokeTest();
+
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
     delay(20);
     yield();
     rp2040.reboot();
+
   } else if (!strcmp(t0, "del")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1725,9 +1989,11 @@ static void handleCommand(char* line) {
     }
     if (activeFs.deleteFile && activeFs.deleteFile(fn)) Console.println("deleted");
     else Console.println("delete failed");
+
   } else if (!strcmp(t0, "format")) {
     if (activeFs.format && activeFs.format()) Console.println("FS formatted");
     else Console.println("format failed");
+
   } else if (!strcmp(t0, "wipebootloader")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1736,6 +2002,7 @@ static void handleCommand(char* line) {
       yield();
       rp2040.rebootToBootloader();
     } else Console.println("wipe failed");
+
   } else if (!strcmp(t0, "wipereboot")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1744,10 +2011,12 @@ static void handleCommand(char* line) {
       yield();
       rp2040.reboot();
     } else Console.println("wipe failed");
+
   } else if (!strcmp(t0, "wipe")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) Console.println("Chip wiped");
     else Console.println("wipe failed");
+
   } else if (!strcmp(t0, "puthex")) {
     char* fn;
     char* hex;
@@ -1772,6 +2041,7 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("puthex: write failed");
+
   } else if (!strcmp(t0, "putb64")) {
     char* fn;
     char* b64;
@@ -1796,8 +2066,8 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
+
   } else if (!strcmp(t0, "cc")) {
-    // compile Tiny-C source from FS and store compiled raw binary to FS
     char* src;
     char* dst;
     if (!nextToken(p, src) || !nextToken(p, dst)) {
@@ -1808,57 +2078,47 @@ static void handleCommand(char* line) {
     if (!compileTinyCFileToFile(src, dst)) {
       Console.println("cc: failed");
     }
-  } else if (!strcmp(t0, "edit")) {
-    char* fn;
-    if (!nextToken(p, fn)) {
-      Console.println("usage: edit <file>");
-      return;
-    }
-    if (!checkNameLen(fn)) return;
-    Console.printf("Opening text editor for '%s'...\n", fn);
-    launchTextEditorInteractive(fn);
-    Console.println("Returned to console.");
-  } else if (!strcmp(t0, "hexedit")) {
-    char* fn;
-    if (!nextToken(p, fn)) {
-      Console.println("usage: hexedit <file>");
-      return;
-    }
-    if (!checkNameLen(fn)) return;
-    Console.printf("Opening hex editor for '%s'...\n", fn);
-    launchHexEditorInteractive(fn);
-    Console.println("Returned to console.");
+
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
 }
+
 // ========== Setup and main loops ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
   Serial.println("System booting..");
+
   // Initialize Console
   Console.begin();
+
   // Initialize flash
   flashBB.begin();
+
   // PSRAM decoder + bus
   psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
   psramBB.begin();
   psramBB.setClockDelayUs(PSRAM_CLOCK_DELAY_US);
+
   // bind FS and mount
   bindActiveFs(g_storage);
   bool mounted = (g_storage == StorageBackend::Flash) ? activeFs.mount(true) : activeFs.mount(false);
   if (!mounted) { Console.println("FS mount failed on active storage"); }
+
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
+
   // ExecHost wiring
   Exec.attachConsole(&Console);
   updateExecFsTable();
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
+
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   Console.printf("System ready. Type 'help'\n> ");
 }
+
 void setup1() {
   Exec.core1Setup();
 }
@@ -1866,6 +2126,7 @@ void loop1() {
   Exec.core1Poll();
   tight_loop_contents();
 }
+
 void loop() {
   Exec.pollBackground();  // handle any background job completions/timeouts
   if (readLine()) {
