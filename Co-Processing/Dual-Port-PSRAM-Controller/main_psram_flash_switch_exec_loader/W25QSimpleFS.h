@@ -1,6 +1,8 @@
 #pragma once
 #include "W25QBitbang.h"
 
+static ConsolePrint W25QFSConsole;  // Console wrapper
+
 // Simple FS for W25Q128 with two write styles:
 //  - Append-only (default): writeFile() appends new versions at the tail.
 //  - Fixed-slot (in-place): createFileSlot() reserves sector-aligned space,
@@ -308,13 +310,13 @@ public:
   }
 
   void listFilesToSerial() {
-    Serial.println("Files (FLASH):");
+    W25QFSConsole.println("Files (FLASH):");
     for (size_t i = 0; i < _fileCount; ++i) {
       if (_files[i].deleted) continue;
-      Serial.printf("- %s  \tsize=%" PRIu32 "  \taddr=0x", _files[i].name, _files[i].size);
-      Serial.print(_files[i].addr, HEX);
+      W25QFSConsole.printf("- %s  \tsize=%" PRIu32 "  \taddr=0x", _files[i].name, _files[i].size);
+      W25QFSConsole.print(_files[i].addr, HEX);
       uint32_t cap = (_files[i].capEnd > _files[i].addr) ? (_files[i].capEnd - _files[i].addr) : 0;
-      Serial.printf("  \tcap=%" PRIu32 "  \tslotSafe=%s\n", cap, _files[i].slotSafe ? "Y" : "N");
+      W25QFSConsole.printf("  \tcap=%" PRIu32 "  \tslotSafe=%s\n", cap, _files[i].slotSafe ? "Y" : "N");
     }
   }
 

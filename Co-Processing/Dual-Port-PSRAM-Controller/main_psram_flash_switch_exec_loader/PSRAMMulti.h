@@ -46,6 +46,8 @@
 #define PSRAMMULTI_MAX_CHIPS 8
 #endif
 
+static ConsolePrint PSRAMFSConsole;  // Console wrapper
+
 class PSRAMAggregateDevice {
 public:
   enum class CSSelMode : uint8_t {
@@ -141,13 +143,25 @@ public:
         break;
       case CSSelMode::Decoder138:
         if (_decEn != 255) { pinMode(_decEn, OUTPUT); }
-        if (_decA0 != 255) { pinMode(_decA0, OUTPUT); digitalWrite(_decA0, LOW); }
-        if (_decA1 != 255) { pinMode(_decA1, OUTPUT); digitalWrite(_decA1, LOW); }
-        if (_decA2 != 255) { pinMode(_decA2, OUTPUT); digitalWrite(_decA2, LOW); }
+        if (_decA0 != 255) {
+          pinMode(_decA0, OUTPUT);
+          digitalWrite(_decA0, LOW);
+        }
+        if (_decA1 != 255) {
+          pinMode(_decA1, OUTPUT);
+          digitalWrite(_decA1, LOW);
+        }
+        if (_decA2 != 255) {
+          pinMode(_decA2, OUTPUT);
+          digitalWrite(_decA2, LOW);
+        }
         if (_decEn != 255) digitalWrite(_decEn, _decEnActiveLow ? HIGH : LOW);  // disable
         break;
       case CSSelMode::Decoder138_595:
-        if (_srLatch != 255) { pinMode(_srLatch, OUTPUT); digitalWrite(_srLatch, LOW); }
+        if (_srLatch != 255) {
+          pinMode(_srLatch, OUTPUT);
+          digitalWrite(_srLatch, LOW);
+        }
         srWriteByte(srCompose(0, /*enActive*/ false));
         break;
     }
@@ -178,9 +192,15 @@ public:
     _bus.setClockDelayUs(halfCycleDelayUs);
   }
 
-  uint32_t capacity() const { return _perChipCapacity * _chipCount; }
-  uint32_t perChipCapacity() const { return _perChipCapacity; }
-  uint8_t chipCount() const { return _chipCount; }
+  uint32_t capacity() const {
+    return _perChipCapacity * _chipCount;
+  }
+  uint32_t perChipCapacity() const {
+    return _perChipCapacity;
+  }
+  uint8_t chipCount() const {
+    return _chipCount;
+  }
 
   void readJEDEC(uint8_t bank, uint8_t* out, size_t len) {
     if (bank >= _chipCount || !out || len == 0) return;
@@ -445,7 +465,7 @@ public:
     _nextSeq = 1;
     _dataHead = DATA_START;
   }
-  
+
   bool mount(bool autoFormatIfEmpty = true) {
     if (_capacity == 0 || _capacity <= DATA_START) return false;
     _fileCount = 0;
@@ -650,13 +670,13 @@ public:
     return true;
   }
   void listFilesToSerial() {
-    Serial.println("Files (PSRAM Multi):");
+    PSRAMFSConsole.println("Files (PSRAM Multi):");
     for (size_t i = 0; i < _fileCount; ++i) {
       if (_files[i].deleted) continue;
-      Serial.printf("- %s  \tsize=%u  \taddr=0x", _files[i].name, (unsigned)_files[i].size);
-      Serial.print(_files[i].addr, HEX);
+      PSRAMFSConsole.printf("- %s  \tsize=%u  \taddr=0x", _files[i].name, (unsigned)_files[i].size);
+      PSRAMFSConsole.print(_files[i].addr, HEX);
       uint32_t cap = (_files[i].capEnd > _files[i].addr) ? (_files[i].capEnd - _files[i].addr) : 0;
-      Serial.printf("  \tcap=%u  \tslotSafe=%s\n", (unsigned)cap, _files[i].slotSafe ? "Y" : "N");
+      PSRAMFSConsole.printf("  \tcap=%u  \tslotSafe=%s\n", (unsigned)cap, _files[i].slotSafe ? "Y" : "N");
     }
   }
   size_t fileCount() const {
