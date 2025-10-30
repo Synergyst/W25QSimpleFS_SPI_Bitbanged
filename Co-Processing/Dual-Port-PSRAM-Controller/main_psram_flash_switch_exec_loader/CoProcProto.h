@@ -5,6 +5,7 @@
   - Frame: 24B header + payload + CRC32(payload) (CRC=0 if len==0).
   - Requests: HELLO, INFO, LOAD_BEGIN, LOAD_DATA, LOAD_END, EXEC, STATUS, MAILBOX_RD, CANCEL, RESET.
   - Script Requests: SCRIPT_BEGIN, SCRIPT_DATA, SCRIPT_END, SCRIPT_EXEC (same framing as LOAD_EXEC).
+  - FUNC Request: call a named function registered on the co-processor (see payload below).
   - ISP Requests: ISP_ENTER, ISP_EXIT.
   - Responses: cmd | 0x80, status-first payloads.
 */
@@ -42,6 +43,13 @@ enum : uint16_t {
   CMD_SCRIPT_END = 0x32,    // req: uint32 expected_crc32
   CMD_SCRIPT_EXEC = 0x33,   // req: uint32 argc, int32 argv[argc], uint32 timeout_ms
                             //       (alternate mode supported by impl: marker 0xFFFFFFFF + ASCII args)
+
+  // Named function dispatch
+  CMD_FUNC = 0x40,  // req: uint32 name_len, bytes[name_len], uint32 argc,
+                    //      if argc>0:
+                    //        either classic: int32 argv[argc]
+                    //        or alternate: uint32 marker=0xFFFFFFFF, then for each arg: uint32 slen, bytes[slen] (ASCII numeric)
+                    // resp: int32 status, int32 result
 
   // ISP control
   CMD_ISP_ENTER = 0x60,  // req: -

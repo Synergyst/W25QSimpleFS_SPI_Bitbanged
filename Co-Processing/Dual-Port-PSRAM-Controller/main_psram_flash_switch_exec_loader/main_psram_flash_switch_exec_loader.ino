@@ -1,7 +1,6 @@
 /*
   main_psram_flash_switch_exec_loader_serial.ino
   DEFAULT (golden) PSRAM CS SCHEME: Single 74HC138 (MC74HC138AN), 4 PSRAM chips
-  ... [original top comment unchanged] ...
 */
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
@@ -22,7 +21,6 @@
 #include "PSRAMBitbang.h"
 #endif
 #include "PSRAMMulti.h"
-
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
@@ -39,7 +37,6 @@
 #define PIN_COPROC_TX 1  // GP1 (main TX)
 #endif
 static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, TX, non-inverted
-
 // Store ASCII scripts as raw multi-line strings, expose pointer + length.
 #ifndef DECLARE_ASCII_SCRIPT
 #define DECLARE_ASCII_SCRIPT(name, literal) \
@@ -47,10 +44,11 @@ static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, T
   const uint8_t* name = reinterpret_cast<const uint8_t*>(name##_ascii); \
   const unsigned int name##_len = (unsigned int)(sizeof(name##_ascii) - 1)
 #endif
-
 #include "blob_mailbox_config.h"
 #include "blob_ret42.h"
 #define FILE_RET42 "ret42"
+#include "blob_add2.h"
+#define FILE_ADD2 "add2"
 #include "blob_pwmc.h"
 #define FILE_PWMC "pwmc"
 #include "blob_pwmc2350.h"
@@ -60,19 +58,17 @@ static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, T
 #include "scripts.h"
 #define FILE_BLINKSCRIPT "blinkscript"
 #define FILE_ONSCRIPT "onscript"
-
 struct BlobReg;               // Forward declaration
 static ConsolePrint Console;  // Console wrapper
-
+// ------- MC Compiiler -------
+#include "MCCompiler.h"
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
-
 // ========== bitbang pin definitions (flash) ==========
 const uint8_t PIN_FLASH_MISO = 12;  // GP12
 const uint8_t PIN_FLASH_CS = 28;    // GP28
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_FLASH_MOSI = 11;  // GP11
-
 // ========== bitbang pin definitions (psram) ==========
 const bool PSRAM_ENABLE_QPI = false;     // Should we enable the PSRAM QPI-mode?
 const uint8_t PSRAM_CLOCK_DELAY_US = 0;  // Small delay helps ensure decoder/address settle before EN
@@ -85,7 +81,6 @@ const uint8_t PIN_138_A1 = 7;     // 74HC138 pin 2 (A1)
 const uint8_t PIN_138_EN = 9;     // 74HC138 pins 4+5 (G2A/G2B tied), 10k pull-up to 3.3V
 const uint8_t PIN_138_A2 = 255;   // 255 means "not used"; tie 74HC138 pin 3 (A2) to GND
 const uint8_t PIN_595_LATCH = 4;  // 595.RCLK (unused in 138-only mode)
-
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 const size_t PERSIST_LEN = 32;
 enum class StorageBackend {
@@ -93,18 +88,14 @@ enum class StorageBackend {
   PSRAM_BACKEND
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-
 constexpr uint8_t PSRAM_NUM_CHIPS = 4;
 constexpr uint32_t PER_CHIP_CAP_BYTES = 8UL * 1024UL * 1024UL;
 constexpr uint32_t AGG_CAPACITY_BYTES = PER_CHIP_CAP_BYTES * PSRAM_NUM_CHIPS;
-
 W25QBitbang flashBB(PIN_FLASH_MISO, PIN_FLASH_CS, PIN_FLASH_SCK, PIN_FLASH_MOSI);
 W25QSimpleFS fsFlash(flashBB);
 PSRAMAggregateDevice psramBB(PIN_PSRAM_MISO, PIN_PSRAM_MOSI, PIN_PSRAM_SCK, PER_CHIP_CAP_BYTES);
 PSRAMSimpleFS_Multi fsPSRAM(psramBB, AGG_CAPACITY_BYTES);
-
 static bool g_dev_mode = true;
-
 // ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -127,7 +118,6 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-
 static void bindActiveFs(StorageBackend backend) {
   if (backend == StorageBackend::Flash) {
     activeFs.mount = [](bool b) {
@@ -229,7 +219,6 @@ static void bindActiveFs(StorageBackend backend) {
     };
   }
 }
-
 // ========== Blob registry ==========
 struct BlobReg {
   const char* id;
@@ -238,6 +227,7 @@ struct BlobReg {
 };
 static const BlobReg g_blobs[] = {
   { FILE_RET42, blob_ret42, blob_ret42_len },
+  { FILE_ADD2, blob_add2, blob_add2_len },
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
   { FILE_PWMC2350, blob_pwmc, blob_pwmc2350_len },
   { FILE_RETMIN, blob_retmin, blob_retmin_len },
@@ -245,21 +235,17 @@ static const BlobReg g_blobs[] = {
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-
 // ========== helpers using Console ==========
 static void printHexByte(uint8_t b) {
   if (b < 0x10) Console.print('0');
   Console.print(b, HEX);
 }
-
 // ========== Return mailbox reservation (Scratch) ==========
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
-
 // ================= New: ExecHost header =================
 #include "ExecHost.h"
 static ExecHost Exec;
-
 // Helper to supply Exec with current FS function pointers
 static void updateExecFsTable() {
   ExecFSTable t{};
@@ -274,7 +260,6 @@ static void updateExecFsTable() {
   t.deleteFile = activeFs.deleteFile;
   Exec.attachFS(t);
 }
-
 // ========== FS helpers and console (unchanged) ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -399,6 +384,7 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
 static void autogenBlobWrites() {
   bool allOk = true;
   allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
+  allOk &= ensureBlobIfMissing(FILE_ADD2, blob_add2, blob_add2_len);
   allOk &= ensureBlobIfMissing(FILE_PWMC, blob_pwmc, blob_pwmc_len);
   allOk &= ensureBlobIfMissing(FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len);
   allOk &= ensureBlobIfMissing(FILE_RETMIN, blob_retmin, blob_retmin_len);
@@ -407,7 +393,6 @@ static void autogenBlobWrites() {
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
-
 // ========== PSRAM smoke test (unchanged) ==========
 static bool psramSafeSmokeTest() {
   if (g_storage != StorageBackend::PSRAM_BACKEND) {
@@ -563,7 +548,6 @@ static bool psramSafeSmokeTest() {
   Console.printf("Total bytes written (approx): %llu\n", (unsigned long long)totalWritten);
   return true;
 }
-
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -680,6 +664,255 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   return ok;
 }
 
+// ========== New: compile Tiny-C source file -> raw Thumb binary on FS ==========
+static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos) {
+  const size_t CONTEXT = 40;
+  if (!src || srcLen == 0) return;
+  size_t start = (pos > CONTEXT) ? (pos - CONTEXT) : 0;
+  size_t end = (pos + CONTEXT < srcLen) ? (pos + CONTEXT) : srcLen;
+  Console.println("----- context -----");
+  for (size_t i = start; i < end; ++i) {
+    char c = src[i];
+    if (c == '\r') c = ' ';
+    Console.print(c);
+  }
+  Console.println();
+  size_t caret = pos - start;
+  for (size_t i = 0; i < caret; ++i) Console.print(' ');
+  Console.println("^");
+  Console.println("-------------------");
+}
+
+static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
+  if (!checkNameLen(srcName) || !checkNameLen(dstName)) return false;
+  if (!activeFs.exists(srcName)) {
+    Console.print("compile: source not found: ");
+    Console.println(srcName);
+    return false;
+  }
+  uint32_t srcSize = 0;
+  if (!activeFs.getFileSize(srcName, srcSize) || srcSize == 0) {
+    Console.println("compile: getFileSize failed or empty source");
+    return false;
+  }
+  // Read source
+  char* srcBuf = (char*)malloc(srcSize + 1);
+  if (!srcBuf) {
+    Console.println("compile: malloc src failed");
+    return false;
+  }
+  uint32_t got = activeFs.readFile(srcName, (uint8_t*)srcBuf, srcSize);
+  if (got != srcSize) {
+    Console.println("compile: readFile failed");
+    free(srcBuf);
+    return false;
+  }
+  srcBuf[srcSize] = 0;
+
+  // Prepare output buffer (rough upper bound: small compiler, but be generous)
+  uint32_t outCap = (srcSize * 12u) + 256u;  // tiny code generator; literals pool small
+  if (outCap < 512u) outCap = 512u;
+  uint8_t* outBuf = (uint8_t*)malloc(outCap);
+  if (!outBuf) {
+    Console.println("compile: malloc out failed");
+    free(srcBuf);
+    return false;
+  }
+
+  MCCompiler comp;
+  size_t outSize = 0;
+  MCCompiler::Result r = comp.compile(srcBuf, srcSize, outBuf, outCap, &outSize);
+  if (!r.ok) {
+    Console.print("compile: error at pos ");
+    Console.print((uint32_t)r.errorPos);
+    Console.print(": ");
+    Console.println(r.errorMsg ? r.errorMsg : "unknown");
+    printCompileErrorContext(srcBuf, srcSize, r.errorPos);
+    free(outBuf);
+    free(srcBuf);
+    return false;
+  }
+
+  // Write to destination file
+  bool ok = writeBinaryToFS(dstName, outBuf, (uint32_t)outSize);
+  if (ok) {
+    Console.print("compile: OK -> ");
+    Console.print(dstName);
+    Console.print(" (");
+    Console.print((uint32_t)outSize);
+    Console.println(" bytes)");
+    if (outSize & 1u) {
+      Console.println("note: odd-sized output; for Thumb execution, even size is recommended.");
+    }
+  } else {
+    Console.println("compile: write failed");
+  }
+
+  free(outBuf);
+  free(srcBuf);
+  return ok;
+}
+
+// ===================== Co-Processor RPC helpers (for CMD_FUNC) =====================
+static uint32_t g_coproc_seq = 1;
+static bool coprocWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  size_t off = 0;
+  while (off < n) {
+    size_t w = coprocLink.write(src + off, n - off);
+    if (w > 0) {
+      off += w;
+      continue;
+    }
+    if ((millis() - start) > timeoutMs) return false;
+    yield();
+  }
+  coprocLink.flush();
+  return true;
+}
+static bool coprocReadByte(uint8_t& b, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while ((millis() - start) <= timeoutMs) {
+    int a = coprocLink.available();
+    if (a > 0) {
+      int v = coprocLink.read();
+      if (v >= 0) {
+        b = (uint8_t)v;
+        return true;
+      }
+    }
+    tight_loop_contents();
+    yield();
+  }
+  return false;
+}
+static bool coprocReadExact(uint8_t* dst, size_t n, uint32_t timeoutPerByteMs) {
+  for (size_t i = 0; i < n; ++i) {
+    if (!coprocReadByte(dst[i], timeoutPerByteMs)) return false;
+  }
+  return true;
+}
+// Send CMD_FUNC with classic int32 argv[argc]. On success returns true and sets outResult.
+static bool coprocCallFunc(const char* name, const int32_t* argv, uint32_t argc, int32_t& outResult) {
+  if (!name) return false;
+  uint32_t nameLen = (uint32_t)strlen(name);
+  if (nameLen == 0 || nameLen > 128) {
+    Console.println("coproc func: name length invalid (1..128)");
+    return false;
+  }
+  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
+  // Build payload: [uint32 nameLen][bytes name][uint32 argc][int32 argv[argc]]
+  const uint32_t payloadLen = 4 + nameLen + 4 + 4 * argc;
+  uint8_t payload[4 + 128 + 4 + 4 * MAX_EXEC_ARGS];
+  size_t off = 0;
+  CoProc::writePOD(payload, sizeof(payload), off, nameLen);
+  CoProc::writeBytes(payload, sizeof(payload), off, name, nameLen);
+  CoProc::writePOD(payload, sizeof(payload), off, argc);
+  for (uint32_t i = 0; i < argc; ++i) {
+    CoProc::writePOD(payload, sizeof(payload), off, argv[i]);
+  }
+  // Build request header
+  CoProc::Frame req{};
+  req.magic = CoProc::MAGIC;
+  req.version = CoProc::VERSION;
+  req.cmd = CoProc::CMD_FUNC;
+  req.seq = g_coproc_seq++;
+  req.len = payloadLen;
+  req.crc32 = (payloadLen ? CoProc::crc32_ieee(payload, payloadLen) : 0);
+  // Send request
+  if (!coprocWriteAll(reinterpret_cast<const uint8_t*>(&req), sizeof(req), 2000)) {
+    Console.println("coproc func: write header failed");
+    return false;
+  }
+  if (payloadLen) {
+    if (!coprocWriteAll(payload, payloadLen, 10000)) {
+      Console.println("coproc func: write payload failed");
+      return false;
+    }
+  }
+  // Read response: scan for magic
+  const uint8_t magicBytes[4] = { (uint8_t)('C'), (uint8_t)('P'), (uint8_t)('R'), (uint8_t)('0') };
+  uint8_t w[4] = { 0, 0, 0, 0 };
+  for (;;) {
+    uint8_t b = 0;
+    if (!coprocReadByte(b, 5000)) {
+      Console.println("coproc func: response timeout");
+      return false;
+    }
+    w[0] = w[1];
+    w[1] = w[2];
+    w[2] = w[3];
+    w[3] = b;
+    if (w[0] == magicBytes[0] && w[1] == magicBytes[1] && w[2] == magicBytes[2] && w[3] == magicBytes[3]) {
+      // We have magic, read rest of header
+      union {
+        CoProc::Frame f;
+        uint8_t bytes[sizeof(CoProc::Frame)];
+      } u;
+      memcpy(u.bytes, w, 4);
+      if (!coprocReadExact(u.bytes + 4, sizeof(CoProc::Frame) - 4, 200)) {
+        Console.println("coproc func: resp header tail timeout");
+        return false;
+      }
+      CoProc::Frame resp = u.f;
+      if ((resp.magic != CoProc::MAGIC) || (resp.version != CoProc::VERSION)) {
+        Console.println("coproc func: resp bad magic/version");
+        return false;
+      }
+      if (resp.cmd != (uint16_t)(CoProc::CMD_FUNC | 0x80)) {
+        Console.print("coproc func: unexpected resp cmd=0x");
+        Console.println(resp.cmd, HEX);
+        return false;
+      }
+      // Read payload if any
+      uint8_t buf[16];
+      if (resp.len > sizeof(buf)) {
+        Console.println("coproc func: resp too large");
+        // Drain anyway
+        uint32_t left = resp.len;
+        uint8_t sink[32];
+        while (left) {
+          uint32_t chunk = (left > sizeof(sink)) ? sizeof(sink) : left;
+          if (!coprocReadExact(sink, chunk, 200)) break;
+          left -= chunk;
+        }
+        return false;
+      }
+      if (resp.len) {
+        if (!coprocReadExact(buf, resp.len, 200)) {
+          Console.println("coproc func: resp payload timeout");
+          return false;
+        }
+        uint32_t crc = CoProc::crc32_ieee(buf, resp.len);
+        if (crc != resp.crc32) {
+          Console.print("coproc func: resp CRC mismatch exp=0x");
+          Console.print(resp.crc32, HEX);
+          Console.print(" got=0x");
+          Console.println(crc, HEX);
+          return false;
+        }
+      }
+      // Parse response: int32 status, int32 result
+      size_t rp = 0;
+      int32_t st = CoProc::ST_BAD_CMD;
+      int32_t rv = 0;
+      if (resp.len >= sizeof(int32_t)) {
+        CoProc::readPOD(buf, resp.len, rp, st);
+      }
+      if (resp.len >= 2 * sizeof(int32_t)) {
+        CoProc::readPOD(buf, resp.len, rp, rv);
+      }
+      if (st == CoProc::ST_OK) {
+        outResult = rv;
+        return true;
+      } else {
+        Console.print("coproc func: remote error status=");
+        Console.println(st);
+        return false;
+      }
+    }
+  }
+}
 // ========== Serial console / command handling ==========
 static char lineBuf[FS_SECTOR_SIZE];
 static bool readLine() {
@@ -741,6 +974,7 @@ static void printHelp() {
   Console.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Console.println("  puthex <file> <hex>          - upload binary as hex string (single line)");
   Console.println("  putb64 <file> <base64>       - upload binary as base64 (single line)");
+  Console.println("  cc <src> <dst>               - compile Tiny-C source file to raw ARM Thumb-1 binary");
   Console.println();
   Console.println("Co-Processor (serial RPC) commands:");
   Console.println("  coproc ping                  - HELLO (version/features)");
@@ -749,10 +983,12 @@ static void printHelp() {
   Console.println("                                 Timeout is taken from 'timeout' setting on the master");
   Console.println("  coproc sexec <file> [a0..aN] - Load a script file to co-proc and execute once");
   Console.println("                                 Uses master 'timeout' setting; script may use DELAY/DELAY_US, PINMODE, DWRITE, etc.");
+  Console.println("  coproc func <name> [a0..aN]  - Call a named function registered on the co-processor");
   Console.println("  coproc status                - STATUS (exec_state)");
   Console.println("  coproc mbox [n]              - MAILBOX_RD (read up to n bytes; default 128)");
   Console.println("  coproc cancel                - CANCEL (sets cancel flag)");
   Console.println("  coproc reset                 - RESET (remote reboot)");
+  Console.println("  coproc isp enter|exit        - request co-processor to enter or exit ISP mode (device-specific)");
   Console.println();
   Console.println("Linux hints:");
   Console.println("  # Base64 (single line, no wraps)  base64 -w0 your.bin");
@@ -760,12 +996,12 @@ static void printHelp() {
   Console.println("Example:");
   Console.println("  putb64 myprog <paste_output_of_base64>");
   Console.println("  puthex myprog <paste_output_of_xxd>");
+  Console.println("  cc myprog.c myprog.bin");
   Console.println("Notes:");
   Console.println("  - For blobs you intend to exec, even byte length is recommended (Thumb).");
   Console.println("  - Background jobs: only one background job supported at a time. Use 'bg' to query or cancel.");
   Console.println();
 }
-
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
@@ -1021,6 +1257,8 @@ static void handleCommand(char* line) {
       Console.println("  coproc ping");
       Console.println("  coproc info");
       Console.println("  coproc exec <file> [a0..aN]");
+      Console.println("  coproc sexec <file> [a0..aN]");
+      Console.println("  coproc func <name> [a0..aN]");
       Console.println("  coproc status");
       Console.println("  coproc mbox [n]");
       Console.println("  coproc cancel");
@@ -1062,6 +1300,25 @@ static void handleCommand(char* line) {
         return;
       }
       if (!Exec.coprocExecTokens(tokens, argc)) Console.println("coproc exec failed");
+    } else if (!strcmp(sub, "func")) {
+      char* name = nullptr;
+      if (!nextToken(p, name)) {
+        Console.println("usage: coproc func <name> [a0..aN]");
+        return;
+      }
+      static int32_t argvN[MAX_EXEC_ARGS];
+      uint32_t argc = 0;
+      char* tok = nullptr;
+      while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) {
+        argvN[argc++] = (int32_t)strtol(tok, nullptr, 0);
+      }
+      int32_t result = 0;
+      if (coprocCallFunc(name, argvN, argc, result)) {
+        Console.print("coproc func OK, result=");
+        Console.println(result);
+      } else {
+        Console.println("coproc func failed");
+      }
     } else if (!strcmp(sub, "status")) {
       if (!Exec.coprocStatus()) Console.println("coproc status failed");
     } else if (!strcmp(sub, "mbox")) {
@@ -1087,7 +1344,7 @@ static void handleCommand(char* line) {
         Console.println("usage: coproc isp enter|exit");
       }
     } else {
-      Console.println("usage: coproc ping|info|exec <file> [a0..aN]|status|mbox [n]|cancel|reset");
+      Console.println("usage: coproc ping|info|exec <file> [a0..aN]|sexec <file> [a0..aN]|func <name> [a0..aN]|status|mbox [n]|cancel|reset");
     }
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
@@ -1201,43 +1458,47 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
+  } else if (!strcmp(t0, "cc")) {
+    // compile Tiny-C source from FS and store compiled raw binary to FS
+    char* src;
+    char* dst;
+    if (!nextToken(p, src) || !nextToken(p, dst)) {
+      Console.println("usage: cc <src> <dst>");
+      Console.println("example: cc myprog.c myprog.bin");
+      return;
+    }
+    if (!compileTinyCFileToFile(src, dst)) {
+      Console.println("cc: failed");
+    }
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
 }
-
 // ========== Setup and main loops ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
   Serial.println("System booting..");
-
   // Initialize Console
   Console.begin();
-
   // Initialize flash
   flashBB.begin();
-
   // PSRAM decoder + bus
   psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
   psramBB.begin();
   psramBB.setClockDelayUs(PSRAM_CLOCK_DELAY_US);
-
   // bind FS and mount
   bindActiveFs(g_storage);
   bool mounted = (g_storage == StorageBackend::Flash) ? activeFs.mount(true) : activeFs.mount(false);
   if (!mounted) { Console.println("FS mount failed on active storage"); }
-
   // Clear mailbox
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-
   // ExecHost wiring
   Exec.attachConsole(&Console);
   updateExecFsTable();
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
-
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
