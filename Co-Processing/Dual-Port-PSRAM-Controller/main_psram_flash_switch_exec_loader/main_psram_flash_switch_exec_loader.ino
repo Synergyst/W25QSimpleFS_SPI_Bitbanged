@@ -1,26 +1,7 @@
-/*
-  main_psram_flash_switch_exec_loader.ino
-  DEFAULT CONFIGURATION (golden/known-good-configs) PSRAM CS SCHEME: Single 74HC138 (MC74HC138AN), 4 PSRAM chips
-*/
+// main_psram_flash_switch_exec_loader.ino
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
-#include <SPI.h>
-// FLASH on HW-SPI via W25QBitbang's HW path
-#define W25Q_USE_HW_SPI 1
-#define W25Q_SPI_INSTANCE SPI1
-#define W25Q_SPI_CLOCK_HZ 20000000UL
-#include "W25QBitbang.h"
-#include "W25QSimpleFS.h"
-// PSRAM transport
-#define USE_PSRAM_HW_SPI 1
-#if USE_PSRAM_HW_SPI
-#define PSRAM_SPI_INSTANCE SPI1
-#include "SPIHWAdapter.h"
-#define PSRAM_AGGREGATE_BUS SPIHWAdapter
-#else
-#include "PSRAMBitbang.h"
-#endif
-#include "PSRAMMulti.h"
+#include "UnifiedSPIMemSimpleFS.h"
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
@@ -50,7 +31,52 @@ static ConsolePrint Console;  // Console wrapper
 #include "MCCompiler.h"
 
 // ------- User preference configuration -------
-#include "config.h"
+#include "blob_mailbox_config.h"  // Do not remove this line. This is the memory address where we handle the shared interprocess-mailbox-buffer
+
+#include "blob_ret42.h"
+#define FILE_RET42 "ret42"
+#include "blob_add2.h"
+#define FILE_ADD2 "add2"
+#include "blob_pwmc.h"
+#define FILE_PWMC "pwmc"
+#include "blob_pwmc2350.h"
+#define FILE_PWMC2350 "pwmc2350"
+#include "blob_retmin.h"
+#define FILE_RETMIN "retmin"
+#include "scripts.h"
+#define FILE_BLINKSCRIPT "blinkscript"
+#define FILE_ONSCRIPT "onscript"
+
+// ========== Static buffer-related compile-time constant ==========
+#define FS_SECTOR_SIZE 4096
+
+// Pins you already have:
+const uint8_t PIN_FLASH_MISO = 12;  // GP12
+const uint8_t PIN_FLASH_CS = 9;     // GP9
+const uint8_t PIN_FLASH_SCK = 10;   // GP10
+const uint8_t PIN_FLASH_MOSI = 11;  // GP11
+
+const uint8_t PIN_PSRAM_MISO = 12;  // GP12
+const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
+const uint8_t PIN_PSRAM_SCK = 10;   // GP10
+const uint8_t PIN_PSRAM_CS = 14;    // GP14
+
+// ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
+// Persisted config you already have
+const size_t PERSIST_LEN = 32;
+enum class StorageBackend {
+  Flash,
+  PSRAM_BACKEND
+};
+static StorageBackend g_storage = StorageBackend::Flash;
+// Unified manager: one bus, many CS
+UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);
+// SimpleFS facades (these are your “handles”)
+W25QUnifiedSimpleFS fsFlash;  // Use MX35UnifiedSimpleFS if your flash is MX35LF SPI-NAND
+PSRAMUnifiedSimpleFS fsPSRAM;
+// If your flash chip is actually MX35LF (SPI-NAND), do this instead:
+// MX35UnifiedSimpleFS fsFlash;r
+static bool g_dev_mode = true;
 
 // ========== ActiveFS structure ==========
 struct ActiveFS {
@@ -93,7 +119,7 @@ static void bindActiveFs(StorageBackend backend) {
       return fsFlash.createFileSlot(n, r, d, s);
     };
     activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsFlash.writeFile(n, d, s, static_cast<W25QSimpleFS::WriteMode>(m));
+      return fsFlash.writeFile(n, d, s, static_cast<W25QUnifiedSimpleFS::WriteMode>(m));
     };
     activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
       return fsFlash.writeFileInPlace(n, d, s, a);
@@ -203,7 +229,271 @@ int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
 static ExecHost Exec;
 
 // ================= FSHelpers header =================
-#include "FSHelpers.h"
+// Helper to supply Exec with current FS function pointers
+static void updateExecFsTable() {
+  ExecFSTable t{};
+  t.exists = activeFs.exists;
+  t.getFileSize = activeFs.getFileSize;
+  t.readFile = activeFs.readFile;
+  t.readFileRange = activeFs.readFileRange;
+  t.createFileSlot = activeFs.createFileSlot;
+  t.writeFile = activeFs.writeFile;
+  t.writeFileInPlace = activeFs.writeFileInPlace;
+  t.getFileInfo = activeFs.getFileInfo;
+  t.deleteFile = activeFs.deleteFile;
+  Exec.attachFS(t);
+}
+
+// ========== FS helpers and console (unchanged) ==========
+static bool checkNameLen(const char* name) {
+  size_t n = strlen(name);
+  if (n == 0 || n > ActiveFS::MAX_NAME) {
+    Console.print("Error: filename length ");
+    Console.print(n);
+    Console.print(" exceeds max ");
+    Console.print(ActiveFS::MAX_NAME);
+    Console.println(". Use a shorter name.");
+    return false;
+  }
+  return true;
+}
+static void listBlobs() {
+  Console.println("Available blobs:");
+  for (size_t i = 0; i < g_blobs_count; ++i) {
+    Console.printf(" - %s  \t(%d bytes)\n", g_blobs[i].id, g_blobs[i].len);
+  }
+}
+static const BlobReg* findBlob(const char* id) {
+  for (size_t i = 0; i < g_blobs_count; ++i)
+    if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
+  return nullptr;
+}
+static void dumpFileHead(const char* fname, uint32_t count) {
+  uint32_t sz = 0;
+  if (!activeFs.getFileSize(fname, sz) || sz == 0) {
+    Console.println("dump: missing/empty");
+    return;
+  }
+  if (count > sz) count = sz;
+  const size_t CHUNK = 32;
+  uint8_t buf[CHUNK];
+  uint32_t off = 0;
+  Console.print(fname);
+  Console.print(" size=");
+  Console.println(sz);
+  while (off < count) {
+    size_t n = (count - off > CHUNK) ? CHUNK : (count - off);
+    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
+    if (got != n) {
+      Console.println("  read error");
+      break;
+    }
+    Console.print("  ");
+    for (size_t i = 0; i < n; ++i) {
+      if (i) Console.print(' ');
+      if (buf[i] < 0x10) Console.print('0');
+      Console.print(buf[i], HEX);
+    }
+    Console.println();
+    off += n;
+  }
+}
+static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
+  if (!checkNameLen(fname)) return false;
+  if (!activeFs.exists(fname)) {
+    Console.print("Creating slot ");
+    Console.print(fname);
+    Console.print(" (");
+    Console.print(reserve);
+    Console.println(" bytes)...");
+    if (activeFs.createFileSlot(fname, reserve, data, len)) {
+      Console.println("Created and wrote blob");
+      return true;
+    }
+    Console.println("Failed to create slot");
+    return false;
+  }
+  uint32_t addr, size, cap;
+  if (!activeFs.getFileInfo(fname, addr, size, cap)) {
+    Console.println("getFileInfo failed");
+    return false;
+  }
+  bool same = (size == len);
+  if (same) {
+    const size_t CHUNK = 64;
+    uint8_t buf[CHUNK];
+    uint32_t off = 0;
+    while (off < size) {
+      size_t n = (size - off > CHUNK) ? CHUNK : (size - off);
+      activeFs.readFileRange(fname, off, buf, n);
+      for (size_t i = 0; i < n; ++i) {
+        if (buf[i] != data[off + i]) {
+          same = false;
+          break;
+        }
+      }
+      if (!same) break;
+      off += n;
+      yield();
+    }
+  }
+  if (same) {
+    Console.println("Blob already up to date");
+    return true;
+  }
+  if (cap >= len && activeFs.writeFileInPlace(fname, data, len, false)) {
+    Console.println("Updated in place");
+    return true;
+  }
+  if (activeFs.writeFile(fname, data, len, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists))) {
+    Console.println("Updated by allocating new space");
+    return true;
+  }
+  Console.println("Failed to update file");
+  return false;
+}
+static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
+  if (!checkNameLen(fname)) return false;
+  if (activeFs.exists(fname)) {
+    Console.printf("Skipping: %s\n", fname);
+    return true;
+  }
+  Console.printf("Auto-creating %s (%d bytes)...\n", fname, reserve);
+  if (activeFs.createFileSlot(fname, reserve, data, len)) {
+    Console.println("Created and wrote blob");
+    return true;
+  }
+  Console.println("Auto-create failed");
+  return false;
+}
+static void autogenBlobWrites() {
+  bool allOk = true;
+  allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
+  allOk &= ensureBlobIfMissing(FILE_ADD2, blob_add2, blob_add2_len);
+  allOk &= ensureBlobIfMissing(FILE_PWMC, blob_pwmc, blob_pwmc_len);
+  allOk &= ensureBlobIfMissing(FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len);
+  allOk &= ensureBlobIfMissing(FILE_RETMIN, blob_retmin, blob_retmin_len);
+  allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
+  allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
+  Console.print("Autogen:  ");
+  Console.println(allOk ? "OK" : "some failures");
+}
+
+// ========== Binary upload helpers (single-line puthex/putb64) ==========
+static inline int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
+  out = nullptr;
+  outLen = 0;
+  if (!hex) return false;
+  size_t n = strlen(hex);
+  if (n == 0) return false;
+  if (n & 1) {
+    Console.println("puthex: error: hex string length is odd");
+    return false;
+  }
+  uint32_t bytes = (uint32_t)(n / 2);
+  uint8_t* buf = (uint8_t*)malloc(bytes);
+  if (!buf) {
+    Console.println("puthex: malloc failed");
+    return false;
+  }
+  for (uint32_t i = 0; i < bytes; ++i) {
+    int hi = hexVal(hex[2 * i + 0]), lo = hexVal(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) {
+      Console.println("puthex: invalid hex character");
+      free(buf);
+      return false;
+    }
+    buf[i] = (uint8_t)((hi << 4) | lo);
+  }
+  out = buf;
+  outLen = bytes;
+  return true;
+}
+static int8_t b64Map[256];
+static void initB64MapOnce() {
+  static bool inited = false;
+  if (inited) return;
+  for (int i = 0; i < 256; ++i) b64Map[i] = -1;
+  for (char c = 'A'; c <= 'Z'; ++c) b64Map[(uint8_t)c] = (int8_t)(c - 'A');
+  for (char c = 'a'; c <= 'z'; c++) b64Map[(uint8_t)c] = (int8_t)(26 + (c - 'a'));
+  for (char c = '0'; c <= '9'; c++) b64Map[(uint8_t)c] = (int8_t)(52 + (c - '0'));
+  b64Map[(uint8_t)'+'] = 62;
+  b64Map[(uint8_t)'/'] = 63;
+}
+static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
+  out = nullptr;
+  outLen = 0;
+  if (!s) return false;
+  initB64MapOnce();
+  size_t inLen = strlen(s);
+  uint32_t outCap = (uint32_t)(((inLen + 3) / 4) * 3);
+  uint8_t* buf = (uint8_t*)malloc(outCap ? outCap : 1);
+  if (!buf) {
+    Console.println("putb64: malloc failed");
+    return false;
+  }
+  uint32_t o = 0;
+  int vals[4];
+  int vCount = 0;
+  int pad = 0;
+  for (size_t i = 0; i < inLen; ++i) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+    if (c == '=') {
+      vals[vCount++] = 0;
+      pad++;
+    } else {
+      int8_t v = b64Map[c];
+      if (v < 0) {
+        Console.println("putb64: invalid base64 character");
+        free(buf);
+        return false;
+      }
+      vals[vCount++] = v;
+    }
+    if (vCount == 4) {
+      uint32_t v0 = (uint32_t)vals[0], v1 = (uint32_t)vals[1], v2 = (uint32_t)vals[2], v3 = (uint32_t)vals[3];
+      uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
+      uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
+      uint8_t b2 = (uint8_t)(((v2 & 0x03) << 6) | v3);
+      if (pad == 0) {
+        buf[o++] = b0;
+        buf[o++] = b1;
+        buf[o++] = b2;
+      } else if (pad == 1) {
+        buf[o++] = b0;
+        buf[o++] = b1;
+      } else if (pad == 2) {
+        buf[o++] = b0;
+      } else {
+        free(buf);
+        Console.println("putb64: invalid padding");
+        return false;
+      }
+      vCount = 0;
+      pad = 0;
+    }
+  }
+  if (vCount != 0) {
+    free(buf);
+    Console.println("putb64: truncated input");
+    return false;
+  }
+  out = buf;
+  outLen = o;
+  return true;
+}
+static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
+  if (!checkNameLen(fname)) return false;
+  bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists));
+  return ok;
+}
 
 // ================= CompilerHelpers header =================
 #include "CompilerHelpers.h"
@@ -465,7 +755,7 @@ static void printHelp() {
   Console.println("  wipereboot                   - erase chip then reboot (DANGEROUS to FS)");
   Console.println("  wipebootloader               - erase chip then reboot to bootloader (DANGEROUS to FS)");
   Console.println("  meminfo                      - show heap/stack info");
-  Console.println("  psramsmoketest               - safe, non-destructive PSRAM test (prefers FS-free region)");
+  //Console.println("  psramsmoketest               - safe, non-destructive PSRAM test (prefers FS-free region)");
   Console.println("  bg [status|query]            - query background job status");
   Console.println("  bg kill|cancel [force]       - cancel background job; 'force' may reset core1 (platform-dependent)");
   Console.println("  reboot                       - reboot the MCU");
@@ -602,7 +892,7 @@ static void handleCommand(char* line) {
         }
       } else {
         if (!activeFs.writeFileInPlace(pf, buf, PERSIST_LEN, true)) {
-          if (!activeFs.writeFile(pf, buf, PERSIST_LEN, static_cast<int>(W25QSimpleFS::WriteMode::ReplaceIfExists))) {
+          if (!activeFs.writeFile(pf, buf, PERSIST_LEN, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists))) {
             Console.println("persist write: write failed");
             return;
           }
@@ -890,7 +1180,7 @@ static void handleCommand(char* line) {
       Console.println(" ms");
     }
 
-  } else if (!strcmp(t0, "meminfo")) {
+    /*} else if (!strcmp(t0, "meminfo")) {
     Console.println();
     Console.printf("Total Heap:        %d bytes\n", rp2040.getTotalHeap());
     Console.printf("Free Heap:         %d bytes\n", rp2040.getFreeHeap());
@@ -901,9 +1191,9 @@ static void handleCommand(char* line) {
     Console.printf("Free Stack:        %d bytes\n", rp2040.getFreeStack());
     psramBB.printCapacityReport();
 
-  } else if (!strcmp(t0, "psramsmoketest")) {
+    } else if (!strcmp(t0, "psramsmoketest")) {
     psramBB.printCapacityReport();
-    psramSafeSmokeTest();
+    psramSafeSmokeTest();*/
 
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
@@ -1014,38 +1304,58 @@ static void handleCommand(char* line) {
   }
 }
 
+SoftwareSerial tinySerial(4, 5, false);
+
 // ========== Setup and main loops ==========
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
   Console.println("System booting..");
-
-  // Initialize Console
   Console.begin();
 
-  // Initialize flash
-  flashBB.begin();
+  // Bring up unified SPI and make sure we don’t clobber PSRAM contents on ID (optional)
+  uniMem.begin();
+  uniMem.setPreservePsramContents(true);  // keep PSRAM contents during identification
 
-  // PSRAM decoder + bus
-  psramBB.configureDecoder138(PSRAM_NUM_CHIPS, PIN_138_EN, PIN_138_A0, PIN_138_A1, PIN_138_A2, /*enActiveLow=*/true);
-  psramBB.begin();
-  psramBB.setClockDelayUs(PSRAM_CLOCK_DELAY_US);
+  // Tell the manager every CS present on the bus (NOR + PSRAM)
+  uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS });
 
-  // bind FS and mount
-  bindActiveFs(g_storage);
-  bool mounted = (g_storage == StorageBackend::Flash) ? activeFs.mount(true) : activeFs.mount(false);
-  if (!mounted) { Console.println("FS mount failed on active storage"); }
+  // Scan bus
+  size_t found = uniMem.rescan();
+  Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
+  for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
+    const auto* di = uniMem.detectedInfo(i);
+    if (!di) continue;
+    Console.printf("  CS=%u  Type=%s  Vendor=%s  Cap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
+  }
 
-  // Clear mailbox
+  // Open separate FS handles (reservations are handled for you)
+  bool flashOk = fsFlash.begin(uniMem);  // W25QUnifiedSimpleFS (or MX35UnifiedSimpleFS)
+  bool psramOk = fsPSRAM.begin(uniMem);  // PSRAMUnifiedSimpleFS
+
+  if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
+  if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
+
+  // Mount like before (choose your active storage)
+  bool mounted = false;
+  if (g_storage == StorageBackend::Flash) {
+    mounted = fsFlash.mount(true);  // auto-format if empty
+  } else {
+    mounted = fsPSRAM.mount(false);  // keep PSRAM as-is by default
+  }
+  if (!mounted) {
+    Console.println("FS mount failed on active storage");
+  }
+
+  // ... the rest of your setup ...
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-
-  // ExecHost wiring
   Exec.attachConsole(&Console);
   updateExecFsTable();
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
-
-  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
+  tinySerial.begin(COPROC_BAUD);
+  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
+                 (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
@@ -1060,5 +1370,10 @@ void loop() {
   if (readLine()) {
     handleCommand(lineBuf);
     Console.print("> ");
+  }
+  if (tinySerial.available() > 0) {
+    delay(50);
+    char b = tinySerial.read();
+    if (b > 0) Serial.print(b);
   }
 }
