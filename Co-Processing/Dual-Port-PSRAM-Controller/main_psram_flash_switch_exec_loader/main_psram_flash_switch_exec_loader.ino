@@ -59,7 +59,10 @@ const uint8_t PIN_FLASH_MOSI = 11;  // GP11
 const uint8_t PIN_PSRAM_MISO = 12;  // GP12
 const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
 const uint8_t PIN_PSRAM_SCK = 10;   // GP10
-const uint8_t PIN_PSRAM_CS = 14;    // GP14
+const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
+const uint8_t PIN_PSRAM_CS1 = 15;   // GP15
+const uint8_t PIN_PSRAM_CS2 = 26;   // GP26
+const uint8_t PIN_PSRAM_CS3 = 27;   // GP27
 
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
@@ -100,7 +103,14 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-
+struct FsIndexEntry {
+  // Scan directory region and build the latest view of files.
+  // Out arrays are optional; pass nullptr to only count or check emptiness.
+  char name[ActiveFS::MAX_NAME + 1];
+  uint32_t size;
+  bool deleted;
+  uint32_t seq;
+};
 static void bindActiveFs(StorageBackend backend) {
   if (backend == StorageBackend::Flash) {
     activeFs.mount = [](bool b) {
@@ -200,6 +210,235 @@ static void bindActiveFs(StorageBackend backend) {
     activeFs.dataRegionStart = []() {
       return fsPSRAM.dataRegionStart();
     };
+  }
+}
+static bool makePath(char* out, size_t outCap, const char* folder, const char* name) {
+  if (!out || !folder || !name) return false;
+  // Compose "folder/name"
+  int needed = snprintf(out, outCap, "%s/%s", folder, name);
+  if (needed < 0) return false;
+  // needed = number of chars (excluding null). Enforce FS name limit and buffer size.
+  if ((size_t)needed > ActiveFS::MAX_NAME) return false;
+  if ((size_t)needed >= outCap) return false;
+  return true;
+}
+static bool writeFileToFolder(const char* folder, const char* fname, const uint8_t* data, uint32_t len) {
+  char path[ActiveFS::MAX_NAME + 1];
+  if (!makePath(path, sizeof(path), folder, fname)) {
+    Console.println("path too long for SimpleFS (max 32 chars)");
+    return false;
+  }
+  // Create sector-aligned slot (optional) then write; or just writeFile() directly.
+  if (!activeFs.exists(path)) {
+    // Reserve 1 sector by default; adjust as needed.
+    if (!activeFs.createFileSlot(path, ActiveFS::SECTOR_SIZE, data, len)) return false;
+    return true;
+  }
+  // Try in-place update first, fallback to reallocate
+  if (activeFs.writeFileInPlace(path, data, len, true)) return true;
+  return activeFs.writeFile(path, data, len, /*ReplaceIfExists*/ 0);
+}
+static uint32_t readFileFromFolder(const char* folder, const char* fname, uint8_t* buf, uint32_t bufSize) {
+  char path[ActiveFS::MAX_NAME + 1];
+  if (!makePath(path, sizeof(path), folder, fname)) {
+    Console.println("path too long for SimpleFS (max 32 chars)");
+    return 0;
+  }
+  return activeFs.readFile(path, buf, bufSize);
+}
+static bool folderExists(const char* absFolder) {
+  // Marker is a zero-length file named "folder/". This consumes no data space.
+  // absFolder must end with '/'
+  if (!absFolder || !absFolder[0]) return false;
+  if (absFolder[strlen(absFolder) - 1] != '/') return false;
+  return activeFs.exists(absFolder);
+}
+static bool mkdirFolder(const char* path) {
+  // Create zero-length "folder/" marker
+  if (activeFs.exists(path)) return true;  // already exists as a file or marker
+  return activeFs.writeFile(path, nullptr, 0, /*ReplaceIfExists*/ 0);
+}
+static bool touchPath(const char* cwd, const char* arg) {
+  // Create an empty file if it doesn't exist. No-op if it already exists.
+  // If the path ends with '/', treat it like a folder marker creation (mkdir shortcut).
+  if (!arg) return false;
+
+  // If arg ends with '/', interpret as folder marker (mkdir).
+  size_t L = strlen(arg);
+  if (L > 0 && arg[L - 1] == '/') {
+    char marker[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(marker, sizeof(marker), cwd, arg, /*wantTrailingSlash*/ true)) {
+      Console.println("touch: folder path too long (<= 32 chars)");
+      return false;
+    }
+    if (folderExists(marker)) return true;  // already present
+    return mkdirFolder(marker);
+  }
+
+  // Regular file path
+  char path[ActiveFS::MAX_NAME + 1];
+  if (!pathJoin(path, sizeof(path), cwd, arg, /*wantTrailingSlash*/ false)) {
+    Console.println("touch: path too long (<= 32 chars)");
+    return false;
+  }
+
+  if (activeFs.exists(path)) {
+    // POSIX touch would update mtime; we have no timestamps, so it's a no-op.
+    return true;
+  }
+
+  // Create zero-length file (no slot reserved, does not advance data head)
+  return activeFs.writeFile(path, /*data*/ nullptr, /*size*/ 0, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists));
+}
+
+// ========== Minimal directory enumeration (reads the DIR table directly) ==========
+static inline uint32_t rd32_be(const uint8_t* p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
+}
+static bool isAllFF(const uint8_t* p, size_t n) {
+  for (size_t i = 0; i < n; ++i)
+    if (p[i] != 0xFF) return false;
+  return true;
+}
+static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
+  // Access underlying device via FS handles
+  UnifiedSpiMem::MemDevice* dev = (g_storage == StorageBackend::Flash)
+                                    ? fsFlash.raw().device()
+                                    : fsPSRAM.raw().device();
+  if (!dev) return 0;
+
+  constexpr uint32_t DIR_START = 0x000000;
+  constexpr uint32_t DIR_SIZE = 64 * 1024;
+  constexpr uint32_t ENTRY = 32;
+
+  // Temporary map in memory (max 64 like SimpleFS)
+  FsIndexEntry map[64];
+  size_t mapCount = 0;
+
+  uint8_t rec[ENTRY];
+  for (uint32_t off = 0; off < DIR_SIZE; off += ENTRY) {
+    if (dev->read(DIR_START + off, rec, ENTRY) != ENTRY) break;
+    if (isAllFF(rec, ENTRY)) break;                  // end-of-log
+    if (rec[0] != 0x57 || rec[1] != 0x46) continue;  // signature "WF"
+    uint8_t flags = rec[2];
+    uint8_t nlen = rec[3];
+    if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
+
+    char name[ActiveFS::MAX_NAME + 1];
+    memset(name, 0, sizeof(name));
+    for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
+    bool deleted = (flags & 0x01) != 0;
+    uint32_t size = rd32_be(&rec[24]);
+    uint32_t seq = rd32_be(&rec[28]);
+
+    // Upsert by name, keep highest seq
+    int idx = -1;
+    for (size_t i = 0; i < mapCount; ++i) {
+      if (strncmp(map[i].name, name, ActiveFS::MAX_NAME) == 0) {
+        idx = (int)i;
+        break;
+      }
+    }
+    if (idx < 0) {
+      if (mapCount < 64) {
+        idx = (int)mapCount++;
+        strncpy(map[idx].name, name, ActiveFS::MAX_NAME);
+      } else continue;
+    }
+    if (seq >= map[idx].seq) {
+      map[idx].seq = seq;
+      map[idx].deleted = deleted;
+      map[idx].size = size;
+    }
+  }
+
+  // Copy to out if requested
+  if (out && outMax) {
+    size_t n = (mapCount < outMax) ? mapCount : outMax;
+    for (size_t i = 0; i < n; ++i) out[i] = map[i];
+  }
+  return mapCount;
+}
+static bool hasPrefix(const char* name, const char* prefix) {
+  // Helpers to test prefix match and extract single-level child
+  size_t lp = strlen(prefix);
+  return strncmp(name, prefix, lp) == 0;
+}
+static bool childOfFolder(const char* name, const char* folderPrefix, const char*& childOut) {
+  // folderPrefix must end with '/'
+  size_t lp = strlen(folderPrefix);
+  if (strncmp(name, folderPrefix, lp) != 0) return false;
+  const char* rest = name + lp;
+  if (*rest == 0) return false;  // this is the folder marker itself
+  // Only immediate child (no further '/')
+  const char* slash = strchr(rest, '/');
+  if (slash) return false;
+  childOut = rest;
+  return true;
+}
+
+// ========== CWD + path helpers ==========
+static char g_cwd[ActiveFS::MAX_NAME + 1] = "";  // "" = root, printed as "/"
+static void pathStripTrailingSlashes(char* p) {
+  if (!p) return;
+  size_t n = strlen(p);
+  while (n > 0 && p[n - 1] == '/') { p[--n] = 0; }
+}
+static bool pathJoin(char* out, size_t outCap, const char* base, const char* name, bool wantTrailingSlash) {
+  if (!out || !name) return false;
+  // Absolute path?
+  if (name[0] == '/') {
+    // strip leading '/'
+    const char* s = name + 1;
+    size_t L = strlen(s);
+    if (wantTrailingSlash && (L == 0 || s[L - 1] != '/')) {
+      int need = snprintf(out, outCap, "%s/", s);
+      if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= outCap) return false;
+      return true;
+    } else {
+      int need = snprintf(out, outCap, "%s", s);
+      if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= outCap) return false;
+      return true;
+    }
+  }
+  // Relative path: base + "/" + name
+  if (!base) base = "";
+  char tmp[ActiveFS::MAX_NAME + 1];
+  int need = 0;
+  if (base[0] == 0) {
+    need = snprintf(tmp, sizeof(tmp), "%s", name);
+  } else if (name[0] == 0) {
+    need = snprintf(tmp, sizeof(tmp), "%s", base);
+  } else {
+    need = snprintf(tmp, sizeof(tmp), "%s/%s", base, name);
+  }
+  if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= sizeof(tmp)) return false;
+  // Optional trailing slash
+  if (wantTrailingSlash) {
+    if (tmp[0] == 0 || tmp[strlen(tmp) - 1] != '/') {
+      if (strlen(tmp) + 1 > ActiveFS::MAX_NAME) return false;
+      strncat(tmp, "/", sizeof(tmp) - strlen(tmp) - 1);
+    }
+  }
+  // Copy to out
+  size_t len = strlen(tmp);
+  if (len >= outCap) return false;
+  memcpy(out, tmp, len + 1);
+  return true;
+}
+static void pathParent(char* p) {
+  if (!p) return;
+  pathStripTrailingSlashes(p);
+  size_t n = strlen(p);
+  if (n == 0) return;
+  // find last '/'
+  char* last = strrchr(p, '/');
+  if (!last) {
+    p[0] = 0;  // up to root
+  } else if (last == p) {
+    p[0] = 0;  // treat single-level as root (SimpleFS has no true root entry)
+  } else {
+    *last = 0;
   }
 }
 
@@ -993,6 +1232,26 @@ static void printHelp() {
   Console.println("      Arrows: move   Backspace/Delete: edit   Enter: newline");
   Console.println("      Ctrl+C: show cursor position   Ctrl+X: prompt to save and exit");
   Console.println();
+  Console.println("Folders (SimpleFS path emulation; full path <= 32 chars):");
+  Console.println("  pwd                         - show current folder (\"/\" = root)");
+  Console.println("  cd / | cd .. | cd .         - change folder (root, parent, stay)");
+  Console.println("  cd <path>                   - change to relative or absolute path");
+  Console.println("  mkdir <path>                - create folder (creates zero-byte marker)");
+  Console.println("  ls [path]                   - list current or specified folder");
+  Console.println("  rmdir <path> [-r]           - remove folder; -r deletes all children");
+  Console.println("  touch <path|name|folder/>   - create empty file if missing; no-op if exists");
+  Console.println("                                if path ends with '/', creates folder marker (mkdir shortcut)");
+  Console.println("Examples:");
+  Console.println("  mkdir scripts            -> creates folder marker 'scripts/'");
+  Console.println("  cd scripts               -> change into 'scripts'");
+  Console.println("  writeblob scripts/blink blinkscript");
+  Console.println("  ls                       -> shows 'blink' and any child folders");
+  Console.println("  cd /; ls scripts         -> list contents of '/scripts'");
+  Console.println("  rmdir scripts -r         -> delete folder and all files under it");
+  Console.println("Notes:");
+  Console.println("  - SimpleFS is flat; folders are filename prefixes + trailing '/'.");
+  Console.println("  - Use short paths (<= 32 chars total). No nested enumeration by FS API; ls filters by prefix.");
+  Console.println();
   Console.println("Co-Processor (serial RPC) commands:");
   Console.println("  coproc ping                  - HELLO (version/features)");
   Console.println("  coproc info                  - INFO (flags, blob_len, mailbox_max)");
@@ -1525,6 +1784,176 @@ static void handleCommand(char* line) {
       Console.println("cc: failed");
     }
 
+  } else if (!strcmp(t0, "pwd")) {
+    Console.print("cwd: /");
+    Console.println(g_cwd);
+
+  } else if (!strcmp(t0, "cd")) {
+    char* arg;
+    if (!nextToken(p, arg)) {
+      Console.print("cwd: /");
+      Console.println(g_cwd);
+      return;
+    }
+    if (!strcmp(arg, "/")) {
+      g_cwd[0] = 0;  // root
+      Console.println("ok");
+      return;
+    }
+    if (!strcmp(arg, ".")) {
+      Console.println("ok");
+      return;
+    }
+    if (!strcmp(arg, "..")) {
+      pathParent(g_cwd);
+      Console.println("ok");
+      return;
+    }
+    char target[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(target, sizeof(target), g_cwd, arg, /*wantTrailingSlash*/ true)) {
+      Console.println("cd: path too long for SimpleFS (<=32 chars)");
+      return;
+    }
+    // Only allow cd into existing folder marker, otherwise reject (you can relax this if desired)
+    if (!folderExists(target)) {
+      Console.println("cd: no such folder (create with mkdir)");
+      return;
+    }
+    // Store without trailing slash in cwd
+    target[strlen(target) - 1] = 0;  // drop trailing '/'
+    strncpy(g_cwd, target, sizeof(g_cwd));
+    g_cwd[sizeof(g_cwd) - 1] = 0;
+    Console.println("ok");
+
+  } else if (!strcmp(t0, "mkdir")) {
+    char* arg;
+    if (!nextToken(p, arg)) {
+      Console.println("usage: mkdir <name|/abs|rel/path>");
+      return;
+    }
+    char marker[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(marker, sizeof(marker), g_cwd, arg, /*wantTrailingSlash*/ true)) {
+      Console.println("mkdir: path too long for SimpleFS (<=32 chars)");
+      return;
+    }
+    if (folderExists(marker)) {
+      Console.println("mkdir: already exists");
+      return;
+    }
+    if (mkdirFolder(marker)) Console.println("mkdir: ok");
+    else Console.println("mkdir: failed");
+
+  } else if (!strcmp(t0, "ls")) {
+    // optional path
+    char* arg;
+    char folder[ActiveFS::MAX_NAME + 1];
+    if (nextToken(p, arg)) {
+      if (!pathJoin(folder, sizeof(folder), g_cwd, arg, /*wantTrailingSlash*/ true)) {
+        Console.println("ls: path too long");
+        return;
+      }
+    } else {
+      if (!pathJoin(folder, sizeof(folder), g_cwd, "", /*wantTrailingSlash*/ true)) {
+        Console.println("ls: path error");
+        return;
+      }
+    }
+    FsIndexEntry idx[64];
+    size_t n = buildFsIndex(idx, 64);
+    Console.print("Listing /");
+    Console.print(folder);
+    Console.println(":");
+    // show folder marker first if present
+    if (folderExists(folder)) Console.println("  .");
+    // immediate children only
+    for (size_t i = 0; i < n; ++i) {
+      if (idx[i].deleted) continue;
+      const char* child = nullptr;
+      if (childOfFolder(idx[i].name, folder, child)) {
+        Console.print("  ");
+        Console.print(child);
+        // show slash if this is a child folder (has a matching "child/" marker entry)
+        char childMarker[ActiveFS::MAX_NAME + 1];
+        if (pathJoin(childMarker, sizeof(childMarker), folder, child, true) && folderExists(childMarker)) {
+          Console.print('/');
+        }
+        Console.print("  (");
+        Console.print(idx[i].size);
+        Console.println(" bytes)");
+      }
+    }
+
+  } else if (!strcmp(t0, "rmdir")) {
+    // rmdir <path> [-r]
+    char* arg;
+    if (!nextToken(p, arg)) {
+      Console.println("usage: rmdir <name|path> [-r]");
+      return;
+    }
+    bool recursive = false;
+    char* opt;
+    if (nextToken(p, opt) && !strcmp(opt, "-r")) recursive = true;
+
+    char folder[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(folder, sizeof(folder), g_cwd, arg, /*wantTrailingSlash*/ true)) {
+      Console.println("rmdir: path too long");
+      return;
+    }
+
+    // Build index to find children under prefix
+    FsIndexEntry idx[64];
+    size_t n = buildFsIndex(idx, 64);
+    bool empty = true;
+    for (size_t i = 0; i < n; ++i) {
+      if (idx[i].deleted) continue;
+      if (hasPrefix(idx[i].name, folder)) {
+        // ignore the folder marker itself
+        if (strlen(idx[i].name) == strlen(folder)) continue;
+        empty = false;
+        break;
+      }
+    }
+
+    if (!empty && !recursive) {
+      Console.println("rmdir: not empty (use -r to remove all files under folder)");
+      return;
+    }
+
+    // If recursive, delete everything with the prefix
+    if (recursive) {
+      size_t delCount = 0;
+      for (size_t i = 0; i < n; ++i) {
+        if (idx[i].deleted) continue;
+        if (hasPrefix(idx[i].name, folder)) {
+          if (activeFs.deleteFile(idx[i].name)) delCount++;
+          yield();
+        }
+      }
+      Console.print("rmdir -r: deleted ");
+      Console.print((unsigned)delCount);
+      Console.println(" entries");
+      return;
+    }
+
+    // Empty: remove just the marker if it exists
+    if (folderExists(folder)) {
+      if (activeFs.deleteFile(folder)) Console.println("rmdir: ok");
+      else Console.println("rmdir: failed to remove marker");
+    } else {
+      Console.println("rmdir: marker not found (already removed?)");
+    }
+
+  } else if (!strcmp(t0, "touch")) {
+    char* pathArg;
+    if (!nextToken(p, pathArg)) {
+      Console.println("usage: touch <path|name|folder/>");
+      return;
+    }
+    if (touchPath(g_cwd, pathArg)) {
+      Console.println("ok");
+    } else {
+      Console.println("touch failed");
+    }
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
@@ -1542,7 +1971,7 @@ void setup() {
 
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
-  uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS });
+  uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3 });
 
   size_t found = uniMem.rescan();
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);

@@ -319,13 +319,78 @@ public:
   }
 
   void listFilesToSerial(Stream& out = Serial) {
-    out.println("Files (UnifiedSPIMem SimpleFS):");
+    // Device info (style, CS, capacity)
+    const char* style = _dev.styleName();
+    const uint8_t cs = _dev.cs();
+    const uint64_t devCap = _dev.capacityBytes();
+
+    // FS region math (DIR + DATA)
+    const uint32_t dirUsed = _dirWriteOffset;
+    const uint32_t dirFree = (DIR_SIZE > dirUsed) ? (DIR_SIZE - dirUsed) : 0;
+
+    const uint32_t dataCap = (_capacity > DATA_START) ? (_capacity - DATA_START) : 0;
+    uint32_t dataUsed = (_dataHead > DATA_START) ? (_dataHead - DATA_START) : 0;
+    if (dataUsed > dataCap) dataUsed = dataCap;
+    const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
+
+    auto printPct = [&](uint32_t num, uint32_t den) {
+      if (den == 0) {
+        out.print("n/a");
+        return;
+      }
+      uint32_t scaled = (uint32_t)(((uint64_t)num * 10000ULL + (den / 2)) / den);  // 2 decimals, rounded
+      uint32_t ip = scaled / 100;
+      uint32_t fp = scaled % 100;
+      out.print(ip);
+      out.print('.');
+      if (fp < 10) out.print('0');
+      out.print(fp);
+      out.print('%');
+    };
+
+    out.printf("Files (%s, CS=%u, %llu bytes total; FS data=%lu bytes)\n",
+               style, cs, (unsigned long long)devCap, (unsigned long)dataCap);
+
+    out.print("Usage: data used=");
+    out.print((unsigned long)dataUsed);
+    out.print(" (");
+    printPct(dataUsed, dataCap);
+    out.print(")  data free=");
+    out.print((unsigned long)dataFree);
+    out.print(" (");
+    printPct(dataFree, dataCap);
+    out.println(")");
+
+    out.print("       dir used=");
+    out.print((unsigned long)dirUsed);
+    out.print(" (");
+    printPct(dirUsed, DIR_SIZE);
+    out.print(")  dir free=");
+    out.print((unsigned long)dirFree);
+    out.print(" (");
+    printPct(dirFree, DIR_SIZE);
+    out.println(")");
+
+    // File list
     for (size_t i = 0; i < _fileCount; ++i) {
+      if (_files[i].deleted) continue;
+      const char* nm = _files[i].name;
+      size_t nlen = strlen(nm);
+      bool isFolder = (nlen > 0 && nm[nlen - 1] == '/') && (_files[i].size == 0);
+      if (isFolder) {
+        out.printf("- %s\t (folder)\n", nm);
+        continue;
+      }
+      out.printf("- %s\t size=%u\t addr=0x%08lX", nm, (unsigned)_files[i].size, (unsigned long)_files[i].addr);
+      uint32_t cap = (_files[i].capEnd > _files[i].addr) ? (_files[i].capEnd - _files[i].addr) : 0;
+      out.printf("\t cap=%u\t slotSafe=%s\n", (unsigned)cap, _files[i].slotSafe ? "Y" : "N");
+    }
+    /*for (size_t i = 0; i < _fileCount; ++i) {
       if (_files[i].deleted) continue;
       out.printf("- %s\t size=%u\t addr=0x%08lX", _files[i].name, (unsigned)_files[i].size, (unsigned long)_files[i].addr);
       uint32_t cap = (_files[i].capEnd > _files[i].addr) ? (_files[i].capEnd - _files[i].addr) : 0;
       out.printf("\t cap=%u\t slotSafe=%s\n", (unsigned)cap, _files[i].slotSafe ? "Y" : "N");
-    }
+    }*/
   }
 
   size_t fileCount() const {
@@ -496,6 +561,18 @@ public:
         // Unknown: best effort raw write
         return _dev->write((uint64_t)addr, buf, len);
     }
+  }
+
+  const char* styleName() const {
+    return UnifiedSpiMem::deviceTypeName(_type);
+  }
+
+  uint8_t cs() const {
+    return _dev ? _dev->cs() : 0xFF;
+  }
+
+  uint64_t capacityBytes() const {
+    return _dev ? _dev->capacity() : 0;
   }
 
 private:
