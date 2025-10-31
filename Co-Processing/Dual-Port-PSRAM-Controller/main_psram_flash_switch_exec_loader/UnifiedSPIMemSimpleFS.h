@@ -348,8 +348,7 @@ public:
       out.print('%');
     };
 
-    out.printf("Files (%s, CS=%u, %llu bytes total; FS data=%lu bytes)\n",
-               style, cs, (unsigned long long)devCap, (unsigned long)dataCap);
+    out.printf("Files (%s, CS=%u, %llu bytes total; FS data=%lu bytes)\n", style, cs, (unsigned long long)devCap, (unsigned long)dataCap);
 
     out.print("Usage: data used=");
     out.print((unsigned long)dataUsed);

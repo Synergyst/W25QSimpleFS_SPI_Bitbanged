@@ -29,10 +29,8 @@ struct BlobReg;               // Forward declaration
 static ConsolePrint Console;  // Console wrapper
 // ------- MC Compiiler -------
 #include "MCCompiler.h"
-
 // ------- User preference configuration -------
 #include "blob_mailbox_config.h"  // Do not remove this line. This is the memory address where we handle the shared interprocess-mailbox-buffer
-
 #include "blob_ret42.h"
 #define FILE_RET42 "ret42"
 #include "blob_add2.h"
@@ -46,16 +44,13 @@ static ConsolePrint Console;  // Console wrapper
 #include "scripts.h"
 #define FILE_BLINKSCRIPT "blinkscript"
 #define FILE_ONSCRIPT "onscript"
-
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
-
 // Pins you already have:
 const uint8_t PIN_FLASH_MISO = 12;  // GP12
 const uint8_t PIN_FLASH_CS = 9;     // GP9
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_FLASH_MOSI = 11;  // GP11
-
 const uint8_t PIN_PSRAM_MISO = 12;  // GP12
 const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
 const uint8_t PIN_PSRAM_SCK = 10;   // GP10
@@ -63,7 +58,6 @@ const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
 const uint8_t PIN_PSRAM_CS1 = 15;   // GP15
 const uint8_t PIN_PSRAM_CS2 = 26;   // GP26
 const uint8_t PIN_PSRAM_CS3 = 27;   // GP27
-
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
 const size_t PERSIST_LEN = 32;
@@ -80,7 +74,6 @@ PSRAMUnifiedSimpleFS fsPSRAM;
 // If your flash chip is actually MX35LF (SPI-NAND), do this instead:
 // MX35UnifiedSimpleFS fsFlash;r
 static bool g_dev_mode = true;
-
 // ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -222,25 +215,68 @@ static bool makePath(char* out, size_t outCap, const char* folder, const char* n
   if ((size_t)needed >= outCap) return false;
   return true;
 }
+static void normalizePathInPlace(char* s, bool wantTrailingSlash) {
+  // Collapse duplicate slashes, strip leading '/', and keep/strip trailing slash as requested
+  if (!s) return;
+  // Strip leading slashes
+  size_t r = 0;
+  while (s[r] == '/') ++r;
+  // Collapse duplicate slashes
+  size_t w = 0;
+  for (; s[r]; ++r) {
+    char c = s[r];
+    if (c == '/' && w > 0 && s[w - 1] == '/') continue;
+    s[w++] = c;
+  }
+  s[w] = 0;
+  // Enforce or strip trailing slash
+  size_t n = strlen(s);
+  if (wantTrailingSlash) {
+    if (n > 0 && s[n - 1] != '/') {
+      if (n + 1 < ActiveFS::MAX_NAME + 1) {
+        s[n] = '/';
+        s[n + 1] = 0;
+      }
+    }
+  } else {
+    while (n > 0 && s[n - 1] == '/') { s[--n] = 0; }
+  }
+}
+static bool makePathSafe(char* out, size_t outCap, const char* folder, const char* name) {
+  // Safe "folder/name" join without introducing double slashes; stores without trailing slash.
+  if (!out || !folder || !name) return false;
+  char tmp[ActiveFS::MAX_NAME + 1];
+  if (folder[0] == 0) {
+    if (snprintf(tmp, sizeof(tmp), "%s", name) < 0) return false;
+  } else {
+    if (snprintf(tmp, sizeof(tmp), "%s/%s", folder, name) < 0) return false;
+  }
+  normalizePathInPlace(tmp, /*wantTrailingSlash=*/false);
+  size_t L = strlen(tmp);
+  if (L > ActiveFS::MAX_NAME || L >= outCap) return false;
+  memcpy(out, tmp, L + 1);
+  return true;
+}
 static bool writeFileToFolder(const char* folder, const char* fname, const uint8_t* data, uint32_t len) {
   char path[ActiveFS::MAX_NAME + 1];
-  if (!makePath(path, sizeof(path), folder, fname)) {
+  if (!makePathSafe(path, sizeof(path), folder, fname)) {
     Console.println("path too long for SimpleFS (max 32 chars)");
     return false;
   }
   // Create sector-aligned slot (optional) then write; or just writeFile() directly.
   if (!activeFs.exists(path)) {
-    // Reserve 1 sector by default; adjust as needed.
-    if (!activeFs.createFileSlot(path, ActiveFS::SECTOR_SIZE, data, len)) return false;
-    return true;
+    // Reserve at least one sector; if data is larger, round up to sector boundary.
+    uint32_t reserve = ActiveFS::SECTOR_SIZE;
+    if (len > reserve) reserve = (len + (ActiveFS::SECTOR_SIZE - 1)) & ~(ActiveFS::SECTOR_SIZE - 1);
+    return activeFs.createFileSlot(path, reserve, data, len);
   }
-  // Try in-place update first, fallback to reallocate
+  // Try in-place update first, allow reallocate if needed
   if (activeFs.writeFileInPlace(path, data, len, true)) return true;
   return activeFs.writeFile(path, data, len, /*ReplaceIfExists*/ 0);
 }
 static uint32_t readFileFromFolder(const char* folder, const char* fname, uint8_t* buf, uint32_t bufSize) {
   char path[ActiveFS::MAX_NAME + 1];
-  if (!makePath(path, sizeof(path), folder, fname)) {
+  if (!makePathSafe(path, sizeof(path), folder, fname)) {
     Console.println("path too long for SimpleFS (max 32 chars)");
     return 0;
   }
@@ -262,7 +298,6 @@ static bool touchPath(const char* cwd, const char* arg) {
   // Create an empty file if it doesn't exist. No-op if it already exists.
   // If the path ends with '/', treat it like a folder marker creation (mkdir shortcut).
   if (!arg) return false;
-
   // If arg ends with '/', interpret as folder marker (mkdir).
   size_t L = strlen(arg);
   if (L > 0 && arg[L - 1] == '/') {
@@ -274,23 +309,206 @@ static bool touchPath(const char* cwd, const char* arg) {
     if (folderExists(marker)) return true;  // already present
     return mkdirFolder(marker);
   }
-
   // Regular file path
   char path[ActiveFS::MAX_NAME + 1];
   if (!pathJoin(path, sizeof(path), cwd, arg, /*wantTrailingSlash*/ false)) {
     Console.println("touch: path too long (<= 32 chars)");
     return false;
   }
-
   if (activeFs.exists(path)) {
     // POSIX touch would update mtime; we have no timestamps, so it's a no-op.
     return true;
   }
-
   // Create zero-length file (no slot reserved, does not advance data head)
   return activeFs.writeFile(path, /*data*/ nullptr, /*size*/ 0, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists));
 }
+// ========== mv helpers ==========
+static const char* lastSlash(const char* s) {
+  const char* p = strrchr(s, '/');
+  return p ? (p + 1) : s;
+}
+static bool buildAbsFile(char* out, size_t outCap, const char* cwd, const char* path) {
+  // Normalize: build absolute file path (no trailing slash). Reject folder paths.
+  if (!path || !out) return false;
+  size_t L = strlen(path);
+  if (L > 0 && path[L - 1] == '/') return false;  // folder-like path not allowed here
+  return pathJoin(out, outCap, cwd, path, /*wantTrailingSlash*/ false);
+}
+static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
+  // Move/rename a file within the same SimpleFS (copy then delete).
+  // - If dst ends with '/', treat as folder (dst/<basename(src)>).
+  // - Destination is created as a sector-aligned slot (slotSafe=Y) using source capacity when possible.
+  if (!srcArg || !dstArg) return false;
 
+  // Build absolute source file (reject folder source)
+  char srcAbs[ActiveFS::MAX_NAME + 1];
+  if (!buildAbsFile(srcAbs, sizeof(srcAbs), cwd, srcArg)) {
+    Console.println("mv: invalid source path");
+    return false;
+  }
+
+  // Does source exist? Retrieve size and capacity
+  if (!activeFs.exists(srcAbs)) {
+    Console.println("mv: source not found");
+    return false;
+  }
+  uint32_t srcAddr = 0, srcSize = 0, srcCap = 0;
+  if (!activeFs.getFileInfo(srcAbs, srcAddr, srcSize, srcCap)) {
+    Console.println("mv: getFileInfo failed");
+    return false;
+  }
+
+  // Build destination (folder-aware)
+  char dstAbs[ActiveFS::MAX_NAME + 1];
+  size_t Ldst = strlen(dstArg);
+  bool dstIsFolder = (Ldst > 0 && dstArg[Ldst - 1] == '/');
+  if (dstIsFolder) {
+    // dst is a folder: ensure absolute folder path with trailing slash, then append basename
+    char folder[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(folder, sizeof(folder), cwd, dstArg, /*wantTrailingSlash*/ true)) {
+      Console.println("mv: destination folder path too long");
+      return false;
+    }
+    const char* base = lastSlash(srcAbs);
+    if (!makePath(dstAbs, sizeof(dstAbs), folder, base)) {
+      Console.println("mv: resulting path too long");
+      return false;
+    }
+  } else {
+    if (!buildAbsFile(dstAbs, sizeof(dstAbs), cwd, dstArg)) {
+      Console.println("mv: invalid destination path");
+      return false;
+    }
+  }
+
+  if (strcmp(srcAbs, dstAbs) == 0) {
+    Console.println("mv: source and destination are the same");
+    return true;
+  }
+
+  // Read source contents
+  uint8_t* buf = (uint8_t*)malloc(srcSize ? srcSize : 1);
+  if (!buf) {
+    Console.println("mv: malloc failed");
+    return false;
+  }
+  uint32_t got = activeFs.readFile(srcAbs, buf, srcSize);
+  if (got != srcSize) {
+    Console.println("mv: read failed");
+    free(buf);
+    return false;
+  }
+
+  // Prepare destination slot
+  uint32_t reserve = srcCap;
+  if (reserve < ActiveFS::SECTOR_SIZE) {
+    // If src wasn't allocated via slot, reserve at least one sector aligned
+    uint32_t a = (srcSize + (ActiveFS::SECTOR_SIZE - 1)) & ~(ActiveFS::SECTOR_SIZE - 1);
+    if (a > reserve) reserve = a;
+  }
+
+  bool ok = false;
+  if (!activeFs.exists(dstAbs)) {
+    // Create slot with same capacity budget and write contents in one go
+    ok = activeFs.createFileSlot(dstAbs, reserve, buf, srcSize);
+  } else {
+    // Destination exists: try in-place, otherwise replace
+    uint32_t dA, dS, dC;
+    if (!activeFs.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
+    if (dC >= srcSize) {
+      ok = activeFs.writeFileInPlace(dstAbs, buf, srcSize, false);
+    }
+    if (!ok) {
+      ok = activeFs.writeFile(dstAbs, buf, srcSize, /*ReplaceIfExists*/ 0);
+    }
+  }
+
+  if (!ok) {
+    Console.println("mv: write to destination failed");
+    free(buf);
+    return false;
+  }
+
+  // Delete source so another file can reuse its slot
+  if (!activeFs.deleteFile(srcAbs)) {
+    Console.println("mv: warning: source delete failed");
+    // still return success for the copy
+  } else {
+    Console.println("mv: ok");
+  }
+
+  free(buf);
+  return true;
+}
+static void printPct2(uint32_t num, uint32_t den) {
+  // Percent printer with 2 decimals (no float)
+  if (den == 0) {
+    Console.print("n/a");
+    return;
+  }
+  uint32_t scaled = (uint32_t)(((uint64_t)num * 10000ULL + (den / 2)) / den);
+  Console.printf("%lu.%02lu%%", (unsigned long)(scaled / 100), (unsigned long)(scaled % 100));
+}
+static uint32_t dirBytesUsedEstimate() {
+  // Count directory entries to estimate directory space used (32 bytes per valid entry)
+  FsIndexEntry tmp[64];
+  size_t n = buildFsIndex(tmp, 64);  // robust scan over full DIR
+  return (uint32_t)(n * 32u);
+}
+static void cmdDf() {
+  // Active device (mounted)
+  UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
+  const bool activeIsFlash = (dev != nullptr);
+  if (!dev) dev = fsPSRAM.raw().device();
+  if (dev) {
+    const auto t = dev->type();
+    const char* style = UnifiedSpiMem::deviceTypeName(t);
+    const uint8_t cs = dev->cs();
+    const uint64_t devCap = dev->capacity();
+
+    const uint32_t dataStart = activeFs.dataRegionStart();
+    const uint32_t fsCap32 = activeFs.capacity();
+    const uint32_t dataCap = (fsCap32 > dataStart) ? (fsCap32 - dataStart) : 0;
+    const uint32_t dataUsed = (activeFs.nextDataAddr() > dataStart) ? (activeFs.nextDataAddr() - dataStart) : 0;
+    const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
+    const uint32_t dirUsed = dirBytesUsedEstimate();
+    const uint32_t dirFree = (64u * 1024u > dirUsed) ? (64u * 1024u - dirUsed) : 0;
+
+    Console.println("Filesystem (active):");
+    Console.printf("  Device:  %s  CS=%u\n", style, (unsigned)cs);
+    Console.printf("  DevCap:  %llu bytes\n", (unsigned long long)devCap);
+    Console.printf("  FS data: %lu used (", (unsigned long)dataUsed);
+    printPct2(dataUsed, dataCap);
+    Console.printf(")  %lu free (", (unsigned long)dataFree);
+    printPct2(dataFree, dataCap);
+    Console.println(")");
+    Console.printf("  DIR:     %lu used (", (unsigned long)dirUsed);
+    printPct2(dirUsed, 64u * 1024u);
+    Console.printf(")  %lu free\n", (unsigned long)dirFree);
+  } else {
+    Console.println("Filesystem (active): none");
+  }
+
+  // Other detected devices (raw capacities)
+  size_t n = uniMem.detectedCount();
+  if (n == 0) return;
+  Console.println("Detected devices:");
+  for (size_t i = 0; i < n; ++i) {
+    const auto* di = uniMem.detectedInfo(i);
+    if (!di) continue;
+    // Mark which one is the active filesystem device (by CS + type)
+    bool isActive = false;
+    if (dev) {
+      isActive = (di->cs == dev->cs() && di->type == dev->type());
+    }
+    Console.printf("  CS=%u  Type=%s  Vendor=%s  Cap=%llu bytes%s\n",
+                   di->cs,
+                   UnifiedSpiMem::deviceTypeName(di->type),
+                   di->vendorName,
+                   (unsigned long long)di->capacityBytes,
+                   isActive ? "  [mounted]" : "");
+  }
+}
 // ========== Minimal directory enumeration (reads the DIR table directly) ==========
 static inline uint32_t rd32_be(const uint8_t* p) {
   return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
@@ -301,58 +519,66 @@ static bool isAllFF(const uint8_t* p, size_t n) {
   return true;
 }
 static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
-  // Access underlying device via FS handles
-  UnifiedSpiMem::MemDevice* dev = (g_storage == StorageBackend::Flash)
-                                    ? fsFlash.raw().device()
-                                    : fsPSRAM.raw().device();
+  // Use whichever device handle is open; prefer flash (that's what files shows)
+  UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
+  if (!dev) dev = fsPSRAM.raw().device();
   if (!dev) return 0;
 
   constexpr uint32_t DIR_START = 0x000000;
   constexpr uint32_t DIR_SIZE = 64 * 1024;
   constexpr uint32_t ENTRY = 32;
+  constexpr uint32_t CHUNK = 256;
 
-  // Temporary map in memory (max 64 like SimpleFS)
   FsIndexEntry map[64];
   size_t mapCount = 0;
 
-  uint8_t rec[ENTRY];
-  for (uint32_t off = 0; off < DIR_SIZE; off += ENTRY) {
-    if (dev->read(DIR_START + off, rec, ENTRY) != ENTRY) break;
-    if (isAllFF(rec, ENTRY)) break;                  // end-of-log
-    if (rec[0] != 0x57 || rec[1] != 0x46) continue;  // signature "WF"
-    uint8_t flags = rec[2];
-    uint8_t nlen = rec[3];
-    if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
+  uint8_t buf[CHUNK];
 
-    char name[ActiveFS::MAX_NAME + 1];
-    memset(name, 0, sizeof(name));
-    for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
-    bool deleted = (flags & 0x01) != 0;
-    uint32_t size = rd32_be(&rec[24]);
-    uint32_t seq = rd32_be(&rec[28]);
+  for (uint32_t off = 0; off < DIR_SIZE; off += CHUNK) {
+    size_t toRead = ((off + CHUNK) <= DIR_SIZE) ? CHUNK : (DIR_SIZE - off);
+    size_t got = dev->read(DIR_START + off, buf, toRead);
+    if (got == 0) continue;  // treat as empty; keep scanning
+    // Walk this chunk in 32-byte records
+    for (uint32_t c = 0; c + ENTRY <= got; c += ENTRY) {
+      const uint8_t* rec = &buf[c];
+      // Only accept records with "WF" header; skip everything else (including 0xFF blocks)
+      if (rec[0] != 0x57 || rec[1] != 0x46) continue;
 
-    // Upsert by name, keep highest seq
-    int idx = -1;
-    for (size_t i = 0; i < mapCount; ++i) {
-      if (strncmp(map[i].name, name, ActiveFS::MAX_NAME) == 0) {
-        idx = (int)i;
-        break;
+      uint8_t flags = rec[2];
+      uint8_t nlen = rec[3];
+      if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
+
+      char name[ActiveFS::MAX_NAME + 1];
+      memset(name, 0, sizeof(name));
+      for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
+
+      uint32_t size = rd32_be(&rec[24]);
+      uint32_t seq = rd32_be(&rec[28]);
+      bool deleted = (flags & 0x01) != 0;
+
+      // Upsert by name, keep highest seq
+      int idx = -1;
+      for (size_t i = 0; i < mapCount; ++i) {
+        if (strncmp(map[i].name, name, ActiveFS::MAX_NAME) == 0) {
+          idx = (int)i;
+          break;
+        }
       }
-    }
-    if (idx < 0) {
-      if (mapCount < 64) {
+      if (idx < 0) {
+        if (mapCount >= 64) continue;
         idx = (int)mapCount++;
         strncpy(map[idx].name, name, ActiveFS::MAX_NAME);
-      } else continue;
-    }
-    if (seq >= map[idx].seq) {
-      map[idx].seq = seq;
-      map[idx].deleted = deleted;
-      map[idx].size = size;
+        map[idx].name[ActiveFS::MAX_NAME] = 0;
+        map[idx].seq = 0;
+      }
+      if (seq >= map[idx].seq) {
+        map[idx].seq = seq;
+        map[idx].deleted = deleted;
+        map[idx].size = size;
+      }
     }
   }
 
-  // Copy to out if requested
   if (out && outMax) {
     size_t n = (mapCount < outMax) ? mapCount : outMax;
     for (size_t i = 0; i < n; ++i) out[i] = map[i];
@@ -376,7 +602,29 @@ static bool childOfFolder(const char* name, const char* folderPrefix, const char
   childOut = rest;
   return true;
 }
+static void dumpDirHeadRaw(uint32_t bytes = 256) {
+  UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
+  if (!dev) dev = fsPSRAM.raw().device();
+  if (!dev) {
+    Console.println("lsdebug: no device");
+    return;
+  }
 
+  if (bytes == 0 || bytes > 1024) bytes = 256;  // keep it small on console
+  uint8_t buf[1024];
+  size_t got = dev->read(0, buf, bytes);
+  Console.printf("lsdebug: read %u bytes @ 0x000000\n", (unsigned)got);
+  for (size_t i = 0; i < got; i += 16) {
+    Console.printf("  %04u: ", (unsigned)i);
+    for (size_t j = 0; j < 16 && (i + j) < got; ++j) {
+      uint8_t b = buf[i + j];
+      if (b < 16) Console.print('0');
+      Console.print(b, HEX);
+      Console.print(' ');
+    }
+    Console.println();
+  }
+}
 // ========== CWD + path helpers ==========
 static char g_cwd[ActiveFS::MAX_NAME + 1] = "";  // "" = root, printed as "/"
 static void pathStripTrailingSlashes(char* p) {
@@ -386,44 +634,41 @@ static void pathStripTrailingSlashes(char* p) {
 }
 static bool pathJoin(char* out, size_t outCap, const char* base, const char* name, bool wantTrailingSlash) {
   if (!out || !name) return false;
-  // Absolute path?
+
+  // Absolute path: strip one leading '/'
   if (name[0] == '/') {
-    // strip leading '/'
     const char* s = name + 1;
     size_t L = strlen(s);
-    if (wantTrailingSlash && (L == 0 || s[L - 1] != '/')) {
-      int need = snprintf(out, outCap, "%s/", s);
-      if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= outCap) return false;
-      return true;
-    } else {
-      int need = snprintf(out, outCap, "%s", s);
-      if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= outCap) return false;
-      return true;
+    if (L > ActiveFS::MAX_NAME || L >= outCap) return false;
+    memcpy(out, s, L + 1);
+    // Add trailing slash only for non-root
+    if (wantTrailingSlash && L > 0 && out[L - 1] != '/') {
+      if (L + 1 > ActiveFS::MAX_NAME || L + 2 > outCap) return false;
+      out[L] = '/';
+      out[L + 1] = 0;
     }
+    return true;
   }
-  // Relative path: base + "/" + name
+
+  // Relative
   if (!base) base = "";
   char tmp[ActiveFS::MAX_NAME + 1];
   int need = 0;
-  if (base[0] == 0) {
-    need = snprintf(tmp, sizeof(tmp), "%s", name);
-  } else if (name[0] == 0) {
-    need = snprintf(tmp, sizeof(tmp), "%s", base);
-  } else {
-    need = snprintf(tmp, sizeof(tmp), "%s/%s", base, name);
-  }
+  if (base[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", name);
+  else if (name[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", base);
+  else need = snprintf(tmp, sizeof(tmp), "%s/%s", base, name);
   if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= sizeof(tmp)) return false;
-  // Optional trailing slash
-  if (wantTrailingSlash) {
-    if (tmp[0] == 0 || tmp[strlen(tmp) - 1] != '/') {
-      if (strlen(tmp) + 1 > ActiveFS::MAX_NAME) return false;
-      strncat(tmp, "/", sizeof(tmp) - strlen(tmp) - 1);
-    }
+
+  size_t L = strlen(tmp);
+  // Add trailing slash only for non-root
+  if (wantTrailingSlash && L > 0 && tmp[L - 1] != '/') {
+    if (L + 1 > ActiveFS::MAX_NAME) return false;
+    tmp[L] = '/';
+    tmp[L + 1] = 0;
   }
-  // Copy to out
-  size_t len = strlen(tmp);
-  if (len >= outCap) return false;
-  memcpy(out, tmp, len + 1);
+
+  if (L >= outCap) return false;
+  memcpy(out, tmp, L + 1);
   return true;
 }
 static void pathParent(char* p) {
@@ -441,7 +686,13 @@ static void pathParent(char* p) {
     *last = 0;
   }
 }
-
+static bool isFolderMarkerName(const char* nm) {
+  size_t n = strlen(nm);
+  return (n > 0 && nm[n - 1] == '/');
+}
+static const char* firstSlash(const char* s) {
+  return strchr(s, '/');
+}
 // ========== Blob registry ==========
 struct BlobReg {
   const char* id;
@@ -458,15 +709,12 @@ static const BlobReg g_blobs[] = {
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-
 // ========== Return mailbox reservation (Scratch) ==========
 extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
 int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
-
 // ================= ExecHost header =================
 #include "ExecHost.h"
 static ExecHost Exec;
-
 // ================= FSHelpers header =================
 // Helper to supply Exec with current FS function pointers
 static void updateExecFsTable() {
@@ -482,7 +730,6 @@ static void updateExecFsTable() {
   t.deleteFile = activeFs.deleteFile;
   Exec.attachFS(t);
 }
-
 // ================= Memory Diagnostics =================
 // Portable free stack helper for core0 (current core).
 // On RP2040, uses linker symbols __StackTop/__StackBottom.
@@ -498,12 +745,10 @@ static uint32_t freeStackCurrentCoreApprox() {
   uintptr_t sp = (uintptr_t)&marker;  // approximate SP
   uintptr_t top = (uintptr_t)&__StackTop;
   uintptr_t bottom = (uintptr_t)&__StackBottom;
-
   // Validate and compute: ARM stack grows down => bottom < sp <= top
   if (top > bottom && sp >= bottom && sp <= top) {
     return (uint32_t)(sp - bottom);  // free = SP - bottom
   }
-
   // Fallback: clamp "gap to heap end" at 0
   void* heapEnd = sbrk(0);
   intptr_t gap = (intptr_t)sp - (intptr_t)heapEnd;
@@ -533,7 +778,6 @@ static void printStackInfo() {
   Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
 }
 #endif
-
 // ========== FS helpers and console (unchanged) ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -674,13 +918,11 @@ static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = 
   uint64_t total = 0;
   out.println();
   out.println("PSRAM capacity report (Unified):");
-
   for (size_t i = 0; i < mgr.detectedCount(); ++i) {
     const auto* di = mgr.detectedInfo(i);
     if (!di || di->type != UnifiedSpiMem::DeviceType::Psram) continue;
     banks++;
     total += di->capacityBytes;
-
     out.print("  Bank ");
     out.print(banks - 1);
     out.print(" (CS=");
@@ -702,7 +944,6 @@ static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = 
     }
     out.println();
   }
-
   out.print("Banks: ");
   out.println((unsigned)banks);
   out.print("Total: ");
@@ -718,13 +959,11 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     out.println("PSRAM smoke test: PSRAM device not open");
     return;
   }
-
   const uint64_t cap = dev->capacity();
   if (cap < 1024) {
     out.println("PSRAM smoke test: capacity too small");
     return;
   }
-
   // Prefer testing right after FS allocation head when possible
   const uint32_t fsHead = fs.raw().nextDataAddr();
   const uint32_t dataStart = fs.raw().dataRegionStart();
@@ -738,13 +977,11 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
   // Align a bit (not strictly needed for PSRAM)
   testAddr = (testAddr + 0xFF) & ~0xFFull;
   if (testAddr < dataStart) testAddr = dataStart;
-
   out.print("PSRAM smoke test @ 0x");
   out.print((unsigned long)testAddr, HEX);
   out.print(" size=");
   out.print(TEST_SIZE);
   out.println(" bytes");
-
   uint8_t* original = (uint8_t*)malloc(TEST_SIZE);
   uint8_t* verify = (uint8_t*)malloc(TEST_SIZE);
   if (!original || !verify) {
@@ -753,7 +990,6 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     if (verify) free(verify);
     return;
   }
-
   // Save original contents
   if (dev->read(testAddr, original, TEST_SIZE) != TEST_SIZE) {
     out.println("read (backup) failed");
@@ -761,7 +997,6 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     free(verify);
     return;
   }
-
   // Pattern 1: 0xAA
   memset(verify, 0xAA, TEST_SIZE);
   if (!dev->write(testAddr, verify, TEST_SIZE)) {
@@ -789,7 +1024,6 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     if ((i & 63) == 0) yield();
   }
   out.println(okAA ? "Pattern 0xAA OK" : "Pattern 0xAA mismatch");
-
   // Pattern 2: address-based
   for (uint32_t i = 0; i < TEST_SIZE; ++i) {
     verify[i] = (uint8_t)((testAddr + i) ^ 0x5A);
@@ -828,18 +1062,15 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
   }
   out.println(okAddr ? "Pattern addr^0x5A OK" : "Pattern addr^0x5A mismatch");
   free(rb);
-
   // Restore original contents
   if (!dev->write(testAddr, original, TEST_SIZE)) {
     out.println("restore failed (data left with test pattern)");
   } else {
     out.println("restore OK");
   }
-
   free(original);
   free(verify);
 }
-
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
 static inline int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -955,10 +1186,8 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists));
   return ok;
 }
-
 // ================= CompilerHelpers header =================
 #include "CompilerHelpers.h"
-
 // ===================== Co-Processor RPC helpers (for CMD_FUNC) =====================
 static uint32_t g_coproc_seq = 1;
 static bool coprocWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
@@ -1118,10 +1347,8 @@ static bool coprocCallFunc(const char* name, const int32_t* argv, uint32_t argc,
     }
   }
 }
-
 // ----------------- Nano-like editor integration -----------------
 #include "TextEditor.h"
-
 // ========== Serial console / command handling ==========
 static char lineBuf[FS_SECTOR_SIZE];
 static bool readLine() {
@@ -1132,7 +1359,6 @@ static bool readLine() {
     int ic = Serial.read();
     if (ic < 0) break;
     char c = (char)ic;
-
     // Handle Windows CRLF and Unix LF
     if (c == '\r' || c == '\n') {
       // Swallow paired LF after CR for Windows
@@ -1149,7 +1375,6 @@ static bool readLine() {
       pos = 0;
       return true;
     }
-
     // Backspace / Delete
     if ((c == 0x08) || (c == 0x7F)) {
       if (pos > 0) {
@@ -1161,7 +1386,6 @@ static bool readLine() {
       }
       continue;
     }
-
     // Printable ASCII
     if (c >= 32 && c <= 126) {
       if (pos + 1 < sizeof(lineBuf)) {
@@ -1173,7 +1397,6 @@ static bool readLine() {
       }
       continue;
     }
-
     // Ignore other control bytes
   }
   return false;
@@ -1241,6 +1464,8 @@ static void printHelp() {
   Console.println("  rmdir <path> [-r]           - remove folder; -r deletes all children");
   Console.println("  touch <path|name|folder/>   - create empty file if missing; no-op if exists");
   Console.println("                                if path ends with '/', creates folder marker (mkdir shortcut)");
+  Console.println("  df                          - show device and FS usage (capacity/used/free/%)");
+  Console.println("  mv <src> <dst|folder/>      - move/rename file; if dst ends with '/', moves into folder");
   Console.println("Examples:");
   Console.println("  mkdir scripts            -> creates folder marker 'scripts/'");
   Console.println("  cd scripts               -> change into 'scripts'");
@@ -1283,10 +1508,8 @@ static void handleCommand(char* line) {
   char* p = line;
   char* t0;
   if (!nextToken(p, t0)) return;
-
   if (!strcmp(t0, "help")) {
     printHelp();
-
   } else if (!strcmp(t0, "nano") || !strcmp(t0, "edit")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1297,7 +1520,6 @@ static void handleCommand(char* line) {
     Console.printf("Opening editor for '%s'...\n", fn);
     runNanoEditor(fn);
     Console.println("Returned to console.");
-
   } else if (!strcmp(t0, "storage")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1322,7 +1544,6 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: storage [flash|psram]");
     }
-
   } else if (!strcmp(t0, "mode")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1337,7 +1558,6 @@ static void handleCommand(char* line) {
       g_dev_mode = false;
       Console.println("mode=prod");
     } else Console.println("usage: mode [dev|prod]");
-
   } else if (!strcmp(t0, "persist")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1383,13 +1603,10 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: persist [read|write]");
     }
-
   } else if (!strcmp(t0, "autogen")) {
     autogenBlobWrites();
-
   } else if (!strcmp(t0, "files")) {
     activeFs.listFilesToSerial();
-
   } else if (!strcmp(t0, "info")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1406,7 +1623,6 @@ static void handleCommand(char* line) {
       Console.print(" cap=");
       Console.println(c);
     } else Console.println("not found");
-
   } else if (!strcmp(t0, "dump")) {
     char* fn;
     char* nstr;
@@ -1415,7 +1631,6 @@ static void handleCommand(char* line) {
       return;
     }
     dumpFileHead(fn, (uint32_t)strtoul(nstr, nullptr, 0));
-
   } else if (!strcmp(t0, "mkSlot")) {
     char* fn;
     char* nstr;
@@ -1427,7 +1642,6 @@ static void handleCommand(char* line) {
     uint32_t res = (uint32_t)strtoul(nstr, nullptr, 0);
     if (activeFs.createFileSlot(fn, res, nullptr, 0)) Console.println("slot created");
     else Console.println("mkSlot failed");
-
   } else if (!strcmp(t0, "writeblob")) {
     char* fn;
     char* bid;
@@ -1443,7 +1657,6 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
-
   } else if (!strcmp(t0, "exec")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1495,7 +1708,6 @@ static void handleCommand(char* line) {
         free(raw);
       }
     }
-
   } else if (!strcmp(t0, "bg")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1546,7 +1758,6 @@ static void handleCommand(char* line) {
     } else {
       Console.println("bg: usage: bg [status|query] | bg kill|cancel [force]");
     }
-
   } else if (!strcmp(t0, "coproc")) {
     char* sub;
     if (!nextToken(p, sub)) {
@@ -1643,10 +1854,8 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: coproc ping|info|exec <file> [a0..aN]|sexec <file> [a0..aN]|func <name> [a0..aN]|status|mbox [n]|cancel|reset");
     }
-
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
-
   } else if (!strcmp(t0, "timeout")) {
     char* msStr;
     if (!nextToken(p, msStr)) {
@@ -1660,7 +1869,6 @@ static void handleCommand(char* line) {
       Console.print(ms);
       Console.println(" ms");
     }
-
   } else if (!strcmp(t0, "meminfo")) {
     Console.println();
     Console.printf("Total Heap:        %d bytes\n", rp2040.getTotalHeap());
@@ -1675,17 +1883,14 @@ static void handleCommand(char* line) {
     Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
 #endif
     psramPrintCapacityReport(uniMem);
-
   } else if (!strcmp(t0, "psramsmoketest")) {
     psramPrintCapacityReport(uniMem);
     psramSafeSmokeTest(fsPSRAM);
-
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
     delay(20);
     yield();
     rp2040.reboot();
-
   } else if (!strcmp(t0, "del")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1694,11 +1899,9 @@ static void handleCommand(char* line) {
     }
     if (activeFs.deleteFile && activeFs.deleteFile(fn)) Console.println("deleted");
     else Console.println("delete failed");
-
   } else if (!strcmp(t0, "format")) {
     if (activeFs.format && activeFs.format()) Console.println("FS formatted");
     else Console.println("format failed");
-
   } else if (!strcmp(t0, "wipebootloader")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1707,7 +1910,6 @@ static void handleCommand(char* line) {
       yield();
       rp2040.rebootToBootloader();
     } else Console.println("wipe failed");
-
   } else if (!strcmp(t0, "wipereboot")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1716,12 +1918,10 @@ static void handleCommand(char* line) {
       yield();
       rp2040.reboot();
     } else Console.println("wipe failed");
-
   } else if (!strcmp(t0, "wipe")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) Console.println("Chip wiped");
     else Console.println("wipe failed");
-
   } else if (!strcmp(t0, "puthex")) {
     char* fn;
     char* hex;
@@ -1746,7 +1946,6 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("puthex: write failed");
-
   } else if (!strcmp(t0, "putb64")) {
     char* fn;
     char* b64;
@@ -1771,7 +1970,6 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
-
   } else if (!strcmp(t0, "cc")) {
     char* src;
     char* dst;
@@ -1783,11 +1981,9 @@ static void handleCommand(char* line) {
     if (!compileTinyCFileToFile(src, dst)) {
       Console.println("cc: failed");
     }
-
   } else if (!strcmp(t0, "pwd")) {
     Console.print("cwd: /");
     Console.println(g_cwd);
-
   } else if (!strcmp(t0, "cd")) {
     char* arg;
     if (!nextToken(p, arg)) {
@@ -1824,11 +2020,15 @@ static void handleCommand(char* line) {
     strncpy(g_cwd, target, sizeof(g_cwd));
     g_cwd[sizeof(g_cwd) - 1] = 0;
     Console.println("ok");
-
   } else if (!strcmp(t0, "mkdir")) {
     char* arg;
     if (!nextToken(p, arg)) {
       Console.println("usage: mkdir <name|/abs|rel/path>");
+      return;
+    }
+    // Disallow root
+    if (strcmp(arg, "/") == 0 || arg[0] == 0) {
+      Console.println("mkdir: refusing to create root");
       return;
     }
     char marker[ActiveFS::MAX_NAME + 1];
@@ -1842,47 +2042,135 @@ static void handleCommand(char* line) {
     }
     if (mkdirFolder(marker)) Console.println("mkdir: ok");
     else Console.println("mkdir: failed");
-
   } else if (!strcmp(t0, "ls")) {
-    // optional path
+    // Determine target folder prefix (no leading slash, trailing slash if non-root)
     char* arg;
-    char folder[ActiveFS::MAX_NAME + 1];
-    if (nextToken(p, arg)) {
-      if (!pathJoin(folder, sizeof(folder), g_cwd, arg, /*wantTrailingSlash*/ true)) {
-        Console.println("ls: path too long");
-        return;
-      }
+    char folder[ActiveFS::MAX_NAME + 1] = { 0 };
+    bool ok;
+    if (!nextToken(p, arg)) {
+      ok = pathJoin(folder, sizeof(folder), g_cwd, "", /*wantTrailingSlash*/ true);
+    } else if (!strcmp(arg, "/")) {
+      folder[0] = 0;
+      ok = true;  // root
+    } else if (!strcmp(arg, ".")) {
+      ok = pathJoin(folder, sizeof(folder), g_cwd, "", true);
+    } else if (!strcmp(arg, "..")) {
+      char parent[ActiveFS::MAX_NAME + 1];
+      strncpy(parent, g_cwd, sizeof(parent));
+      parent[sizeof(parent) - 1] = 0;
+      pathParent(parent);
+      ok = pathJoin(folder, sizeof(folder), parent, "", true);
     } else {
-      if (!pathJoin(folder, sizeof(folder), g_cwd, "", /*wantTrailingSlash*/ true)) {
-        Console.println("ls: path error");
-        return;
-      }
+      ok = pathJoin(folder, sizeof(folder), g_cwd, arg, /*wantTrailingSlash*/ true);
     }
+    if (!ok) {
+      Console.println("ls: path too long");
+      return;
+    }
+
     FsIndexEntry idx[64];
     size_t n = buildFsIndex(idx, 64);
     Console.print("Listing /");
     Console.print(folder);
     Console.println(":");
-    // show folder marker first if present
+
+    // Root: list top-level files (no '/'), and show top-level folders once
+    if (folder[0] == 0) {
+      // First, files at root (no '/')
+      for (size_t i = 0; i < n; ++i) {
+        if (idx[i].deleted) continue;
+        if (strchr(idx[i].name, '/') == nullptr) {
+          Console.print("  ");
+          Console.print(idx[i].name);
+          Console.print("  (");
+          Console.print(idx[i].size);
+          Console.println(" bytes)");
+        }
+      }
+      // Then, top-level folders (dedup by first segment)
+      const size_t MAX_SEEN = 32;
+      char seen[MAX_SEEN][ActiveFS::MAX_NAME + 1];
+      size_t seenCount = 0;
+      auto seenPush = [&](const char* seg) {
+        for (size_t k = 0; k < seenCount; ++k)
+          if (strcmp(seen[k], seg) == 0) return false;
+        if (seenCount < MAX_SEEN) {
+          strncpy(seen[seenCount], seg, ActiveFS::MAX_NAME);
+          seen[seenCount][ActiveFS::MAX_NAME] = 0;
+          ++seenCount;
+          return true;
+        }
+        return false;
+      };
+      for (size_t i = 0; i < n; ++i) {
+        if (idx[i].deleted) continue;
+        const char* slash = strchr(idx[i].name, '/');
+        if (!slash) continue;
+        char seg[ActiveFS::MAX_NAME + 1];
+        size_t segLen = (size_t)(slash - idx[i].name);
+        if (segLen > ActiveFS::MAX_NAME) segLen = ActiveFS::MAX_NAME;
+        memcpy(seg, idx[i].name, segLen);
+        seg[segLen] = 0;
+        if (seenPush(seg)) {
+          Console.print("  ");
+          Console.print(seg);
+          Console.println("/");
+        }
+      }
+      return;
+    }
+
+    // Subfolder: immediate children under "folder"
+    size_t folderLen = strlen(folder);
     if (folderExists(folder)) Console.println("  .");
-    // immediate children only
+    const size_t MAX_SEEN = 32;
+    char seenChild[MAX_SEEN][ActiveFS::MAX_NAME + 1];
+    size_t seenCount = 0;
+    auto seenPush = [&](const char* seg) {
+      for (size_t k = 0; k < seenCount; ++k)
+        if (strcmp(seenChild[k], seg) == 0) return false;
+      if (seenCount < MAX_SEEN) {
+        strncpy(seenChild[seenCount], seg, ActiveFS::MAX_NAME);
+        seenChild[seenCount][ActiveFS::MAX_NAME] = 0;
+        ++seenCount;
+        return true;
+      }
+      return false;
+    };
     for (size_t i = 0; i < n; ++i) {
       if (idx[i].deleted) continue;
-      const char* child = nullptr;
-      if (childOfFolder(idx[i].name, folder, child)) {
+      if (strncmp(idx[i].name, folder, folderLen) != 0) continue;
+      const char* rest = idx[i].name + folderLen;
+      if (*rest == 0) continue;  // marker itself
+      // NEW: tolerate legacy "folder//file" -> skip the extra '/'
+      if (*rest == '/') ++rest;
+      if (*rest == 0) continue;
+      if (*rest == 0) continue;  // marker itself
+      const char* slash = strchr(rest, '/');
+      if (!slash) {
         Console.print("  ");
-        Console.print(child);
-        // show slash if this is a child folder (has a matching "child/" marker entry)
-        char childMarker[ActiveFS::MAX_NAME + 1];
-        if (pathJoin(childMarker, sizeof(childMarker), folder, child, true) && folderExists(childMarker)) {
-          Console.print('/');
-        }
+        Console.print(rest);
         Console.print("  (");
         Console.print(idx[i].size);
         Console.println(" bytes)");
+      } else {
+        size_t segLen = (size_t)(slash - rest);
+        char seg[ActiveFS::MAX_NAME + 1];
+        if (segLen > ActiveFS::MAX_NAME) segLen = ActiveFS::MAX_NAME;
+        memcpy(seg, rest, segLen);
+        seg[segLen] = 0;
+        if (seenPush(seg)) {
+          Console.print("  ");
+          Console.print(seg);
+          Console.println("/");
+        }
       }
     }
-
+  } else if (!strcmp(t0, "lsdebug")) {
+    char* nstr;
+    uint32_t n = 256;
+    if (nextToken(p, nstr)) n = (uint32_t)strtoul(nstr, nullptr, 0);
+    dumpDirHeadRaw(n);
   } else if (!strcmp(t0, "rmdir")) {
     // rmdir <path> [-r]
     char* arg;
@@ -1893,16 +2181,19 @@ static void handleCommand(char* line) {
     bool recursive = false;
     char* opt;
     if (nextToken(p, opt) && !strcmp(opt, "-r")) recursive = true;
-
     char folder[ActiveFS::MAX_NAME + 1];
     if (!pathJoin(folder, sizeof(folder), g_cwd, arg, /*wantTrailingSlash*/ true)) {
       Console.println("rmdir: path too long");
       return;
     }
-
     // Build index to find children under prefix
     FsIndexEntry idx[64];
     size_t n = buildFsIndex(idx, 64);
+    if (n == 0) {
+      Console.println("(ls fallback) Directory scan empty; printing files view:");
+      activeFs.listFilesToSerial();
+      return;
+    }
     bool empty = true;
     for (size_t i = 0; i < n; ++i) {
       if (idx[i].deleted) continue;
@@ -1913,12 +2204,10 @@ static void handleCommand(char* line) {
         break;
       }
     }
-
     if (!empty && !recursive) {
       Console.println("rmdir: not empty (use -r to remove all files under folder)");
       return;
     }
-
     // If recursive, delete everything with the prefix
     if (recursive) {
       size_t delCount = 0;
@@ -1934,7 +2223,6 @@ static void handleCommand(char* line) {
       Console.println(" entries");
       return;
     }
-
     // Empty: remove just the marker if it exists
     if (folderExists(folder)) {
       if (activeFs.deleteFile(folder)) Console.println("rmdir: ok");
@@ -1942,7 +2230,6 @@ static void handleCommand(char* line) {
     } else {
       Console.println("rmdir: marker not found (already removed?)");
     }
-
   } else if (!strcmp(t0, "touch")) {
     char* pathArg;
     if (!nextToken(p, pathArg)) {
@@ -1954,13 +2241,23 @@ static void handleCommand(char* line) {
     } else {
       Console.println("touch failed");
     }
+  } else if (!strcmp(t0, "df")) {
+    cmdDf();
+  } else if (!strcmp(t0, "mv")) {
+    char* srcArg;
+    char* dstArg;
+    if (!nextToken(p, srcArg) || !nextToken(p, dstArg)) {
+      Console.println("usage: mv <src> <dst|folder/>");
+      return;
+    }
+    if (!cmdMvImpl(g_cwd, srcArg, dstArg)) {
+      Console.println("mv failed");
+    }
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
 }
-
 SoftwareSerial tinySerial(4, 5, false);
-
 // ========== Setup and main loops ==========
 void setup() {
   Serial.begin(115200);
@@ -1968,11 +2265,9 @@ void setup() {
   delay(20);
   Console.println("System booting..");
   Console.begin();
-
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3 });
-
   size_t found = uniMem.rescan();
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
@@ -1980,23 +2275,19 @@ void setup() {
     if (!di) continue;
     Console.printf("  CS=%u  Type=%s  Vendor=%s  Cap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
-
   // Open both handles (reservations handled internally)
   bool flashOk = fsFlash.begin(uniMem);  // or MX35UnifiedSimpleFS if using SPI-NAND
   bool psramOk = fsPSRAM.begin(uniMem);
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
-
   // IMPORTANT: Bind activeFs before using it anywhere
   bindActiveFs(g_storage);
   updateExecFsTable();
-
   // Mount through activeFs (keeps table + handle consistent)
   bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
-
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
   Exec.attachConsole(&Console);
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
