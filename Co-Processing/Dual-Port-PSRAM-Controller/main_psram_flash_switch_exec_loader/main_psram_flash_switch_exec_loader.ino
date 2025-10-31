@@ -244,6 +244,57 @@ static void updateExecFsTable() {
   Exec.attachFS(t);
 }
 
+// ================= Memory Diagnostics =================
+// Portable free stack helper for core0 (current core).
+// On RP2040, uses linker symbols __StackTop/__StackBottom.
+// Otherwise, falls back to a non-negative "gap to heap" estimate.
+#ifdef ARDUINO_ARCH_RP2040
+extern "C" {
+  extern char __StackTop;     // high address (start of empty stack)
+  extern char __StackBottom;  // low address (stack limit)
+}
+#include "unistd.h"
+static uint32_t freeStackCurrentCoreApprox() {
+  volatile uint8_t marker;            // lives on current stack
+  uintptr_t sp = (uintptr_t)&marker;  // approximate SP
+  uintptr_t top = (uintptr_t)&__StackTop;
+  uintptr_t bottom = (uintptr_t)&__StackBottom;
+
+  // Validate and compute: ARM stack grows down => bottom < sp <= top
+  if (top > bottom && sp >= bottom && sp <= top) {
+    return (uint32_t)(sp - bottom);  // free = SP - bottom
+  }
+
+  // Fallback: clamp "gap to heap end" at 0
+  void* heapEnd = sbrk(0);
+  intptr_t gap = (intptr_t)sp - (intptr_t)heapEnd;
+  return (gap > 0) ? (uint32_t)gap : 0u;
+}
+#else
+static uint32_t freeStackCurrentCoreApprox() {
+  volatile uint8_t marker;
+  void* heapEnd = sbrk(0);
+  intptr_t gap = (intptr_t)&marker - (intptr_t)heapEnd;
+  return (gap > 0) ? (uint32_t)gap : 0u;
+}
+#endif
+#ifdef ARDUINO_ARCH_RP2040
+static void printStackInfo() {
+  volatile uint8_t marker;
+  uintptr_t sp = (uintptr_t)&marker;
+  uintptr_t top = (uintptr_t)&__StackTop;
+  uintptr_t bottom = (uintptr_t)&__StackBottom;
+  if (top > bottom && sp >= bottom && sp <= top) {
+    uint32_t total = (uint32_t)(top - bottom);
+    uint32_t used = (uint32_t)(top - sp);
+    uint32_t free = (uint32_t)(sp - bottom);
+    Console.printf("Stack total=%u used=%u free=%u bytes\n", total, used, free);
+    return;
+  }
+  Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
+}
+#endif
+
 // ========== FS helpers and console (unchanged) ==========
 static bool checkNameLen(const char* name) {
   size_t n = strlen(name);
@@ -377,6 +428,177 @@ static void autogenBlobWrites() {
   allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
+}
+// ========== PSRAM diagnostics using UnifiedSPIMem ==========
+static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = Serial) {
+  size_t banks = 0;
+  uint64_t total = 0;
+  out.println();
+  out.println("PSRAM capacity report (Unified):");
+
+  for (size_t i = 0; i < mgr.detectedCount(); ++i) {
+    const auto* di = mgr.detectedInfo(i);
+    if (!di || di->type != UnifiedSpiMem::DeviceType::Psram) continue;
+    banks++;
+    total += di->capacityBytes;
+
+    out.print("  Bank ");
+    out.print(banks - 1);
+    out.print(" (CS=");
+    out.print(di->cs);
+    out.print(")  Vendor=");
+    out.print(di->vendorName);
+    out.print("  Cap=");
+    out.print((unsigned long)di->capacityBytes);
+    out.print(" bytes");
+    if (di->partHint) {
+      out.print("  Part=");
+      out.print(di->partHint);
+    }
+    out.print("  JEDEC:");
+    for (uint8_t k = 0; k < di->jedecLen; ++k) {
+      out.print(' ');
+      if (di->jedec[k] < 16) out.print('0');
+      out.print(di->jedec[k], HEX);
+    }
+    out.println();
+  }
+
+  out.print("Banks: ");
+  out.println((unsigned)banks);
+  out.print("Total: ");
+  out.print((unsigned long)total);
+  out.print(" bytes (");
+  out.print((unsigned long)(total / (1024UL * 1024UL)));
+  out.println(" MB)");
+  out.println();
+}
+static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
+  auto* dev = fs.raw().device();
+  if (!dev || dev->type() != UnifiedSpiMem::DeviceType::Psram) {
+    out.println("PSRAM smoke test: PSRAM device not open");
+    return;
+  }
+
+  const uint64_t cap = dev->capacity();
+  if (cap < 1024) {
+    out.println("PSRAM smoke test: capacity too small");
+    return;
+  }
+
+  // Prefer testing right after FS allocation head when possible
+  const uint32_t fsHead = fs.raw().nextDataAddr();
+  const uint32_t dataStart = fs.raw().dataRegionStart();
+  const uint32_t TEST_SIZE = 1024;    // small, quick, non-destructive
+  uint64_t testAddr = fsHead + 4096;  // leave a small gap from FS head
+  if (testAddr + TEST_SIZE > cap) {
+    // fallback to end-of-chip window
+    if (cap > TEST_SIZE) testAddr = cap - TEST_SIZE;
+    else testAddr = 0;
+  }
+  // Align a bit (not strictly needed for PSRAM)
+  testAddr = (testAddr + 0xFF) & ~0xFFull;
+  if (testAddr < dataStart) testAddr = dataStart;
+
+  out.print("PSRAM smoke test @ 0x");
+  out.print((unsigned long)testAddr, HEX);
+  out.print(" size=");
+  out.print(TEST_SIZE);
+  out.println(" bytes");
+
+  uint8_t* original = (uint8_t*)malloc(TEST_SIZE);
+  uint8_t* verify = (uint8_t*)malloc(TEST_SIZE);
+  if (!original || !verify) {
+    out.println("malloc failed for buffers");
+    if (original) free(original);
+    if (verify) free(verify);
+    return;
+  }
+
+  // Save original contents
+  if (dev->read(testAddr, original, TEST_SIZE) != TEST_SIZE) {
+    out.println("read (backup) failed");
+    free(original);
+    free(verify);
+    return;
+  }
+
+  // Pattern 1: 0xAA
+  memset(verify, 0xAA, TEST_SIZE);
+  if (!dev->write(testAddr, verify, TEST_SIZE)) {
+    out.println("write pattern 0xAA failed");
+    // attempt to restore
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  memset(verify, 0x00, TEST_SIZE);
+  if (dev->read(testAddr, verify, TEST_SIZE) != TEST_SIZE) {
+    out.println("readback (0xAA) failed");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  bool okAA = true;
+  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
+    if (verify[i] != 0xAA) {
+      okAA = false;
+      break;
+    }
+    if ((i & 63) == 0) yield();
+  }
+  out.println(okAA ? "Pattern 0xAA OK" : "Pattern 0xAA mismatch");
+
+  // Pattern 2: address-based
+  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
+    verify[i] = (uint8_t)((testAddr + i) ^ 0x5A);
+  }
+  if (!dev->write(testAddr, verify, TEST_SIZE)) {
+    out.println("write pattern addr^0x5A failed");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  uint8_t* rb = (uint8_t*)malloc(TEST_SIZE);
+  if (!rb) {
+    out.println("malloc failed for readback");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  if (dev->read(testAddr, rb, TEST_SIZE) != TEST_SIZE) {
+    out.println("readback (addr^0x5A) failed");
+    free(rb);
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  bool okAddr = true;
+  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
+    uint8_t exp = (uint8_t)((testAddr + i) ^ 0x5A);
+    if (rb[i] != exp) {
+      okAddr = false;
+      break;
+    }
+    if ((i & 63) == 0) yield();
+  }
+  out.println(okAddr ? "Pattern addr^0x5A OK" : "Pattern addr^0x5A mismatch");
+  free(rb);
+
+  // Restore original contents
+  if (!dev->write(testAddr, original, TEST_SIZE)) {
+    out.println("restore failed (data left with test pattern)");
+  } else {
+    out.println("restore OK");
+  }
+
+  free(original);
+  free(verify);
 }
 
 // ========== Binary upload helpers (single-line puthex/putb64) ==========
@@ -755,7 +977,7 @@ static void printHelp() {
   Console.println("  wipereboot                   - erase chip then reboot (DANGEROUS to FS)");
   Console.println("  wipebootloader               - erase chip then reboot to bootloader (DANGEROUS to FS)");
   Console.println("  meminfo                      - show heap/stack info");
-  //Console.println("  psramsmoketest               - safe, non-destructive PSRAM test (prefers FS-free region)");
+  Console.println("  psramsmoketest               - safe, non-destructive PSRAM test (prefers FS-free region)");
   Console.println("  bg [status|query]            - query background job status");
   Console.println("  bg kill|cancel [force]       - cancel background job; 'force' may reset core1 (platform-dependent)");
   Console.println("  reboot                       - reboot the MCU");
@@ -1180,7 +1402,7 @@ static void handleCommand(char* line) {
       Console.println(" ms");
     }
 
-    /*} else if (!strcmp(t0, "meminfo")) {
+  } else if (!strcmp(t0, "meminfo")) {
     Console.println();
     Console.printf("Total Heap:        %d bytes\n", rp2040.getTotalHeap());
     Console.printf("Free Heap:         %d bytes\n", rp2040.getFreeHeap());
@@ -1188,12 +1410,16 @@ static void handleCommand(char* line) {
     Console.printf("Total PSRAM Heap:  %d bytes\n", rp2040.getTotalPSRAMHeap());
     Console.printf("Free PSRAM Heap:   %d bytes\n", rp2040.getFreePSRAMHeap());
     Console.printf("Used PSRAM Heap:   %d bytes\n", rp2040.getUsedPSRAMHeap());
-    Console.printf("Free Stack:        %d bytes\n", rp2040.getFreeStack());
-    psramBB.printCapacityReport();
+#ifdef ARDUINO_ARCH_RP2040
+    printStackInfo();  // detailed (total/used/free)
+#else
+    Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
+#endif
+    psramPrintCapacityReport(uniMem);
 
-    } else if (!strcmp(t0, "psramsmoketest")) {
-    psramBB.printCapacityReport();
-    psramSafeSmokeTest();*/
+  } else if (!strcmp(t0, "psramsmoketest")) {
+    psramPrintCapacityReport(uniMem);
+    psramSafeSmokeTest(fsPSRAM);
 
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
@@ -1314,14 +1540,10 @@ void setup() {
   Console.println("System booting..");
   Console.begin();
 
-  // Bring up unified SPI and make sure we don’t clobber PSRAM contents on ID (optional)
   uniMem.begin();
-  uniMem.setPreservePsramContents(true);  // keep PSRAM contents during identification
-
-  // Tell the manager every CS present on the bus (NOR + PSRAM)
+  uniMem.setPreservePsramContents(true);
   uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS });
 
-  // Scan bus
   size_t found = uniMem.rescan();
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
@@ -1330,28 +1552,24 @@ void setup() {
     Console.printf("  CS=%u  Type=%s  Vendor=%s  Cap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
 
-  // Open separate FS handles (reservations are handled for you)
-  bool flashOk = fsFlash.begin(uniMem);  // W25QUnifiedSimpleFS (or MX35UnifiedSimpleFS)
-  bool psramOk = fsPSRAM.begin(uniMem);  // PSRAMUnifiedSimpleFS
-
+  // Open both handles (reservations handled internally)
+  bool flashOk = fsFlash.begin(uniMem);  // or MX35UnifiedSimpleFS if using SPI-NAND
+  bool psramOk = fsPSRAM.begin(uniMem);
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
 
-  // Mount like before (choose your active storage)
-  bool mounted = false;
-  if (g_storage == StorageBackend::Flash) {
-    mounted = fsFlash.mount(true);  // auto-format if empty
-  } else {
-    mounted = fsPSRAM.mount(false);  // keep PSRAM as-is by default
-  }
+  // IMPORTANT: Bind activeFs before using it anywhere
+  bindActiveFs(g_storage);
+  updateExecFsTable();
+
+  // Mount through activeFs (keeps table + handle consistent)
+  bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
 
-  // ... the rest of your setup ...
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
   Exec.attachConsole(&Console);
-  updateExecFsTable();
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
   tinySerial.begin(COPROC_BAUD);
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
