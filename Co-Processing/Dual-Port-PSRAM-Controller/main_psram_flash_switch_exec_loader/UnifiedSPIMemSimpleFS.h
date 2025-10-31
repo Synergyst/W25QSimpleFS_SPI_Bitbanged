@@ -59,7 +59,7 @@ public:
   static const uint32_t DATA_START = DIR_START + DIR_SIZE;
   static const uint32_t SECTOR_SIZE = 4096;
   static const uint32_t PAGE_SIZE = 256;
-  static const size_t MAX_NAME = 32;
+  static const size_t MAX_NAME = 1024;
 
   enum class WriteMode : uint8_t {
     ReplaceIfExists = 0,

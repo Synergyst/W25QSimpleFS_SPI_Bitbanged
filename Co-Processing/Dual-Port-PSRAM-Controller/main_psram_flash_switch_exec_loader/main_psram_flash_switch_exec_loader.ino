@@ -72,7 +72,7 @@ UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);
 W25QUnifiedSimpleFS fsFlash;  // Use MX35UnifiedSimpleFS if your flash is MX35LF SPI-NAND
 PSRAMUnifiedSimpleFS fsPSRAM;
 // If your flash chip is actually MX35LF (SPI-NAND), do this instead:
-// MX35UnifiedSimpleFS fsFlash;r
+// MX35UnifiedSimpleFS fsFlash;
 static bool g_dev_mode = true;
 // ========== ActiveFS structure ==========
 struct ActiveFS {
@@ -339,19 +339,32 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
   // - If dst ends with '/', treat as folder (dst/<basename(src)>).
   // - Destination is created as a sector-aligned slot (slotSafe=Y) using source capacity when possible.
   if (!srcArg || !dstArg) return false;
-
   // Build absolute source file (reject folder source)
   char srcAbs[ActiveFS::MAX_NAME + 1];
   if (!buildAbsFile(srcAbs, sizeof(srcAbs), cwd, srcArg)) {
     Console.println("mv: invalid source path");
     return false;
   }
-
-  // Does source exist? Retrieve size and capacity
-  if (!activeFs.exists(srcAbs)) {
+  // Optional convenience for legacy/typed double slashes:
+  bool srcExists = activeFs.exists(srcAbs);
+  if (!srcExists) {
+    if (strstr(srcAbs, "//")) {
+      char alt[sizeof(srcAbs)];
+      strncpy(alt, srcAbs, sizeof(alt));
+      alt[sizeof(alt) - 1] = 0;
+      normalizePathInPlace(alt, /*wantTrailingSlash=*/false);
+      if (activeFs.exists(alt)) {
+        strncpy(srcAbs, alt, sizeof(srcAbs));
+        srcAbs[sizeof(srcAbs) - 1] = 0;
+        srcExists = true;
+      }
+    }
+  }
+  if (!srcExists) {
     Console.println("mv: source not found");
     return false;
   }
+  // Does source exist? Retrieve size and capacity
   uint32_t srcAddr = 0, srcSize = 0, srcCap = 0;
   if (!activeFs.getFileInfo(srcAbs, srcAddr, srcSize, srcCap)) {
     Console.println("mv: getFileInfo failed");
@@ -362,15 +375,17 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
   char dstAbs[ActiveFS::MAX_NAME + 1];
   size_t Ldst = strlen(dstArg);
   bool dstIsFolder = (Ldst > 0 && dstArg[Ldst - 1] == '/');
+
   if (dstIsFolder) {
-    // dst is a folder: ensure absolute folder path with trailing slash, then append basename
-    char folder[ActiveFS::MAX_NAME + 1];
-    if (!pathJoin(folder, sizeof(folder), cwd, dstArg, /*wantTrailingSlash*/ true)) {
+    // Make a folder path WITHOUT trailing slash
+    char folderNoSlash[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(folderNoSlash, sizeof(folderNoSlash), cwd, dstArg, /*wantTrailingSlash*/ false)) {
       Console.println("mv: destination folder path too long");
       return false;
     }
+    // Append basename safely (guarantees single slash)
     const char* base = lastSlash(srcAbs);
-    if (!makePath(dstAbs, sizeof(dstAbs), folder, base)) {
+    if (!makePathSafe(dstAbs, sizeof(dstAbs), folderNoSlash, base)) {
       Console.println("mv: resulting path too long");
       return false;
     }
@@ -381,9 +396,17 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
     }
   }
 
+  // Final normalization (safety)
+  normalizePathInPlace(dstAbs, /*wantTrailingSlash=*/false);
+
   if (strcmp(srcAbs, dstAbs) == 0) {
     Console.println("mv: source and destination are the same");
     return true;
+  }
+
+  if (pathTooLongForOnDisk(dstAbs)) {
+    Console.println("mv: destination name too long for FS (would be truncated)");
+    return false;
   }
 
   // Read source contents
@@ -398,7 +421,6 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
     free(buf);
     return false;
   }
-
   // Prepare destination slot
   uint32_t reserve = srcCap;
   if (reserve < ActiveFS::SECTOR_SIZE) {
@@ -406,7 +428,6 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
     uint32_t a = (srcSize + (ActiveFS::SECTOR_SIZE - 1)) & ~(ActiveFS::SECTOR_SIZE - 1);
     if (a > reserve) reserve = a;
   }
-
   bool ok = false;
   if (!activeFs.exists(dstAbs)) {
     // Create slot with same capacity budget and write contents in one go
@@ -422,13 +443,11 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
       ok = activeFs.writeFile(dstAbs, buf, srcSize, /*ReplaceIfExists*/ 0);
     }
   }
-
   if (!ok) {
     Console.println("mv: write to destination failed");
     free(buf);
     return false;
   }
-
   // Delete source so another file can reuse its slot
   if (!activeFs.deleteFile(srcAbs)) {
     Console.println("mv: warning: source delete failed");
@@ -436,7 +455,6 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
   } else {
     Console.println("mv: ok");
   }
-
   free(buf);
   return true;
 }
@@ -465,7 +483,6 @@ static void cmdDf() {
     const char* style = UnifiedSpiMem::deviceTypeName(t);
     const uint8_t cs = dev->cs();
     const uint64_t devCap = dev->capacity();
-
     const uint32_t dataStart = activeFs.dataRegionStart();
     const uint32_t fsCap32 = activeFs.capacity();
     const uint32_t dataCap = (fsCap32 > dataStart) ? (fsCap32 - dataStart) : 0;
@@ -473,7 +490,6 @@ static void cmdDf() {
     const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
     const uint32_t dirUsed = dirBytesUsedEstimate();
     const uint32_t dirFree = (64u * 1024u > dirUsed) ? (64u * 1024u - dirUsed) : 0;
-
     Console.println("Filesystem (active):");
     Console.printf("  Device:  %s  CS=%u\n", style, (unsigned)cs);
     Console.printf("  DevCap:  %llu bytes\n", (unsigned long long)devCap);
@@ -488,7 +504,6 @@ static void cmdDf() {
   } else {
     Console.println("Filesystem (active): none");
   }
-
   // Other detected devices (raw capacities)
   size_t n = uniMem.detectedCount();
   if (n == 0) return;
@@ -523,17 +538,13 @@ static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
   UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
   if (!dev) dev = fsPSRAM.raw().device();
   if (!dev) return 0;
-
   constexpr uint32_t DIR_START = 0x000000;
   constexpr uint32_t DIR_SIZE = 64 * 1024;
   constexpr uint32_t ENTRY = 32;
   constexpr uint32_t CHUNK = 256;
-
   FsIndexEntry map[64];
   size_t mapCount = 0;
-
   uint8_t buf[CHUNK];
-
   for (uint32_t off = 0; off < DIR_SIZE; off += CHUNK) {
     size_t toRead = ((off + CHUNK) <= DIR_SIZE) ? CHUNK : (DIR_SIZE - off);
     size_t got = dev->read(DIR_START + off, buf, toRead);
@@ -543,19 +554,15 @@ static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
       const uint8_t* rec = &buf[c];
       // Only accept records with "WF" header; skip everything else (including 0xFF blocks)
       if (rec[0] != 0x57 || rec[1] != 0x46) continue;
-
       uint8_t flags = rec[2];
       uint8_t nlen = rec[3];
       if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
-
       char name[ActiveFS::MAX_NAME + 1];
       memset(name, 0, sizeof(name));
       for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
-
       uint32_t size = rd32_be(&rec[24]);
       uint32_t seq = rd32_be(&rec[28]);
       bool deleted = (flags & 0x01) != 0;
-
       // Upsert by name, keep highest seq
       int idx = -1;
       for (size_t i = 0; i < mapCount; ++i) {
@@ -578,7 +585,6 @@ static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
       }
     }
   }
-
   if (out && outMax) {
     size_t n = (mapCount < outMax) ? mapCount : outMax;
     for (size_t i = 0; i < n; ++i) out[i] = map[i];
@@ -609,7 +615,6 @@ static void dumpDirHeadRaw(uint32_t bytes = 256) {
     Console.println("lsdebug: no device");
     return;
   }
-
   if (bytes == 0 || bytes > 1024) bytes = 256;  // keep it small on console
   uint8_t buf[1024];
   size_t got = dev->read(0, buf, bytes);
@@ -634,7 +639,6 @@ static void pathStripTrailingSlashes(char* p) {
 }
 static bool pathJoin(char* out, size_t outCap, const char* base, const char* name, bool wantTrailingSlash) {
   if (!out || !name) return false;
-
   // Absolute path: strip one leading '/'
   if (name[0] == '/') {
     const char* s = name + 1;
@@ -649,7 +653,6 @@ static bool pathJoin(char* out, size_t outCap, const char* base, const char* nam
     }
     return true;
   }
-
   // Relative
   if (!base) base = "";
   char tmp[ActiveFS::MAX_NAME + 1];
@@ -658,7 +661,6 @@ static bool pathJoin(char* out, size_t outCap, const char* base, const char* nam
   else if (name[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", base);
   else need = snprintf(tmp, sizeof(tmp), "%s/%s", base, name);
   if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= sizeof(tmp)) return false;
-
   size_t L = strlen(tmp);
   // Add trailing slash only for non-root
   if (wantTrailingSlash && L > 0 && tmp[L - 1] != '/') {
@@ -666,7 +668,6 @@ static bool pathJoin(char* out, size_t outCap, const char* base, const char* nam
     tmp[L] = '/';
     tmp[L + 1] = 0;
   }
-
   if (L >= outCap) return false;
   memcpy(out, tmp, L + 1);
   return true;
@@ -693,6 +694,10 @@ static bool isFolderMarkerName(const char* nm) {
 static const char* firstSlash(const char* s) {
   return strchr(s, '/');
 }
+static constexpr size_t FS_NAME_ONDISK_MAX = 17;  // conservative (writer seems to truncate at 17 here)
+static bool pathTooLongForOnDisk(const char* full) {
+  return strlen(full) > FS_NAME_ONDISK_MAX;
+}
 // ========== Blob registry ==========
 struct BlobReg {
   const char* id;
@@ -716,8 +721,8 @@ int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
 #include "ExecHost.h"
 static ExecHost Exec;
 // ================= FSHelpers header =================
-// Helper to supply Exec with current FS function pointers
 static void updateExecFsTable() {
+  // Helper to supply Exec with current FS function pointers
   ExecFSTable t{};
   t.exists = activeFs.exists;
   t.getFileSize = activeFs.getFileSize;
@@ -1892,13 +1897,29 @@ static void handleCommand(char* line) {
     yield();
     rp2040.reboot();
   } else if (!strcmp(t0, "del")) {
-    char* fn;
-    if (!nextToken(p, fn)) {
+    char* arg;
+    if (!nextToken(p, arg)) {
       Console.println("usage: del <file>");
       return;
     }
-    if (activeFs.deleteFile && activeFs.deleteFile(fn)) Console.println("deleted");
-    else Console.println("delete failed");
+    // Build absolute, normalize
+    char abs[ActiveFS::MAX_NAME + 1];
+    if (!pathJoin(abs, sizeof(abs), g_cwd, arg, /*wantTrailingSlash*/ false)) {
+      Console.println("del: path too long (<= 32 chars buffer)");
+      return;
+    }
+    normalizePathInPlace(abs, /*wantTrailingSlash=*/false);
+
+    bool ok = false;
+    if (activeFs.exists && activeFs.exists(abs)) ok = activeFs.deleteFile(abs);
+    if (!ok && strstr(abs, "//")) {
+      char alt[sizeof abs];
+      strncpy(alt, abs, sizeof alt);
+      alt[sizeof alt - 1] = 0;
+      normalizePathInPlace(alt, false);
+      if (activeFs.exists && activeFs.exists(alt)) ok = activeFs.deleteFile(alt);
+    }
+    Console.println(ok ? "deleted" : "delete failed");
   } else if (!strcmp(t0, "format")) {
     if (activeFs.format && activeFs.format()) Console.println("FS formatted");
     else Console.println("format failed");
@@ -2067,13 +2088,11 @@ static void handleCommand(char* line) {
       Console.println("ls: path too long");
       return;
     }
-
     FsIndexEntry idx[64];
     size_t n = buildFsIndex(idx, 64);
     Console.print("Listing /");
     Console.print(folder);
     Console.println(":");
-
     // Root: list top-level files (no '/'), and show top-level folders once
     if (folder[0] == 0) {
       // First, files at root (no '/')
@@ -2119,7 +2138,6 @@ static void handleCommand(char* line) {
       }
       return;
     }
-
     // Subfolder: immediate children under "folder"
     size_t folderLen = strlen(folder);
     if (folderExists(folder)) Console.println("  .");
@@ -2142,10 +2160,10 @@ static void handleCommand(char* line) {
       if (strncmp(idx[i].name, folder, folderLen) != 0) continue;
       const char* rest = idx[i].name + folderLen;
       if (*rest == 0) continue;  // marker itself
-      // NEW: tolerate legacy "folder//file" -> skip the extra '/'
+      // tolerate legacy "folder//file" -> skip the extra '/'
       if (*rest == '/') ++rest;
       if (*rest == 0) continue;
-      if (*rest == 0) continue;  // marker itself
+
       const char* slash = strchr(rest, '/');
       if (!slash) {
         Console.print("  ");
@@ -2154,6 +2172,8 @@ static void handleCommand(char* line) {
         Console.print(idx[i].size);
         Console.println(" bytes)");
       } else {
+        // if the first char is a slash, skip this malformed entry
+        if (slash == rest) continue;
         size_t segLen = (size_t)(slash - rest);
         char seg[ActiveFS::MAX_NAME + 1];
         if (segLen > ActiveFS::MAX_NAME) segLen = ActiveFS::MAX_NAME;
@@ -2252,6 +2272,13 @@ static void handleCommand(char* line) {
     }
     if (!cmdMvImpl(g_cwd, srcArg, dstArg)) {
       Console.println("mv failed");
+    }
+  } else if (!strcmp(t0, "lsraw")) {
+    FsIndexEntry idx[64];
+    size_t n = buildFsIndex(idx, 64);
+    for (size_t i = 0; i < n; ++i) {
+      if (idx[i].deleted) continue;
+      Console.printf("- %s  (%lu bytes)\n", idx[i].name, (unsigned long)idx[i].size);
     }
   } else {
     Console.println("Unknown command. Type 'help'.");
