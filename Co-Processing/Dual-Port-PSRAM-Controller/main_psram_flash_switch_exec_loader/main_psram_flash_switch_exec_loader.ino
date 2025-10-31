@@ -370,12 +370,10 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
     Console.println("mv: getFileInfo failed");
     return false;
   }
-
   // Build destination (folder-aware)
   char dstAbs[ActiveFS::MAX_NAME + 1];
   size_t Ldst = strlen(dstArg);
   bool dstIsFolder = (Ldst > 0 && dstArg[Ldst - 1] == '/');
-
   if (dstIsFolder) {
     // Make a folder path WITHOUT trailing slash
     char folderNoSlash[ActiveFS::MAX_NAME + 1];
@@ -395,20 +393,16 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
       return false;
     }
   }
-
   // Final normalization (safety)
   normalizePathInPlace(dstAbs, /*wantTrailingSlash=*/false);
-
   if (strcmp(srcAbs, dstAbs) == 0) {
     Console.println("mv: source and destination are the same");
     return true;
   }
-
   if (pathTooLongForOnDisk(dstAbs)) {
     Console.println("mv: destination name too long for FS (would be truncated)");
     return false;
   }
-
   // Read source contents
   uint8_t* buf = (uint8_t*)malloc(srcSize ? srcSize : 1);
   if (!buf) {
@@ -475,9 +469,8 @@ static uint32_t dirBytesUsedEstimate() {
 }
 static void cmdDf() {
   // Active device (mounted)
-  UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
-  const bool activeIsFlash = (dev != nullptr);
-  if (!dev) dev = fsPSRAM.raw().device();
+  // FIX: choose the device for the currently active storage
+  UnifiedSpiMem::MemDevice* dev = (g_storage == StorageBackend::Flash) ? fsFlash.raw().device() : fsPSRAM.raw().device();
   if (dev) {
     const auto t = dev->type();
     const char* style = UnifiedSpiMem::deviceTypeName(t);
@@ -525,6 +518,10 @@ static void cmdDf() {
   }
 }
 // ========== Minimal directory enumeration (reads the DIR table directly) ==========
+static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
+  // FIX: helper to return the MemDevice for the currently active storage
+  return (g_storage == StorageBackend::Flash) ? fsFlash.raw().device() : fsPSRAM.raw().device();
+}
 static inline uint32_t rd32_be(const uint8_t* p) {
   return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
 }
@@ -534,9 +531,8 @@ static bool isAllFF(const uint8_t* p, size_t n) {
   return true;
 }
 static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
-  // Use whichever device handle is open; prefer flash (that's what files shows)
-  UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
-  if (!dev) dev = fsPSRAM.raw().device();
+  // FIX: scan the DIR of the currently active storage (no cross-device preference)
+  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
   if (!dev) return 0;
   constexpr uint32_t DIR_START = 0x000000;
   constexpr uint32_t DIR_SIZE = 64 * 1024;
@@ -609,8 +605,8 @@ static bool childOfFolder(const char* name, const char* folderPrefix, const char
   return true;
 }
 static void dumpDirHeadRaw(uint32_t bytes = 256) {
-  UnifiedSpiMem::MemDevice* dev = fsFlash.raw().device();
-  if (!dev) dev = fsPSRAM.raw().device();
+  // FIX: dump from the active storage device
+  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
   if (!dev) {
     Console.println("lsdebug: no device");
     return;
@@ -736,10 +732,10 @@ static void updateExecFsTable() {
   Exec.attachFS(t);
 }
 // ================= Memory Diagnostics =================
+#ifdef ARDUINO_ARCH_RP2040
 // Portable free stack helper for core0 (current core).
 // On RP2040, uses linker symbols __StackTop/__StackBottom.
 // Otherwise, falls back to a non-negative "gap to heap" estimate.
-#ifdef ARDUINO_ARCH_RP2040
 extern "C" {
   extern char __StackTop;     // high address (start of empty stack)
   extern char __StackBottom;  // low address (stack limit)
@@ -1909,7 +1905,6 @@ static void handleCommand(char* line) {
       return;
     }
     normalizePathInPlace(abs, /*wantTrailingSlash=*/false);
-
     bool ok = false;
     if (activeFs.exists && activeFs.exists(abs)) ok = activeFs.deleteFile(abs);
     if (!ok && strstr(abs, "//")) {
@@ -2163,7 +2158,6 @@ static void handleCommand(char* line) {
       // tolerate legacy "folder//file" -> skip the extra '/'
       if (*rest == '/') ++rest;
       if (*rest == 0) continue;
-
       const char* slash = strchr(rest, '/');
       if (!slash) {
         Console.print("  ");
@@ -2284,7 +2278,6 @@ static void handleCommand(char* line) {
     Console.println("Unknown command. Type 'help'.");
   }
 }
-SoftwareSerial tinySerial(4, 5, false);
 // ========== Setup and main loops ==========
 void setup() {
   Serial.begin(115200);
@@ -2300,7 +2293,7 @@ void setup() {
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
     const auto* di = uniMem.detectedInfo(i);
     if (!di) continue;
-    Console.printf("  CS=%u  Type=%s  Vendor=%s  Cap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
   // Open both handles (reservations handled internally)
   bool flashOk = fsFlash.begin(uniMem);  // or MX35UnifiedSimpleFS if using SPI-NAND
@@ -2318,9 +2311,7 @@ void setup() {
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
   Exec.attachConsole(&Console);
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
-  tinySerial.begin(COPROC_BAUD);
-  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
-                 (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
+  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
@@ -2335,10 +2326,5 @@ void loop() {
   if (readLine()) {
     handleCommand(lineBuf);
     Console.print("> ");
-  }
-  if (tinySerial.available() > 0) {
-    delay(50);
-    char b = tinySerial.read();
-    if (b > 0) Serial.print(b);
   }
 }

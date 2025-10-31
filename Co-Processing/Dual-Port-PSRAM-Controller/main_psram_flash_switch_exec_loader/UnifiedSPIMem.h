@@ -35,7 +35,7 @@
 #define UNIFIED_SPI_INSTANCE SPI1
 #endif
 #ifndef UNIFIED_SPI_CLOCK_HZ
-#define UNIFIED_SPI_CLOCK_HZ 8000000UL
+#define UNIFIED_SPI_CLOCK_HZ 104000000UL
 #endif
 #ifndef UNIFIED_MAX_DETECTED
 #define UNIFIED_MAX_DETECTED 16
@@ -649,25 +649,25 @@ struct DeviceInfo {
 };
 static inline const char* vendorNameFromMID(uint8_t mfr) {
   switch (mfr) {
-    case 0xEF: return "Winbond (W25Q)";
-    case 0xC2: return "Macronix (MX25/MX35)";
-    case 0xC8: return "GigaDevice (GD25)";
+    case 0xEF: return "Winbond       ";  // (W25Q)
+    case 0xC2: return "Macronix      ";  // (MX25/MX35)
+    case 0xC8: return "GigaDevice    ";  // (GD25)
     case 0x20: return "Micron/Numonyx";
-    case 0x1F: return "Adesto/Atmel";
-    case 0x9D: return "ISSI";
-    case 0x85: return "Puya";
-    case 0x68: return "BOYA";
-    case 0x0D: return "AP Memory (PSRAM)";
-    case 0x5E: return "Zbit/Zentel (PSRAM)";
-    case 0x5D: return "Zentel (PSRAM)";
-    default: return "Unknown";
+    case 0x1F: return "Adesto/Atmel  ";
+    case 0x9D: return "ISSI          ";
+    case 0x85: return "Puya          ";
+    case 0x68: return "BOYA          ";
+    case 0x0D: return "AP Memory     ";  // (PSRAM)
+    case 0x5E: return "Zbit/Zentel   ";  // (PSRAM)
+    case 0x5D: return "Zentel        ";  // (PSRAM)
+    default: return "Unknown       ";
   }
 }
 static inline const char* deviceTypeName(DeviceType t) {
   switch (t) {
-    case DeviceType::NorW25Q: return "NOR (W25Q-like)";
-    case DeviceType::SpiNandMX35: return "SPI-NAND (MX35LF)";
-    case DeviceType::Psram: return "PSRAM";
+    case DeviceType::NorW25Q: return "NOR";           // (W25Q-like)
+    case DeviceType::SpiNandMX35: return "SPI-NAND";  // (MX35LF)
+    case DeviceType::Psram: return "PSRAM";           // (PSRAM)
     default: return "Unknown";
   }
 }
