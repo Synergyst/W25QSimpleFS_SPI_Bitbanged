@@ -112,6 +112,19 @@ static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
     default: return nullptr;
   }
 }
+// Directory stride helper: 32 for NOR/PSRAM, NAND page size when on MX35
+static inline uint32_t dirEntryStride() {
+  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
+  if (!dev) return 32u;
+  return (dev->type() == UnifiedSpiMem::DeviceType::SpiNandMX35) ? dev->pageSize() : 32u;
+}
+// Erase alignment helper for reserve rounding (PSRAM => fallback to 4K)
+static inline uint32_t getEraseAlign() {
+  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
+  if (!dev) return ActiveFS::SECTOR_SIZE;
+  uint32_t e = dev->eraseSize();
+  return (e > 0) ? e : ActiveFS::SECTOR_SIZE;
+}
 static inline int fsReplaceMode() {
   switch (g_storage) {
     case StorageBackend::Flash:
@@ -332,11 +345,11 @@ static bool writeFileToFolder(const char* folder, const char* fname, const uint8
     Console.println("path too long for SimpleFS (max 32 chars)");
     return false;
   }
-  // Create sector-aligned slot (optional) then write; or just writeFile() directly.
+  uint32_t eraseAlign = getEraseAlign();
+  // Create slot if missing; reserve aligned to device erase size
   if (!activeFs.exists(path)) {
-    // Reserve at least one sector; if data is larger, round up to sector boundary.
-    uint32_t reserve = ActiveFS::SECTOR_SIZE;
-    if (len > reserve) reserve = (len + (ActiveFS::SECTOR_SIZE - 1)) & ~(ActiveFS::SECTOR_SIZE - 1);
+    uint32_t reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : eraseAlign);
+    if (reserve < eraseAlign) reserve = eraseAlign;
     return activeFs.createFileSlot(path, reserve, data, len);
   }
   // Try in-place update first, allow reallocate if needed
@@ -371,7 +384,7 @@ static bool touchPath(const char* cwd, const char* arg) {
   size_t L = strlen(arg);
   if (L > 0 && arg[L - 1] == '/') {
     char marker[ActiveFS::MAX_NAME + 1];
-    if (!pathJoin(marker, sizeof(marker), cwd, arg, /*wantTrailingSlash*/ true)) {
+    if (!pathJoin(marker, sizeof(marker), cwd, arg, /*wantTrailingSlash=*/true)) {
       Console.println("touch: folder path too long (<= 32 chars)");
       return false;
     }
@@ -380,7 +393,7 @@ static bool touchPath(const char* cwd, const char* arg) {
   }
   // Regular file path
   char path[ActiveFS::MAX_NAME + 1];
-  if (!pathJoin(path, sizeof(path), cwd, arg, /*wantTrailingSlash*/ false)) {
+  if (!pathJoin(path, sizeof(path), cwd, arg, /*wantTrailingSlash=*/false)) {
     Console.println("touch: path too long (<= 32 chars)");
     return false;
   }
@@ -485,12 +498,15 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
     return false;
   }
   // Prepare destination slot
+  uint32_t eraseAlign = getEraseAlign();
   uint32_t reserve = srcCap;
-  if (reserve < ActiveFS::SECTOR_SIZE) {
-    // If src wasn't allocated via slot, reserve at least one sector aligned
-    uint32_t a = (srcSize + (ActiveFS::SECTOR_SIZE - 1)) & ~(ActiveFS::SECTOR_SIZE - 1);
+  if (reserve < eraseAlign) {
+    // If src wasn't allocated via slot, reserve at least one erase unit rounded up to length
+    uint32_t a = (srcSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
     if (a > reserve) reserve = a;
   }
+  if (reserve < eraseAlign) reserve = eraseAlign;
+
   bool ok = false;
   if (!activeFs.exists(dstAbs)) {
     // Create slot with same capacity budget and write contents in one go
@@ -535,24 +551,21 @@ static uint32_t dirBytesUsedEstimate() {
   if (!dev) return 0;
   constexpr uint32_t DIR_START = 0x000000;
   constexpr uint32_t DIR_SIZE = 64 * 1024;
-  constexpr uint32_t ENTRY = 32;
-  constexpr uint32_t CHUNK = 256;
-
-  uint8_t buf[CHUNK];
+  const uint32_t stride = dirEntryStride();  // 32 or NAND page size
+  uint8_t rec[32];
   uint32_t records = 0;
-
-  for (uint32_t off = 0; off < DIR_SIZE; off += CHUNK) {
-    size_t toRead = ((off + CHUNK) <= DIR_SIZE) ? CHUNK : (DIR_SIZE - off);
-    size_t got = dev->read(DIR_START + off, buf, toRead);
-    if (got == 0) continue;
-    for (uint32_t c = 0; c + ENTRY <= got; c += ENTRY) {
-      const uint8_t* rec = &buf[c];
-      if (rec[0] == 0x57 && rec[1] == 0x46) {
-        records++;
-      }
+  for (uint32_t off = 0; off + sizeof(rec) <= DIR_SIZE; off += stride) {
+    size_t got = dev->read(DIR_START + off, rec, sizeof(rec));
+    if (got != sizeof(rec)) break;
+    if (rec[0] == 0x57 && rec[1] == 0x46) {
+      records++;
+    } else if (rec[0] == 0xFF && rec[1] == 0xFF) {
+      // optional: first empty slot could break; keep scanning to be robust across power cycles
+      // break;
     }
   }
-  return records * ENTRY;
+  // Actual space consumed on media
+  return records * stride;
 }
 // ========== Minimal directory enumeration (reads the DIR table directly) ==========
 static inline uint32_t rd32_be(const uint8_t* p) {
@@ -564,54 +577,49 @@ static bool isAllFF(const uint8_t* p, size_t n) {
   return true;
 }
 static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
-  // FIX: scan the DIR of the currently active storage (no cross-device preference)
+  // Scan the DIR region honoring the on-media stride (32 or NAND page)
   UnifiedSpiMem::MemDevice* dev = activeFsDevice();
   if (!dev) return 0;
   constexpr uint32_t DIR_START = 0x000000;
   constexpr uint32_t DIR_SIZE = 64 * 1024;
-  constexpr uint32_t ENTRY = 32;
-  constexpr uint32_t CHUNK = 256;
+  const uint32_t stride = dirEntryStride();
   FsIndexEntry map[64];
   size_t mapCount = 0;
-  uint8_t buf[CHUNK];
-  for (uint32_t off = 0; off < DIR_SIZE; off += CHUNK) {
-    size_t toRead = ((off + CHUNK) <= DIR_SIZE) ? CHUNK : (DIR_SIZE - off);
-    size_t got = dev->read(DIR_START + off, buf, toRead);
-    if (got == 0) continue;  // treat as empty; keep scanning
-    // Walk this chunk in 32-byte records
-    for (uint32_t c = 0; c + ENTRY <= got; c += ENTRY) {
-      const uint8_t* rec = &buf[c];
-      // Only accept records with "WF" header; skip everything else (including 0xFF blocks)
-      if (rec[0] != 0x57 || rec[1] != 0x46) continue;
-      uint8_t flags = rec[2];
-      uint8_t nlen = rec[3];
-      if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
-      char name[ActiveFS::MAX_NAME + 1];
-      memset(name, 0, sizeof(name));
-      for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
-      uint32_t size = rd32_be(&rec[24]);
-      uint32_t seq = rd32_be(&rec[28]);
-      bool deleted = (flags & 0x01) != 0;
-      // Upsert by name, keep highest seq
-      int idx = -1;
-      for (size_t i = 0; i < mapCount; ++i) {
-        if (strncmp(map[i].name, name, ActiveFS::MAX_NAME) == 0) {
-          idx = (int)i;
-          break;
-        }
+  uint8_t rec[32];
+  for (uint32_t off = 0; off + sizeof(rec) <= DIR_SIZE; off += stride) {
+    if (dev->read(DIR_START + off, rec, sizeof(rec)) != sizeof(rec)) break;
+    // Only accept records with "WF" header; skip everything else (including 0xFF)
+    if (rec[0] != 0x57 || rec[1] != 0x46) {
+      continue;
+    }
+    uint8_t flags = rec[2];
+    uint8_t nlen = rec[3];
+    if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
+    char name[ActiveFS::MAX_NAME + 1];
+    memset(name, 0, sizeof(name));
+    for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
+    uint32_t size = rd32_be(&rec[24]);
+    uint32_t seq = rd32_be(&rec[28]);
+    bool deleted = (flags & 0x01) != 0;
+    // Upsert by name, keep highest seq
+    int idx = -1;
+    for (size_t i = 0; i < mapCount; ++i) {
+      if (strncmp(map[i].name, name, ActiveFS::MAX_NAME) == 0) {
+        idx = (int)i;
+        break;
       }
-      if (idx < 0) {
-        if (mapCount >= 64) continue;
-        idx = (int)mapCount++;
-        strncpy(map[idx].name, name, ActiveFS::MAX_NAME);
-        map[idx].name[ActiveFS::MAX_NAME] = 0;
-        map[idx].seq = 0;
-      }
-      if (seq >= map[idx].seq) {
-        map[idx].seq = seq;
-        map[idx].deleted = deleted;
-        map[idx].size = size;
-      }
+    }
+    if (idx < 0) {
+      if (mapCount >= 64) continue;
+      idx = (int)mapCount++;
+      strncpy(map[idx].name, name, ActiveFS::MAX_NAME);
+      map[idx].name[ActiveFS::MAX_NAME] = 0;
+      map[idx].seq = 0;
+    }
+    if (seq >= map[idx].seq) {
+      map[idx].seq = seq;
+      map[idx].deleted = deleted;
+      map[idx].size = size;
     }
   }
   if (out && outMax) {
@@ -638,7 +646,7 @@ static bool childOfFolder(const char* name, const char* folderPrefix, const char
   return true;
 }
 static void dumpDirHeadRaw(uint32_t bytes = 256) {
-  // FIX: dump from the active storage device
+  // dump from the active storage device
   UnifiedSpiMem::MemDevice* dev = activeFsDevice();
   if (!dev) {
     Console.println("lsdebug: no device");
@@ -767,7 +775,7 @@ static bool isFolderMarkerName(const char* nm) {
 static const char* firstSlash(const char* s) {
   return strchr(s, '/');
 }
-static constexpr size_t FS_NAME_ONDISK_MAX = 17;  // conservative (writer seems to truncate at 17 here)
+static constexpr size_t FS_NAME_ONDISK_MAX = 32;  // match SimpleFS MAX_NAME
 static bool pathTooLongForOnDisk(const char* full) {
   return strlen(full) > FS_NAME_ONDISK_MAX;
 }
@@ -912,6 +920,10 @@ static void dumpFileHead(const char* fname, uint32_t count) {
 }
 static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
+  uint32_t eraseAlign = getEraseAlign();
+  // Compute aligned reserve
+  if (reserve < eraseAlign) reserve = eraseAlign;
+  reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : reserve);
   if (!activeFs.exists(fname)) {
     Console.print("Creating slot ");
     Console.print(fname);
@@ -970,6 +982,9 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
     Console.printf("Skipping: %s\n", fname);
     return true;
   }
+  uint32_t eraseAlign = getEraseAlign();
+  if (reserve < eraseAlign) reserve = eraseAlign;
+  reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : reserve);
   Console.printf("Auto-creating %s (%lu bytes)...\n", fname, (unsigned long)reserve);
   if (activeFs.createFileSlot(fname, reserve, data, len)) {
     Console.println("Created and wrote blob");
@@ -1637,9 +1652,9 @@ static void handleCommand(char* line) {
       g_storage = StorageBackend::NAND;
       bindActiveFs(g_storage);
       updateExecFsTable();
-      bool ok = activeFs.mount(false);
+      bool ok = activeFs.mount(true);  // auto-format if empty for NAND
       Console.println("Switched active storage to NAND");
-      Console.println(ok ? "Mounted NAND (no auto-format)" : "Mount failed (NAND)\nAttempting to use PSRAM then SRAM as fallback!\n(SRAM only used if PSRAM fails silently)");
+      Console.println(ok ? "Mounted NAND (auto-format if empty)" : "Mount failed (NAND)\nAttempting to use PSRAM then SRAM as fallback!\n(SRAM only used if PSRAM fails silently)");
     } else {
       Console.println("usage: storage [flash|psram|nand]");
     }
@@ -1756,7 +1771,6 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
-
   } else if (!strcmp(t0, "coproc")) {
     char* sub;
     if (!nextToken(p, sub)) {
@@ -2281,14 +2295,11 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
-
   Console.println("System booting..");
   Console.begin();
-
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS });
-
   size_t found = uniMem.rescan();
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
@@ -2296,7 +2307,6 @@ void setup() {
     if (!di) continue;
     Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
-
   // Open FS handles (reservations handled internally)
   bool nandOk = fsNAND.begin(uniMem);
   bool flashOk = fsFlash.begin(uniMem);
@@ -2304,23 +2314,17 @@ void setup() {
   if (!nandOk) Console.println("NAND FS: no suitable device found or open failed");
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
-
-  bindActiveFs(g_storage);  // IMPORTANT: Bind activeFs before using it anywhere
-
+  bindActiveFs(g_storage);                                                                  // IMPORTANT: Bind activeFs before using it anywhere
   bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);  // Mount through activeFs (keeps table + handle consistent)
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
-
   // Clear mailbox (also clears any stale core1 probe)
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-
   Exec.attachConsole(&Console);
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
   updateExecFsTable();
-
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
-
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
