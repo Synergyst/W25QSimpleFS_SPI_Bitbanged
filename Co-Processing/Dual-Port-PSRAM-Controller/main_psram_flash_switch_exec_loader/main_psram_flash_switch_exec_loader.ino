@@ -104,6 +104,26 @@ struct FsIndexEntry {
   bool deleted;
   uint32_t seq;
 };
+static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
+  switch (g_storage) {
+    case StorageBackend::Flash: return fsFlash.raw().device();
+    case StorageBackend::PSRAM_BACKEND: return fsPSRAM.raw().device();
+    case StorageBackend::NAND: return fsNAND.raw().device();
+    default: return nullptr;
+  }
+}
+static inline int fsReplaceMode() {
+  switch (g_storage) {
+    case StorageBackend::Flash:
+      return (int)W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists;
+    case StorageBackend::NAND:
+      return (int)MX35UnifiedSimpleFS::WriteMode::ReplaceIfExists;
+    case StorageBackend::PSRAM_BACKEND:
+      // Use whatever PSRAM expects; if it mirrors Flash numeric values, 0 is likely correct.
+      return 0;
+  }
+  return 0;
+}
 static void bindActiveFs(StorageBackend backend) {
   if (backend == StorageBackend::Flash) {
     activeFs.mount = [](bool b) {
@@ -321,7 +341,7 @@ static bool writeFileToFolder(const char* folder, const char* fname, const uint8
   }
   // Try in-place update first, allow reallocate if needed
   if (activeFs.writeFileInPlace(path, data, len, true)) return true;
-  return activeFs.writeFile(path, data, len, /*ReplaceIfExists*/ 0);
+  return activeFs.writeFile(path, data, len, fsReplaceMode());
 }
 static uint32_t readFileFromFolder(const char* folder, const char* fname, uint8_t* buf, uint32_t bufSize) {
   char path[ActiveFS::MAX_NAME + 1];
@@ -341,7 +361,7 @@ static bool folderExists(const char* absFolder) {
 static bool mkdirFolder(const char* path) {
   // Create zero-length "folder/" marker
   if (activeFs.exists(path)) return true;  // already exists as a file or marker
-  return activeFs.writeFile(path, nullptr, 0, /*ReplaceIfExists*/ 0);
+  return activeFs.writeFile(path, nullptr, 0, fsReplaceMode());
 }
 static bool touchPath(const char* cwd, const char* arg) {
   // Create an empty file if it doesn't exist. No-op if it already exists.
@@ -369,7 +389,7 @@ static bool touchPath(const char* cwd, const char* arg) {
     return true;
   }
   // Create zero-length file (no slot reserved, does not advance data head)
-  return activeFs.writeFile(path, /*data*/ nullptr, /*size*/ 0, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists));
+  return activeFs.writeFile(path, /*data*/ nullptr, /*size*/ 0, fsReplaceMode());
 }
 // ========== mv helpers ==========
 static const char* lastSlash(const char* s) {
@@ -483,7 +503,7 @@ static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
       ok = activeFs.writeFileInPlace(dstAbs, buf, srcSize, false);
     }
     if (!ok) {
-      ok = activeFs.writeFile(dstAbs, buf, srcSize, /*ReplaceIfExists*/ 0);
+      ok = activeFs.writeFile(dstAbs, buf, srcSize, fsReplaceMode());
     }
   }
   if (!ok) {
@@ -511,61 +531,30 @@ static void printPct2(uint32_t num, uint32_t den) {
   Console.printf("%lu.%02lu%%", (unsigned long)(scaled / 100), (unsigned long)(scaled % 100));
 }
 static uint32_t dirBytesUsedEstimate() {
-  // Count directory entries to estimate directory space used (32 bytes per valid entry)
-  FsIndexEntry tmp[64];
-  size_t n = buildFsIndex(tmp, 64);  // robust scan over full DIR
-  return (uint32_t)(n * 32u);
-}
-static void cmdDf() {
-  // Active device (mounted)
-  // FIX: choose the device for the currently active storage
-  UnifiedSpiMem::MemDevice* dev = (g_storage == StorageBackend::Flash) ? fsFlash.raw().device() : fsPSRAM.raw().device();
-  if (dev) {
-    const auto t = dev->type();
-    const char* style = UnifiedSpiMem::deviceTypeName(t);
-    const uint8_t cs = dev->cs();
-    const uint64_t devCap = dev->capacity();
-    const uint32_t dataStart = activeFs.dataRegionStart();
-    const uint32_t fsCap32 = activeFs.capacity();
-    const uint32_t dataCap = (fsCap32 > dataStart) ? (fsCap32 - dataStart) : 0;
-    const uint32_t dataUsed = (activeFs.nextDataAddr() > dataStart) ? (activeFs.nextDataAddr() - dataStart) : 0;
-    const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
-    const uint32_t dirUsed = dirBytesUsedEstimate();
-    const uint32_t dirFree = (64u * 1024u > dirUsed) ? (64u * 1024u - dirUsed) : 0;
-    Console.println("Filesystem (active):");
-    Console.printf("  Device:  %s  CS=%u\n", style, (unsigned)cs);
-    Console.printf("  DevCap:  %llu bytes\n", (unsigned long long)devCap);
-    Console.printf("  FS data: %lu used (", (unsigned long)dataUsed);
-    printPct2(dataUsed, dataCap);
-    Console.printf(")  %lu free (", (unsigned long)dataFree);
-    printPct2(dataFree, dataCap);
-    Console.println(")");
-    Console.printf("  DIR:     %lu used (", (unsigned long)dirUsed);
-    printPct2(dirUsed, 64u * 1024u);
-    Console.printf(")  %lu free\n", (unsigned long)dirFree);
-  } else {
-    Console.println("Filesystem (active): none");
-  }
-  // Other detected devices (raw capacities)
-  size_t n = uniMem.detectedCount();
-  if (n == 0) return;
-  Console.println("Detected devices:");
-  for (size_t i = 0; i < n; ++i) {
-    const auto* di = uniMem.detectedInfo(i);
-    if (!di) continue;
-    // Mark which one is the active filesystem device (by CS + type)
-    bool isActive = false;
-    if (dev) {
-      isActive = (di->cs == dev->cs() && di->type == dev->type());
+  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
+  if (!dev) return 0;
+  constexpr uint32_t DIR_START = 0x000000;
+  constexpr uint32_t DIR_SIZE = 64 * 1024;
+  constexpr uint32_t ENTRY = 32;
+  constexpr uint32_t CHUNK = 256;
+
+  uint8_t buf[CHUNK];
+  uint32_t records = 0;
+
+  for (uint32_t off = 0; off < DIR_SIZE; off += CHUNK) {
+    size_t toRead = ((off + CHUNK) <= DIR_SIZE) ? CHUNK : (DIR_SIZE - off);
+    size_t got = dev->read(DIR_START + off, buf, toRead);
+    if (got == 0) continue;
+    for (uint32_t c = 0; c + ENTRY <= got; c += ENTRY) {
+      const uint8_t* rec = &buf[c];
+      if (rec[0] == 0x57 && rec[1] == 0x46) {
+        records++;
+      }
     }
-    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes%s\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes, isActive ? "\t <-- [mounted]" : "");
   }
+  return records * ENTRY;
 }
 // ========== Minimal directory enumeration (reads the DIR table directly) ==========
-static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
-  // FIX: helper to return the MemDevice for the currently active storage
-  return (g_storage == StorageBackend::Flash) ? fsFlash.raw().device() : fsPSRAM.raw().device();
-}
 static inline uint32_t rd32_be(const uint8_t* p) {
   return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
 }
@@ -668,6 +657,50 @@ static void dumpDirHeadRaw(uint32_t bytes = 256) {
       Console.print(' ');
     }
     Console.println();
+  }
+}
+static void cmdDf() {
+  // Active device (mounted)
+  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
+  if (dev) {
+    const auto t = dev->type();
+    const char* style = UnifiedSpiMem::deviceTypeName(t);
+    const uint8_t cs = dev->cs();
+    const uint64_t devCap = dev->capacity();
+    const uint32_t dataStart = activeFs.dataRegionStart();
+    const uint32_t fsCap32 = activeFs.capacity();
+    const uint32_t dataCap = (fsCap32 > dataStart) ? (fsCap32 - dataStart) : 0;
+    const uint32_t dataUsed = (activeFs.nextDataAddr() > dataStart) ? (activeFs.nextDataAddr() - dataStart) : 0;
+    const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
+    const uint32_t dirUsed = dirBytesUsedEstimate();
+    const uint32_t dirFree = (64u * 1024u > dirUsed) ? (64u * 1024u - dirUsed) : 0;
+    Console.println("Filesystem (active):");
+    Console.printf("  Device:  %s  CS=%u\n", style, (unsigned)cs);
+    Console.printf("  DevCap:  %llu bytes\n", (unsigned long long)devCap);
+    Console.printf("  FS data: %lu used (", (unsigned long)dataUsed);
+    printPct2(dataUsed, dataCap);
+    Console.printf(")  %lu free (", (unsigned long)dataFree);
+    printPct2(dataFree, dataCap);
+    Console.println(")");
+    Console.printf("  DIR:     %lu used (", (unsigned long)dirUsed);
+    printPct2(dirUsed, 64u * 1024u);
+    Console.printf(")  %lu free\n", (unsigned long)dirFree);
+  } else {
+    Console.println("Filesystem (active): none");
+  }
+  // Other detected devices (raw capacities)
+  size_t n = uniMem.detectedCount();
+  if (n == 0) return;
+  Console.println("Detected devices:");
+  for (size_t i = 0; i < n; ++i) {
+    const auto* di = uniMem.detectedInfo(i);
+    if (!di) continue;
+    // Mark which one is the active filesystem device (by CS + type)
+    bool isActive = false;
+    if (dev) {
+      isActive = (di->cs == dev->cs() && di->type == dev->type());
+    }
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes%s\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes, isActive ? "\t <-- [mounted]" : "");
   }
 }
 // ========== CWD + path helpers ==========
@@ -924,7 +957,7 @@ static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len,
     Console.println("Updated in place");
     return true;
   }
-  if (activeFs.writeFile(fname, data, len, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists))) {
+  if (activeFs.writeFile(fname, data, len, fsReplaceMode())) {
     Console.println("Updated by allocating new space");
     return true;
   }
@@ -937,7 +970,7 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
     Console.printf("Skipping: %s\n", fname);
     return true;
   }
-  Console.printf("Auto-creating %s (%d bytes)...\n", fname, reserve);
+  Console.printf("Auto-creating %s (%lu bytes)...\n", fname, (unsigned long)reserve);
   if (activeFs.createFileSlot(fname, reserve, data, len)) {
     Console.println("Created and wrote blob");
     return true;
@@ -1228,7 +1261,7 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
 }
 static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
   if (!checkNameLen(fname)) return false;
-  bool ok = activeFs.writeFile(fname, data, len, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists));
+  bool ok = activeFs.writeFile(fname, data, len, fsReplaceMode());
   return ok;
 }
 // ================= CompilerHelpers header =================
@@ -1464,7 +1497,7 @@ static void printHelp() {
   Console.println("Commands (filename max 32 chars):");
   Console.println("  help                         - this help");
   Console.println("  storage                      - show active storage");
-  Console.println("  storage flash|psram          - switch storage backend");
+  Console.println("  storage flash|psram|nand     - switch storage backend");
   Console.println("  mode                         - show mode (dev/prod)");
   Console.println("  mode dev|prod                - set dev or prod mode");
   Console.println("  persist read                 - read persist file from active storage");
@@ -1641,7 +1674,7 @@ static void handleCommand(char* line) {
       uint8_t buf[PERSIST_LEN];
       memset(buf, 0, PERSIST_LEN);
       uint32_t got = activeFs.readFile(pf, buf, PERSIST_LEN);
-      Console.printf("persist read: %d bytes: ", got);
+      Console.printf("persist read: %lu bytes: ", (unsigned long)got);
       for (size_t i = 0; i < got; ++i) {
         if (i) Console.print(' ');
         if (buf[i] < 0x10) Console.print('0');
@@ -1659,7 +1692,7 @@ static void handleCommand(char* line) {
         }
       } else {
         if (!activeFs.writeFileInPlace(pf, buf, PERSIST_LEN, true)) {
-          if (!activeFs.writeFile(pf, buf, PERSIST_LEN, static_cast<int>(W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists))) {
+          if (!activeFs.writeFile(pf, buf, PERSIST_LEN, fsReplaceMode())) {
             Console.println("persist write: write failed");
             return;
           }
