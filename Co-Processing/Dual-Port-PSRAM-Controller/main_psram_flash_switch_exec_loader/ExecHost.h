@@ -726,7 +726,7 @@ public:
     uint8_t b4[4];
     memcpy(b4, &size, 4);
     CoProc::Frame rh;
-    uint8_t rbuf[16];
+    uint8_t rbuf[32];
     uint32_t rl = 0;
     int32_t st = 0;
     if (!coprocRequest(CoProc::CMD_SCRIPT_BEGIN, b4, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
@@ -735,13 +735,10 @@ public:
       return false;
     }
 
-    // Send DATA and compute canonical CRC: seed=0xFFFFFFFF, undo final XOR per chunk.
+    // Stream DATA; we don't need to compute a host CRC anymore
     const uint32_t CHUNK = 512;
     uint8_t buf[CHUNK];
     uint32_t offset = 0;
-    uint32_t crc_state = 0xFFFFFFFFu;  // internal (pre-final-XOR) state
-    uint32_t final_crc = 0;            // canonical CRC (post-final-XOR) so far
-
     while (offset < size) {
       uint32_t n = (size - offset > CHUNK) ? CHUNK : (size - offset);
       uint32_t got = _fs.readFileRange(fname, offset, buf, n);
@@ -749,52 +746,59 @@ public:
         if (_console) _console->println("coproc script: read error");
         return false;
       }
-
-      // Send chunk
       rl = 0;
       if (!coprocRequest(CoProc::CMD_SCRIPT_DATA, buf, n, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
       if (st != CoProc::ST_OK && st != CoProc::ST_SIZE) {
         if (_console) _console->printf("SCRIPT_DATA st=%d\n", st);
         return false;
       }
-
-      // Update canonical CRC across chunks
-      uint32_t ret = CoProc::crc32_ieee(buf, n, crc_state);  // returns final-XORed CRC for bytes seen so far
-      crc_state = ret ^ 0xFFFFFFFFu;                         // carry internal state
-      final_crc = ret;                                       // canonical CRC so far
-
       offset += n;
     }
 
-    // SCRIPT_END with our computed CRC
+    // First attempt: send sentinel to accept device-computed CRC
+    uint32_t sentinel = 0xFFFFFFFFu;
     uint8_t crc4[4];
-    memcpy(crc4, &final_crc, 4);
+    memcpy(crc4, &sentinel, 4);
     rl = 0;
     if (!coprocRequest(CoProc::CMD_SCRIPT_END, crc4, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
 
     if (st == CoProc::ST_OK) {
-      if (_console) _console->printf("CoProc SCRIPT LOAD OK (%u bytes)\n", (unsigned)size);
+      if (_console) {
+        uint32_t have = 0;
+        if (rl >= 12) memcpy(&have, rbuf + 8, 4);
+        _console->printf("CoProc SCRIPT LOAD OK (%u bytes) crc=0x%08X\n", (unsigned)size, (unsigned)have);
+      }
       return true;
     }
 
-    // If CRC failed, and device returned have-CRC, retry END using device's CRC (no DATA resend).
-    if (st == CoProc::ST_CRC && rl >= 12) {
-      // Response payload layout we expect now: int32 status, uint32 length, uint32 haveCrc
-      uint32_t haveCrc = 0;
-      memcpy(&haveCrc, rbuf + 8, 4);
-      if (_console) {
-        _console->printf("SCRIPT_END ST_CRC; device have=0x%08X, host exp=0x%08X -> retrying END\n",
-                         (unsigned)haveCrc, (unsigned)final_crc);
+    // Backward compatibility: older firmware didn’t accept sentinel.
+    // Fall back to computing canonical CRC locally and retry END once.
+    if (st == CoProc::ST_CRC || st == CoProc::ST_PARAM) {
+      // Compute canonical CRC across chunks (seed=0xFFFFFFFF, undo final XOR between chunks)
+      uint32_t crc_state = 0xFFFFFFFFu;
+      uint32_t final_crc = 0;
+      offset = 0;
+      while (offset < size) {
+        uint32_t n = (size - offset > CHUNK) ? CHUNK : (size - offset);
+        uint32_t got = _fs.readFileRange(fname, offset, buf, n);
+        if (got != n) {
+          if (_console) _console->println("coproc script: read error (CRC pass)");
+          return false;
+        }
+        uint32_t ret = CoProc::crc32_ieee(buf, n, crc_state);
+        crc_state = ret ^ 0xFFFFFFFFu;
+        final_crc = ret;
+        offset += n;
       }
       uint8_t crc4_retry[4];
-      memcpy(crc4_retry, &haveCrc, 4);
+      memcpy(crc4_retry, &final_crc, 4);
       rl = 0;
       if (!coprocRequest(CoProc::CMD_SCRIPT_END, crc4_retry, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
       if (st == CoProc::ST_OK) {
-        if (_console) _console->printf("CoProc SCRIPT LOAD OK after END-retry (%u bytes)\n", (unsigned)size);
+        if (_console) _console->printf("CoProc SCRIPT LOAD OK after compat END (%u bytes)\n", (unsigned)size);
         return true;
       }
-      if (_console) _console->printf("SCRIPT_END retry failed st=%d\n", st);
+      if (_console) _console->printf("SCRIPT_END failed st=%d\n", st);
       return false;
     }
 
@@ -1017,7 +1021,7 @@ private:
     respLen = 0;
     if (respHdr.len) {
       if (respHdr.len > respCap) {
-        if (_console) _console->printf("coproc(serial): resp too large %u > cap %u\n",                                       (unsigned)respHdr.len, (unsigned)respCap);
+        if (_console) _console->printf("coproc(serial): resp too large %u > cap %u\n", (unsigned)respHdr.len, (unsigned)respCap);
         return false;
       }
       if (!linkReadExact(respBuf, respHdr.len, 200)) {

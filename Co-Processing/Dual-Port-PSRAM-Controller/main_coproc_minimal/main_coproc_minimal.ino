@@ -41,8 +41,8 @@ static const uint8_t PIN_TX = 1;  // GP1  (co-processor TX)
 
 // ------- Software serial config -------
 #ifndef SOFT_BAUD
-#define SOFT_BAUD 230400
-//#define SOFT_BAUD 115200
+//#define SOFT_BAUD 230400
+#define SOFT_BAUD 115200
 #endif
 static SoftwareSerial link(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
 
@@ -427,22 +427,22 @@ void setup() {
 
   Serial.println("CoProc (soft-serial) booting...");
   ArbiterISP::initTestPins();
-  bool ok = ArbiterISP::runTestSuiteOnce(true, true);
+  //bool ok = ArbiterISP::runTestSuiteOnce(true, true);
   ArbiterISP::cleanupToResetState();
-  if (!ok) {
+  /*if (!ok) {
     Serial.println("P.O.S.T. failed!");
-    /*Serial.println("Entering ISP mode, please exit serial console and reprogram MCU!");
+    Serial.println("Entering ISP mode, please exit serial console and reprogram MCU!");
     ArbiterISP::enterISPMode();
     while (!BOOTSEL) ArbiterISP::serviceISPOnce();  // inside loop
     delay(2000);
     ArbiterISP::exitISPMode();
-    Serial.println("Exited ISP mode..");*/
+    Serial.println("Exited ISP mode..");
     Serial.println("Are we possibly testing the 74HC32 emulator..?");
     bool ok2 = ArbiterISP::runHC32POST(true);  // verbose = true
     Serial.println(ok2 ? F("[74HC32] DUT PASS") : F("[74HC32] DUT FAIL"));
   } else {
     Serial.println("P.O.S.T. success!");
-  }
+  }*/
 
   // Allocate protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);

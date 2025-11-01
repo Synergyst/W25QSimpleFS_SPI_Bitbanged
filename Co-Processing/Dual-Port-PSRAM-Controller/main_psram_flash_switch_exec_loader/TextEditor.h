@@ -77,7 +77,7 @@ enum {
 };
 
 struct NanoEditor {
-  static const int MAX_LINES = 512;
+  static const int MAX_LINES = 768;
   static const int MAX_COLS = 256;  // allow longer lines than console view
 
   // Dynamic screen geometry (detected or defaults)

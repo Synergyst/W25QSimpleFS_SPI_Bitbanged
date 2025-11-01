@@ -7,8 +7,8 @@
 #include "CoProcProto.h"
 #include "CoProcLang.h"
 #ifndef COPROC_BAUD
-#define COPROC_BAUD 230400
-//#define COPROC_BAUD 115200
+//#define COPROC_BAUD 230400
+#define COPROC_BAUD 115200
 #endif
 #ifndef PIN_COPROC_RX
 #define PIN_COPROC_RX 0  // GP0 (main RX)
@@ -44,6 +44,9 @@ static ConsolePrint Console;  // Console wrapper
 #define FILE_BLINKSCRIPT "blinkscript"
 #define FILE_ONSCRIPT "onscript"
 #define FILE_SONG "song"
+#define FILE_PT1 "pt1"
+#define FILE_PT2 "pt2"
+#define FILE_PT3 "pt3"
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
 // Pins you already have:
@@ -862,6 +865,9 @@ static const BlobReg g_blobs[] = {
   { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
   { FILE_SONG, blob_song, blob_song_len },
+  { FILE_PT1, blob_pt1, blob_pt1_len },
+  { FILE_PT2, blob_pt2, blob_pt2_len },
+  { FILE_PT3, blob_pt3, blob_pt3_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
 // ========== Return mailbox reservation (Scratch) ==========
@@ -1065,6 +1071,9 @@ static void autogenBlobWrites() {
   allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
   allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
   allOk &= ensureBlobIfMissing(FILE_SONG, blob_song, blob_song_len);
+  allOk &= ensureBlobIfMissing(FILE_PT1, blob_pt1, blob_pt1_len);
+  allOk &= ensureBlobIfMissing(FILE_PT2, blob_pt2, blob_pt2_len);
+  allOk &= ensureBlobIfMissing(FILE_PT3, blob_pt3, blob_pt3_len);
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }

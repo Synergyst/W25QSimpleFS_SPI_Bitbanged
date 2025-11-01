@@ -18,17 +18,21 @@
 #include <string.h>
 #include "CoProcProto.h"
 #include "CoProcLang.h"
+
 #ifndef DBG
 #define DBG(...) \
   do { \
   } while (0)
 #endif
+
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
+
 // These must be provided by the including sketch (definitions), we only declare them here.
 extern "C" uint8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX];
 extern volatile uint8_t g_cancel_flag;
+
 // Helper: call entry in "Thumb" mode with up to MAX_EXEC_ARGS int32 args.
 static inline int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
@@ -47,22 +51,26 @@ static inline int call_with_args_thumb(void* entryThumb, uint32_t argc, const in
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
+
 class CoProcExec {
 public:
   using FuncN = int32_t (*)(const int32_t* argv, uint32_t argc);
+
   CoProcExec()
     : g_blob(nullptr), g_blob_len(0), g_blob_cap(0), g_blob_crc(0),
-      g_script(nullptr), g_script_len(0), g_script_cap(0), g_script_crc(0),
+      g_script(nullptr), g_script_len(0), g_script_cap(0), g_script_expected_len(0), g_script_crc(0),
       g_exec_state(CoProc::EXEC_IDLE) {
     memset(&g_job, 0, sizeof(g_job));
     clearFuncRegistry();
   }
+
   void begin() {
     memset(&g_job, 0, sizeof(g_job));
     memset(BLOB_MAILBOX, 0, BLOB_MAILBOX_MAX);
     g_cancel_flag = 0;
     g_exec_state = CoProc::EXEC_IDLE;
   }
+
   // To be called from core1 loop
   void workerPoll() {
     if (!g_job.active) {
@@ -82,6 +90,7 @@ public:
     g_job.active = 0;
     DBG("[COPROC] EXEC done status=%d result=%d\n", (int)status, (int)result);
   }
+
   // Command handlers (build payload into out resp buffer)
   int32_t cmdHELLO(bool ispActive, uint8_t* out, size_t cap, size_t& off) {
     int32_t status = CoProc::ST_OK;
@@ -98,6 +107,7 @@ public:
     CoProc::writePOD(out, cap, off, features);
     return status;
   }
+
   int32_t cmdINFO(bool ispActive, uint8_t* out, size_t cap, size_t& off) {
     CoProc::Info info{};
     info.impl_flags = 0;
@@ -114,6 +124,7 @@ public:
     CoProc::writePOD(out, cap, off, info);
     return status;
   }
+
   int32_t cmdLOAD_BEGIN(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t total = 0;
@@ -129,6 +140,7 @@ public:
     DBG("[DBG] LOAD_BEGIN total=%u\n", (unsigned)total);
     return writeStatus(out, cap, off, CoProc::ST_OK);
   }
+
   int32_t cmdLOAD_DATA(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_blob || g_blob_len >= g_blob_cap) return writeStatus(out, cap, off, CoProc::ST_STATE);
     uint32_t can = g_blob_cap - g_blob_len;
@@ -145,6 +157,7 @@ public:
         (unsigned)len, (unsigned)take, (unsigned)g_blob_len);
     return status;
   }
+
   int32_t cmdLOAD_END(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t expected = 0;
@@ -156,6 +169,7 @@ public:
         (unsigned)expected, (unsigned)g_blob_crc, (int)status);
     return status;
   }
+
   int32_t cmdEXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_blob || (g_blob_len & 1u)) return writeStatus2(out, cap, off, CoProc::ST_STATE, 0);
     if (g_job.active) return writeStatus2(out, cap, off, CoProc::ST_STATE, 0);
@@ -196,6 +210,7 @@ public:
     DBG("[DBG] EXEC reply status=%d result=%d\n", (int)g_job.status, (int)g_job.result);
     return g_job.status;
   }
+
   int32_t cmdSTATUS(uint8_t* out, size_t cap, size_t& off) {
     int32_t status = CoProc::ST_OK;
     uint32_t es = g_exec_state;
@@ -204,6 +219,7 @@ public:
     DBG("[DBG] STATUS es=%u\n", (unsigned)es);
     return status;
   }
+
   int32_t cmdMAILBOX_RD(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t maxb = 0;
@@ -218,6 +234,7 @@ public:
     DBG("[DBG] MAILBOX_RD n=%u\n", (unsigned)n);
     return CoProc::ST_OK;
   }
+
   int32_t cmdCANCEL(uint8_t* out, size_t cap, size_t& off) {
     mailboxSetCancel(1);
     int32_t st = CoProc::ST_OK;
@@ -225,6 +242,7 @@ public:
     DBG("[DBG] CANCEL set\n");
     return st;
   }
+
   // Script pipeline
   int32_t cmdSCRIPT_BEGIN(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
@@ -236,10 +254,12 @@ public:
     if (!g_script) return writeStatus(out, cap, off, CoProc::ST_NOMEM);
     g_script_len = 0;
     g_script_cap = total;
+    g_script_expected_len = total;
     g_script_crc = 0;
     DBG("[DBG] SCRIPT_BEGIN total=%u\n", (unsigned)total);
     return writeStatus(out, cap, off, CoProc::ST_OK);
   }
+
   int32_t cmdSCRIPT_DATA(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_script || g_script_len >= g_script_cap) return writeStatus(out, cap, off, CoProc::ST_STATE);
     uint32_t can = g_script_cap - g_script_len;
@@ -256,6 +276,7 @@ public:
         (unsigned)len, (unsigned)take, (unsigned)g_script_len);
     return status;
   }
+
   int32_t cmdSCRIPT_END(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t expected = 0;
@@ -267,14 +288,27 @@ public:
       g_script[nulpos] = 0;
     }
 
-    // Canonical, one-shot CRC over the stored bytes.
-    const uint32_t have = (g_script && g_script_len)
-                            ? CoProc::crc32_ieee(g_script, g_script_len)
-                            : 0;
+    // Length check (catch truncation/overflow)
+    if (!g_script || g_script_len != g_script_expected_len) {
+      CoProc::writePOD(out, cap, off, (int32_t)CoProc::ST_SIZE);
+      CoProc::writePOD(out, cap, off, g_script_len);
+      uint32_t haveLenCrc = (g_script && g_script_len) ? CoProc::crc32_ieee(g_script, g_script_len) : 0;
+      CoProc::writePOD(out, cap, off, haveLenCrc);
+      DBG("[DBG] SCRIPT_END size mismatch exp_len=%u have_len=%u\n",
+          (unsigned)g_script_expected_len, (unsigned)g_script_len);
+      return CoProc::ST_SIZE;
+    }
 
-    const int32_t status = (expected == have) ? CoProc::ST_OK : CoProc::ST_CRC;
+    // Canonical, one-shot CRC over stored bytes
+    const uint32_t have = (g_script && g_script_len) ? CoProc::crc32_ieee(g_script, g_script_len) : 0;
 
-    // Respond with: status, length, and have-CRC (extra 4 bytes for robustness).
+    // Accept sentinel expected CRC (0xFFFFFFFF) as "use device result"
+    int32_t status = CoProc::ST_OK;
+    if (expected != 0xFFFFFFFFu) {
+      status = (expected == have) ? CoProc::ST_OK : CoProc::ST_CRC;
+    }
+
+    // Respond with: status, length, and have-CRC for robustness
     CoProc::writePOD(out, cap, off, status);
     CoProc::writePOD(out, cap, off, g_script_len);
     CoProc::writePOD(out, cap, off, have);
@@ -283,6 +317,7 @@ public:
         (unsigned)expected, (unsigned)have, (int)status);
     return status;
   }
+
   int32_t cmdSCRIPT_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_script || g_script_len == 0) return writeStatus2(out, cap, off, CoProc::ST_STATE, 0);
     size_t p = 0;
@@ -344,6 +379,7 @@ public:
     CoProc::writePOD(out, cap, off, (int32_t)retVal);
     return st;
   }
+
   // Named function registry and dispatcher (CMD_FUNC)
   // Register a function by name with fixed argc.
   // expected_argc: >=0 for exact match; -1 to allow any argc.
@@ -364,6 +400,7 @@ public:
     ++m_funcCount;
     return true;
   }
+
   int32_t cmdFUNC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t nameLen = 0;
@@ -427,6 +464,7 @@ public:
     CoProc::writePOD(out, cap, off, rv);
     return CoProc::ST_OK;
   }
+
   // Accessors (if needed by the sketch)
   uint32_t getExecState() const {
     return g_exec_state;
@@ -437,6 +475,7 @@ public:
   bool isJobActive() const {
     return g_job.active != 0;
   }
+
 private:
   struct ExecJob {
     uintptr_t code;
@@ -447,17 +486,25 @@ private:
     volatile int32_t result;
     volatile int32_t status;
   };
+
   ExecJob g_job;
+
+  // Blob (binary) state
   uint8_t* g_blob;
   uint32_t g_blob_len;
   uint32_t g_blob_cap;
   uint32_t g_blob_crc;
+
+  // Script state
   uint8_t* g_script;
   uint32_t g_script_len;
   uint32_t g_script_cap;
+  uint32_t g_script_expected_len;  // total length advertised at BEGIN; used for size check at END
   uint32_t g_script_crc;
+
   volatile uint32_t g_exec_state;
   inline static CoProcLang::VM* s_vm = nullptr;
+
   // Function registry
   struct FuncEntry {
     const char* name;
@@ -467,6 +514,7 @@ private:
   static constexpr uint32_t MAX_FUNCS = 32;
   FuncEntry m_funcs[MAX_FUNCS];
   uint32_t m_funcCount = 0;
+
   void clearFuncRegistry() {
     m_funcCount = 0;
     for (uint32_t i = 0; i < MAX_FUNCS; ++i) {
@@ -475,6 +523,7 @@ private:
       m_funcs[i].fn = nullptr;
     }
   }
+
   const FuncEntry* findFunc(const char* name) const {
     for (uint32_t i = 0; i < m_funcCount; ++i) {
       if (m_funcs[i].name && strcmp(m_funcs[i].name, name) == 0) {
@@ -483,9 +532,11 @@ private:
     }
     return nullptr;
   }
+
   static inline void mailboxSetCancel(uint8_t v) {
     g_cancel_flag = v;
   }
+
   static bool parseAsciiInt(const uint8_t* s, size_t n, int32_t& out) {
     if (!s || n == 0) return false;
     const char* p = (const char*)s;
@@ -531,6 +582,7 @@ private:
     out = neg ? -v : v;
     return true;
   }
+
   void freeBlob() {
     if (g_blob) free(g_blob);
     g_blob = nullptr;
@@ -540,18 +592,22 @@ private:
     g_exec_state = CoProc::EXEC_IDLE;
     DBG("[COPROC] blob freed\n");
   }
+
   void freeScript() {
     if (g_script) free(g_script);
     g_script = nullptr;
     g_script_len = 0;
     g_script_cap = 0;
     g_script_crc = 0;
+    g_script_expected_len = 0;
     DBG("[COPROC] script freed\n");
   }
+
   static int32_t writeStatus(uint8_t* out, size_t cap, size_t& off, int32_t st) {
     CoProc::writePOD(out, cap, off, st);
     return st;
   }
+
   static int32_t writeStatus2(uint8_t* out, size_t cap, size_t& off, int32_t st, int32_t v) {
     CoProc::writePOD(out, cap, off, st);
     CoProc::writePOD(out, cap, off, v);
