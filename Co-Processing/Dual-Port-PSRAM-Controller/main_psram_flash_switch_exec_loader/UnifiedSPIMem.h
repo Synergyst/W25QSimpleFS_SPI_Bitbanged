@@ -665,9 +665,9 @@ static inline const char* vendorNameFromMID(uint8_t mfr) {
 }
 static inline const char* deviceTypeName(DeviceType t) {
   switch (t) {
-    case DeviceType::NorW25Q: return "NOR";           // (W25Q-like)
-    case DeviceType::SpiNandMX35: return "SPI-NAND";  // (MX35LF)
-    case DeviceType::Psram: return "PSRAM";           // (PSRAM)
+    case DeviceType::NorW25Q: return "NOR";       // (W25Q-like)
+    case DeviceType::SpiNandMX35: return "NAND";  // (MX35LF)
+    case DeviceType::Psram: return "PSRAM";       // (PSRAM)
     default: return "Unknown";
   }
 }

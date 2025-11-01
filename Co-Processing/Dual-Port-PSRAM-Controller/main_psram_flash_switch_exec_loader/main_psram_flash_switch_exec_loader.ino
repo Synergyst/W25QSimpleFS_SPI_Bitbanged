@@ -1,4 +1,5 @@
 // main_psram_flash_switch_exec_loader.ino
+#define EXECHOST_TRACE 1
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 #include "UnifiedSPIMemSimpleFS.h"
@@ -48,31 +49,31 @@ static ConsolePrint Console;  // Console wrapper
 #define FS_SECTOR_SIZE 4096
 // Pins you already have:
 const uint8_t PIN_FLASH_MISO = 12;  // GP12
-const uint8_t PIN_FLASH_CS = 9;     // GP9
-const uint8_t PIN_FLASH_SCK = 10;   // GP10
-const uint8_t PIN_FLASH_MOSI = 11;  // GP11
 const uint8_t PIN_PSRAM_MISO = 12;  // GP12
+const uint8_t PIN_FLASH_MOSI = 11;  // GP11
 const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
+const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_PSRAM_SCK = 10;   // GP10
+const uint8_t PIN_FLASH_CS = 9;     // GP9
 const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
 const uint8_t PIN_PSRAM_CS1 = 15;   // GP15
 const uint8_t PIN_PSRAM_CS2 = 26;   // GP26
 const uint8_t PIN_PSRAM_CS3 = 27;   // GP27
+const uint8_t PIN_NAND_CS = 28;     // GP28
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
 const size_t PERSIST_LEN = 32;
 enum class StorageBackend {
   Flash,
-  PSRAM_BACKEND
+  PSRAM_BACKEND,
+  NAND,
 };
 static StorageBackend g_storage = StorageBackend::Flash;
-// Unified manager: one bus, many CS
-UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);
-// SimpleFS facades (these are your “handles”)
-W25QUnifiedSimpleFS fsFlash;  // Use MX35UnifiedSimpleFS if your flash is MX35LF SPI-NAND
+UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  // Unified manager: one bus, many CS
+// SimpleFS facades
+W25QUnifiedSimpleFS fsFlash;
 PSRAMUnifiedSimpleFS fsPSRAM;
-// If your flash chip is actually MX35LF (SPI-NAND), do this instead:
-// MX35UnifiedSimpleFS fsFlash;
+MX35UnifiedSimpleFS fsNAND;
 static bool g_dev_mode = true;
 // ========== ActiveFS structure ==========
 struct ActiveFS {
@@ -153,6 +154,55 @@ static void bindActiveFs(StorageBackend backend) {
     };
     activeFs.dataRegionStart = []() {
       return fsFlash.dataRegionStart();
+    };
+  } else if (backend == StorageBackend::NAND) {
+    activeFs.mount = [](bool b) {
+      return fsNAND.mount(b);
+    };
+    activeFs.format = []() {
+      return fsNAND.format();
+    };
+    activeFs.wipeChip = []() {
+      return fsNAND.wipeChip();
+    };
+    activeFs.exists = [](const char* n) {
+      return fsNAND.exists(n);
+    };
+    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsNAND.createFileSlot(n, r, d, s);
+    };
+    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsNAND.writeFile(n, d, s, static_cast<MX35UnifiedSimpleFS::WriteMode>(m));
+    };
+    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsNAND.writeFileInPlace(n, d, s, a);
+    };
+    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsNAND.readFile(n, b, sz);
+    };
+    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
+      return fsNAND.readFileRange(n, off, b, l);
+    };
+    activeFs.getFileSize = [](const char* n, uint32_t& s) {
+      return fsNAND.getFileSize(n, s);
+    };
+    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsNAND.getFileInfo(n, a, s, c);
+    };
+    activeFs.deleteFile = [](const char* n) {
+      return fsNAND.deleteFile(n);
+    };
+    activeFs.listFilesToSerial = []() {
+      fsNAND.listFilesToSerial();
+    };
+    activeFs.nextDataAddr = []() {
+      return fsNAND.nextDataAddr();
+    };
+    activeFs.capacity = []() {
+      return fsNAND.capacity();
+    };
+    activeFs.dataRegionStart = []() {
+      return fsNAND.dataRegionStart();
     };
   } else {
     activeFs.mount = [](bool b) {
@@ -509,12 +559,7 @@ static void cmdDf() {
     if (dev) {
       isActive = (di->cs == dev->cs() && di->type == dev->type());
     }
-    Console.printf("  CS=%u  Type=%s  Vendor=%s  Cap=%llu bytes%s\n",
-                   di->cs,
-                   UnifiedSpiMem::deviceTypeName(di->type),
-                   di->vendorName,
-                   (unsigned long long)di->capacityBytes,
-                   isActive ? "  [mounted]" : "");
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes%s\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes, isActive ? "\t <-- [mounted]" : "");
   }
 }
 // ========== Minimal directory enumeration (reads the DIR table directly) ==========
@@ -1525,7 +1570,21 @@ static void handleCommand(char* line) {
     char* tok;
     if (!nextToken(p, tok)) {
       Console.print("Active storage: ");
-      Console.println(g_storage == StorageBackend::Flash ? "flash" : "psram");
+      switch (g_storage) {
+        case StorageBackend::Flash:
+          Console.println("flash");
+          break;
+        case StorageBackend::PSRAM_BACKEND:
+          Console.println("psram");
+          break;
+        case StorageBackend::NAND:
+          Console.println("nand");
+          break;
+        default:
+          Console.println("unknown");
+          break;
+      }
+      //Console.println(g_storage == StorageBackend::Flash ? "flash" : "psram");
       return;
     }
     if (!strcmp(tok, "flash")) {
@@ -1534,16 +1593,23 @@ static void handleCommand(char* line) {
       updateExecFsTable();
       bool ok = activeFs.mount(true);
       Console.println("Switched active storage to FLASH");
-      Console.println(ok ? "Mounted FLASH (auto-format if empty)" : "Mount failed (FLASH)");
+      Console.println(ok ? "Mounted FLASH (auto-format if empty)" : "Mount failed (FLASH)\nAttempting to use PSRAM then SRAM as fallback!\n(SRAM only used if PSRAM fails silently)");
     } else if (!strcmp(tok, "psram")) {
       g_storage = StorageBackend::PSRAM_BACKEND;
       bindActiveFs(g_storage);
       updateExecFsTable();
       bool ok = activeFs.mount(false);
       Console.println("Switched active storage to PSRAM");
-      Console.println(ok ? "Mounted PSRAM (no auto-format)" : "Mount failed (PSRAM)");
+      Console.println(ok ? "Mounted PSRAM (no auto-format)" : "Mount failed (PSRAM)\nAttempting to use PSRAM then SRAM as fallback!\n(SRAM only used if PSRAM fails silently)");
+    } else if (!strcmp(tok, "nand")) {
+      g_storage = StorageBackend::NAND;
+      bindActiveFs(g_storage);
+      updateExecFsTable();
+      bool ok = activeFs.mount(false);
+      Console.println("Switched active storage to NAND");
+      Console.println(ok ? "Mounted NAND (no auto-format)" : "Mount failed (NAND)\nAttempting to use PSRAM then SRAM as fallback!\n(SRAM only used if PSRAM fails silently)");
     } else {
-      Console.println("usage: storage [flash|psram]");
+      Console.println("usage: storage [flash|psram|nand]");
     }
   } else if (!strcmp(t0, "mode")) {
     char* tok;
@@ -1658,7 +1724,7 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
-  } else if (!strcmp(t0, "exec")) {
+    /*} else if (!strcmp(t0, "exec")) {
     char* fn;
     if (!nextToken(p, fn)) {
       Console.println("usage: exec <file> [a0 ... aN] [&]");
@@ -1758,7 +1824,7 @@ static void handleCommand(char* line) {
       Console.println("Cancellation requested (best-effort).");
     } else {
       Console.println("bg: usage: bg [status|query] | bg kill|cancel [force]");
-    }
+    }*/
   } else if (!strcmp(t0, "coproc")) {
     char* sub;
     if (!nextToken(p, sub)) {
@@ -2279,15 +2345,25 @@ static void handleCommand(char* line) {
   }
 }
 // ========== Setup and main loops ==========
+const uint8_t LED_PIN = 2;  // LED on GP2
+// Reserve a small area in the mailbox to dump core1 Exec addresses (5 x uint32_t)
+//static constexpr uint32_t MBOX_OFF_CORE1_DBG = 16;  // word index (uint32_t) inside mailbox
+//static bool g_printedCore1Probe = false;
 void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
+
   Console.println("System booting..");
   Console.begin();
+
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
-  uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3 });
+  uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS });
+
   size_t found = uniMem.rescan();
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
@@ -2295,36 +2371,136 @@ void setup() {
     if (!di) continue;
     Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
+
   // Open both handles (reservations handled internally)
   bool flashOk = fsFlash.begin(uniMem);  // or MX35UnifiedSimpleFS if using SPI-NAND
   bool psramOk = fsPSRAM.begin(uniMem);
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
+
   // IMPORTANT: Bind activeFs before using it anywhere
   bindActiveFs(g_storage);
   updateExecFsTable();
+
   // Mount through activeFs (keeps table + handle consistent)
   bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
+
+  // Clear mailbox (also clears any stale core1 probe)
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-  Exec.attachConsole(&Console);
+
+  //Exec.attachConsole(&Console);
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
+
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
+
+  // Core0: print Exec addresses (as seen on core0)
+  /*Console.printf("Core0: Exec@0x%08lX job_flag@0x%08lX job@0x%08lX result@0x%08lX status@0x%08lX\n",
+                 (unsigned long)Exec.dbg_addr_this(), (unsigned long)Exec.dbg_addr_job_flag(), (unsigned long)Exec.dbg_addr_job(), (unsigned long)Exec.dbg_addr_result(), (unsigned long)Exec.dbg_addr_status());
+
+  // Give core1 longer to run setup1 and write its probe; then we’ll also re-check later
+  volatile uint32_t* m32 = (volatile uint32_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
+  uint32_t c1_this = 0;
+  uint32_t waitMs = 0;
+  while (waitMs < 10000) {  // wait up to 1 s
+    c1_this = m32[MBOX_OFF_CORE1_DBG + 0];
+    if (c1_this != 0) break;
+    delay(10);
+    waitMs += 10;
+  }
+  if (c1_this != 0) {
+    uint32_t c1_flag = m32[MBOX_OFF_CORE1_DBG + 1];
+    uint32_t c1_job = m32[MBOX_OFF_CORE1_DBG + 2];
+    uint32_t c1_result = m32[MBOX_OFF_CORE1_DBG + 3];
+    uint32_t c1_status = m32[MBOX_OFF_CORE1_DBG + 4];
+    Console.printf("Core1 (probe): Exec@0x%08lX job_flag@0x%08lX job@0x%08lX result@0x%08lX status@0x%08lX\n",
+                   (unsigned long)c1_this, (unsigned long)c1_flag, (unsigned long)c1_job, (unsigned long)c1_result, (unsigned long)c1_status);
+    g_printedCore1Probe = true;
+  } else {
+    Console.println("Core1 (probe): not populated yet");
+    g_printedCore1Probe = false;  // we’ll print it later when it appears
+  }*/
+
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
-  Exec.core1Setup();
+  /*Exec.core1Setup();
+  // Do NOT print to Console/Serial from core1. Store a probe into the mailbox instead.
+  volatile uint32_t* m32 = (volatile uint32_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
+  m32[MBOX_OFF_CORE1_DBG + 0] = (uint32_t)Exec.dbg_addr_this();
+  m32[MBOX_OFF_CORE1_DBG + 1] = (uint32_t)Exec.dbg_addr_job_flag();
+  m32[MBOX_OFF_CORE1_DBG + 2] = (uint32_t)Exec.dbg_addr_job();
+  m32[MBOX_OFF_CORE1_DBG + 3] = (uint32_t)Exec.dbg_addr_result();
+  m32[MBOX_OFF_CORE1_DBG + 4] = (uint32_t)Exec.dbg_addr_status();*/
 }
 void loop1() {
-  Exec.core1Poll();
+  // Core1 job state LED:
+  // 0=idle: off
+  // 1=queued: fast blink
+  // 2=running: solid on
+  // 3=done (waiting for core0): slow blink
+  /*static uint32_t lastBlink = 0;
+  static bool ledState = false;
+
+  uint32_t flag = Exec.core1JobFlag();
+  uint32_t now = millis();
+
+  switch (flag) {
+    case 0u:  // idle
+      digitalWrite(LED_PIN, LOW);
+      break;
+    case 1u:                           // queued (fast blink)
+      if ((now - lastBlink) >= 100) {  // ~10 Hz
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastBlink = now;
+      }
+      break;
+    case 2u:  // running
+      digitalWrite(LED_PIN, HIGH);
+      break;
+    case 3u:                           // done (slow blink)
+      if ((now - lastBlink) >= 400) {  // ~1.25 Hz
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastBlink = now;
+      }
+      break;
+  }
+
+  Exec.core1Poll();*/
   tight_loop_contents();
 }
 void loop() {
-  Exec.pollBackground();  // handle any background job completions/timeouts
+  /*Exec.pollBackground();  // handle any background job completions/timeouts
+
+  // If we didn’t get the core1 probe at boot, try to print it once when it appears
+  if (!g_printedCore1Probe) {
+    volatile uint32_t* m32 = (volatile uint32_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
+    uint32_t c1_this = m32[MBOX_OFF_CORE1_DBG + 0];
+    if (c1_this != 0) {
+      uint32_t c1_flag = m32[MBOX_OFF_CORE1_DBG + 1];
+      uint32_t c1_job = m32[MBOX_OFF_CORE1_DBG + 2];
+      uint32_t c1_result = m32[MBOX_OFF_CORE1_DBG + 3];
+      uint32_t c1_status = m32[MBOX_OFF_CORE1_DBG + 4];
+      Console.printf("\nCore1 (probe late): Exec@0x%08lX job_flag@0x%08lX job@0x%08lX result@0x%08lX status@0x%08lX\n> ",
+                     (unsigned long)c1_this,
+                     (unsigned long)c1_flag,
+                     (unsigned long)c1_job,
+                     (unsigned long)c1_result,
+                     (unsigned long)c1_status);
+      g_printedCore1Probe = true;
+    }
+  }*/
+
   if (readLine()) {
     handleCommand(lineBuf);
+
+    // Breadcrumbs: Core1 phase (mailbox[1]), Core0 phase (mailbox[2]), flag mirror (mailbox[3])
+    /*Console.printf("DBG phases: c1=0x%02X c0=0x%02X fl=0x%02X\n",
+                   (unsigned)((volatile uint8_t*)BLOB_MAILBOX_ADDR)[1], (unsigned)((volatile uint8_t*)BLOB_MAILBOX_ADDR)[2], (unsigned)((volatile uint8_t*)BLOB_MAILBOX_ADDR)[3]);*/
     Console.print("> ");
   }
 }
