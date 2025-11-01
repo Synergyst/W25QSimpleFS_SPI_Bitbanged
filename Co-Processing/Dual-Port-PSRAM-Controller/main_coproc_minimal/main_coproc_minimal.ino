@@ -21,8 +21,6 @@
 #include "rp_selfupdate.h"
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
-#define COPROCLANG_MAX_LINES 512
-#define COPROCLANG_MAX_LABELS 128
 #include "CoProcLang.h"
 
 // ------- Debug toggle -------
@@ -44,6 +42,7 @@ static const uint8_t PIN_TX = 1;  // GP1  (co-processor TX)
 // ------- Software serial config -------
 #ifndef SOFT_BAUD
 #define SOFT_BAUD 230400
+//#define SOFT_BAUD 115200
 #endif
 static SoftwareSerial link(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
 

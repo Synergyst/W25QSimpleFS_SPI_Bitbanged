@@ -5,11 +5,10 @@
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
-#define COPROCLANG_MAX_LINES 512
-#define COPROCLANG_MAX_LABELS 128
 #include "CoProcLang.h"
 #ifndef COPROC_BAUD
 #define COPROC_BAUD 230400
+//#define COPROC_BAUD 115200
 #endif
 #ifndef PIN_COPROC_RX
 #define PIN_COPROC_RX 0  // GP0 (main RX)
@@ -44,6 +43,7 @@ static ConsolePrint Console;  // Console wrapper
 #include "scripts.h"
 #define FILE_BLINKSCRIPT "blinkscript"
 #define FILE_ONSCRIPT "onscript"
+#define FILE_SONG "song"
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
 // Pins you already have:
@@ -67,7 +67,7 @@ enum class StorageBackend {
   PSRAM_BACKEND,
   NAND,
 };
-static StorageBackend g_storage = StorageBackend::Flash;
+static StorageBackend g_storage = StorageBackend::PSRAM_BACKEND;
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  // Unified manager: one bus, many CS
 // SimpleFS facades
 W25QUnifiedSimpleFS fsFlash;
@@ -861,6 +861,7 @@ static const BlobReg g_blobs[] = {
   { FILE_RETMIN, blob_retmin, blob_retmin_len },
   { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
+  { FILE_SONG, blob_song, blob_song_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
 // ========== Return mailbox reservation (Scratch) ==========
@@ -880,7 +881,7 @@ static void updateExecFsTable() {
   t.writeFile = activeFs.writeFile;
   t.writeFileInPlace = activeFs.writeFileInPlace;
   t.getFileInfo = activeFs.getFileInfo;
-  t.deleteFile = activeFs.deleteFile;
+  //t.deleteFile = activeFs.deleteFile;
   Exec.attachFS(t);
 }
 // ================= Memory Diagnostics =================
@@ -1063,6 +1064,7 @@ static void autogenBlobWrites() {
   allOk &= ensureBlobIfMissing(FILE_RETMIN, blob_retmin, blob_retmin_len);
   allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
   allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
+  allOk &= ensureBlobIfMissing(FILE_SONG, blob_song, blob_song_len);
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
 }
@@ -2853,7 +2855,7 @@ void setup() {
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
   bindActiveFs(g_storage);
-  bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
+  bool mounted = activeFs.mount(g_storage == StorageBackend::PSRAM_BACKEND /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }

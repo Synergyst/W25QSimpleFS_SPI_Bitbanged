@@ -1,7 +1,6 @@
 /*
   CoProcExec.h
   Consolidated executor, script handling, and named function dispatch for RP2350/RP2040 co-processor.
-
   Notes:
   - This header assumes the following are provided by the including sketch:
       - #include "CoProcProto.h"
@@ -13,28 +12,23 @@
       - A definition of volatile uint8_t g_cancel_flag;
       - Optional DBG(...) macro for debug logging; if not defined, a no-op is used.
 */
-
 #pragma once
 #include <Arduino.h>
 #include <stdlib.h>
 #include <string.h>
 #include "CoProcProto.h"
 #include "CoProcLang.h"
-
 #ifndef DBG
 #define DBG(...) \
   do { \
   } while (0)
 #endif
-
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
-
 // These must be provided by the including sketch (definitions), we only declare them here.
 extern "C" uint8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX];
 extern volatile uint8_t g_cancel_flag;
-
 // Helper: call entry in "Thumb" mode with up to MAX_EXEC_ARGS int32 args.
 static inline int call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
@@ -53,11 +47,9 @@ static inline int call_with_args_thumb(void* entryThumb, uint32_t argc, const in
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
-
 class CoProcExec {
 public:
   using FuncN = int32_t (*)(const int32_t* argv, uint32_t argc);
-
   CoProcExec()
     : g_blob(nullptr), g_blob_len(0), g_blob_cap(0), g_blob_crc(0),
       g_script(nullptr), g_script_len(0), g_script_cap(0), g_script_crc(0),
@@ -65,14 +57,12 @@ public:
     memset(&g_job, 0, sizeof(g_job));
     clearFuncRegistry();
   }
-
   void begin() {
     memset(&g_job, 0, sizeof(g_job));
     memset(BLOB_MAILBOX, 0, BLOB_MAILBOX_MAX);
     g_cancel_flag = 0;
     g_exec_state = CoProc::EXEC_IDLE;
   }
-
   // To be called from core1 loop
   void workerPoll() {
     if (!g_job.active) {
@@ -92,7 +82,6 @@ public:
     g_job.active = 0;
     DBG("[COPROC] EXEC done status=%d result=%d\n", (int)status, (int)result);
   }
-
   // Command handlers (build payload into out resp buffer)
   int32_t cmdHELLO(bool ispActive, uint8_t* out, size_t cap, size_t& off) {
     int32_t status = CoProc::ST_OK;
@@ -109,7 +98,6 @@ public:
     CoProc::writePOD(out, cap, off, features);
     return status;
   }
-
   int32_t cmdINFO(bool ispActive, uint8_t* out, size_t cap, size_t& off) {
     CoProc::Info info{};
     info.impl_flags = 0;
@@ -126,7 +114,6 @@ public:
     CoProc::writePOD(out, cap, off, info);
     return status;
   }
-
   int32_t cmdLOAD_BEGIN(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t total = 0;
@@ -142,7 +129,6 @@ public:
     DBG("[DBG] LOAD_BEGIN total=%u\n", (unsigned)total);
     return writeStatus(out, cap, off, CoProc::ST_OK);
   }
-
   int32_t cmdLOAD_DATA(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_blob || g_blob_len >= g_blob_cap) return writeStatus(out, cap, off, CoProc::ST_STATE);
     uint32_t can = g_blob_cap - g_blob_len;
@@ -159,7 +145,6 @@ public:
         (unsigned)len, (unsigned)take, (unsigned)g_blob_len);
     return status;
   }
-
   int32_t cmdLOAD_END(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t expected = 0;
@@ -171,7 +156,6 @@ public:
         (unsigned)expected, (unsigned)g_blob_crc, (int)status);
     return status;
   }
-
   int32_t cmdEXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_blob || (g_blob_len & 1u)) return writeStatus2(out, cap, off, CoProc::ST_STATE, 0);
     if (g_job.active) return writeStatus2(out, cap, off, CoProc::ST_STATE, 0);
@@ -193,7 +177,6 @@ public:
     g_job.active = 1;
     g_exec_state = CoProc::EXEC_RUNNING;
     DBG("[DBG] EXEC start argc=%u timeout=%u\n", (unsigned)argc, (unsigned)timeout_ms);
-
     uint32_t t0 = millis();
     while (g_job.active) {
       if (timeout_ms && (millis() - t0) > timeout_ms) {
@@ -213,7 +196,6 @@ public:
     DBG("[DBG] EXEC reply status=%d result=%d\n", (int)g_job.status, (int)g_job.result);
     return g_job.status;
   }
-
   int32_t cmdSTATUS(uint8_t* out, size_t cap, size_t& off) {
     int32_t status = CoProc::ST_OK;
     uint32_t es = g_exec_state;
@@ -222,7 +204,6 @@ public:
     DBG("[DBG] STATUS es=%u\n", (unsigned)es);
     return status;
   }
-
   int32_t cmdMAILBOX_RD(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t maxb = 0;
@@ -237,7 +218,6 @@ public:
     DBG("[DBG] MAILBOX_RD n=%u\n", (unsigned)n);
     return CoProc::ST_OK;
   }
-
   int32_t cmdCANCEL(uint8_t* out, size_t cap, size_t& off) {
     mailboxSetCancel(1);
     int32_t st = CoProc::ST_OK;
@@ -245,7 +225,6 @@ public:
     DBG("[DBG] CANCEL set\n");
     return st;
   }
-
   // Script pipeline
   int32_t cmdSCRIPT_BEGIN(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
@@ -261,7 +240,6 @@ public:
     DBG("[DBG] SCRIPT_BEGIN total=%u\n", (unsigned)total);
     return writeStatus(out, cap, off, CoProc::ST_OK);
   }
-
   int32_t cmdSCRIPT_DATA(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_script || g_script_len >= g_script_cap) return writeStatus(out, cap, off, CoProc::ST_STATE);
     uint32_t can = g_script_cap - g_script_len;
@@ -278,23 +256,33 @@ public:
         (unsigned)len, (unsigned)take, (unsigned)g_script_len);
     return status;
   }
-
   int32_t cmdSCRIPT_END(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t expected = 0;
     if (!CoProc::readPOD(in, len, p, expected)) return writeStatus(out, cap, off, CoProc::ST_PARAM);
-    int32_t status = (expected == g_script_crc) ? CoProc::ST_OK : CoProc::ST_CRC;
+
+    // Null-terminate for interpreter; does not affect CRC input.
     if (g_script) {
       uint32_t nulpos = (g_script_len <= g_script_cap) ? g_script_len : g_script_cap;
       g_script[nulpos] = 0;
     }
+
+    // Canonical, one-shot CRC over the stored bytes.
+    const uint32_t have = (g_script && g_script_len)
+                            ? CoProc::crc32_ieee(g_script, g_script_len)
+                            : 0;
+
+    const int32_t status = (expected == have) ? CoProc::ST_OK : CoProc::ST_CRC;
+
+    // Respond with: status, length, and have-CRC (extra 4 bytes for robustness).
     CoProc::writePOD(out, cap, off, status);
     CoProc::writePOD(out, cap, off, g_script_len);
+    CoProc::writePOD(out, cap, off, have);
+
     DBG("[DBG] SCRIPT_END crc_exp=0x%08X crc_have=0x%08X st=%d\n",
-        (unsigned)expected, (unsigned)g_script_crc, (int)status);
+        (unsigned)expected, (unsigned)have, (int)status);
     return status;
   }
-
   int32_t cmdSCRIPT_EXEC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     if (!g_script || g_script_len == 0) return writeStatus2(out, cap, off, CoProc::ST_STATE, 0);
     size_t p = 0;
@@ -302,7 +290,6 @@ public:
     if (!CoProc::readPOD(in, len, p, argc)) return writeStatus2(out, cap, off, CoProc::ST_PARAM, 0);
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     int32_t argv[MAX_EXEC_ARGS] = { 0 };
-
     if (argc == 0) {
       if (!CoProc::readPOD(in, len, p, timeout_ms)) return writeStatus2(out, cap, off, CoProc::ST_PARAM, 0);
     } else {
@@ -340,7 +327,6 @@ public:
         return writeStatus2(out, cap, off, CoProc::ST_PARAM, 0);
       }
     }
-
     if (!s_vm) {
       s_vm = new CoProcLang::VM();
       if (!s_vm) return writeStatus2(out, cap, off, CoProc::ST_NOMEM, 0);
@@ -348,7 +334,6 @@ public:
     s_vm->env.mailbox = BLOB_MAILBOX;
     s_vm->env.mailbox_max = BLOB_MAILBOX_MAX;
     s_vm->env.cancel_flag = &g_cancel_flag;
-
     g_exec_state = CoProc::EXEC_RUNNING;
     int32_t retVal = 0;
     bool ok = s_vm->run(g_script, g_script_len, argv, argc, timeout_ms, retVal);
@@ -359,7 +344,6 @@ public:
     CoProc::writePOD(out, cap, off, (int32_t)retVal);
     return st;
   }
-
   // Named function registry and dispatcher (CMD_FUNC)
   // Register a function by name with fixed argc.
   // expected_argc: >=0 for exact match; -1 to allow any argc.
@@ -380,7 +364,6 @@ public:
     ++m_funcCount;
     return true;
   }
-
   int32_t cmdFUNC(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
     size_t p = 0;
     uint32_t nameLen = 0;
@@ -390,12 +373,10 @@ public:
     memcpy(nameBuf, in + p, nameLen);
     nameBuf[(nameLen < 128) ? nameLen : 128] = '\0';
     p += nameLen;
-
     uint32_t argc = 0;
     if (!CoProc::readPOD(in, len, p, argc)) return writeStatus2(out, cap, off, CoProc::ST_PARAM, 0);
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     int32_t argv[MAX_EXEC_ARGS] = { 0 };
-
     // Support classic int32 args or alternate ASCII-args mode with marker 0xFFFFFFFF
     if (argc == 0) {
       // nothing more
@@ -432,7 +413,6 @@ public:
         return writeStatus2(out, cap, off, CoProc::ST_PARAM, 0);
       }
     }
-
     const FuncEntry* fe = findFunc(nameBuf);
     if (!fe) {
       DBG("[DBG] FUNC '%s' not found\n", nameBuf);
@@ -442,13 +422,11 @@ public:
       DBG("[DBG] FUNC '%s' argc mismatch exp=%d got=%u\n", nameBuf, fe->expected_argc, (unsigned)argc);
       return writeStatus2(out, cap, off, CoProc::ST_PARAM, 0);
     }
-
     int32_t rv = fe->fn(argv, argc);
     CoProc::writePOD(out, cap, off, (int32_t)CoProc::ST_OK);
     CoProc::writePOD(out, cap, off, rv);
     return CoProc::ST_OK;
   }
-
   // Accessors (if needed by the sketch)
   uint32_t getExecState() const {
     return g_exec_state;
@@ -459,7 +437,6 @@ public:
   bool isJobActive() const {
     return g_job.active != 0;
   }
-
 private:
   struct ExecJob {
     uintptr_t code;
@@ -470,23 +447,17 @@ private:
     volatile int32_t result;
     volatile int32_t status;
   };
-
   ExecJob g_job;
-
   uint8_t* g_blob;
   uint32_t g_blob_len;
   uint32_t g_blob_cap;
   uint32_t g_blob_crc;
-
   uint8_t* g_script;
   uint32_t g_script_len;
   uint32_t g_script_cap;
   uint32_t g_script_crc;
-
   volatile uint32_t g_exec_state;
-
   inline static CoProcLang::VM* s_vm = nullptr;
-
   // Function registry
   struct FuncEntry {
     const char* name;
@@ -496,7 +467,6 @@ private:
   static constexpr uint32_t MAX_FUNCS = 32;
   FuncEntry m_funcs[MAX_FUNCS];
   uint32_t m_funcCount = 0;
-
   void clearFuncRegistry() {
     m_funcCount = 0;
     for (uint32_t i = 0; i < MAX_FUNCS; ++i) {
@@ -505,7 +475,6 @@ private:
       m_funcs[i].fn = nullptr;
     }
   }
-
   const FuncEntry* findFunc(const char* name) const {
     for (uint32_t i = 0; i < m_funcCount; ++i) {
       if (m_funcs[i].name && strcmp(m_funcs[i].name, name) == 0) {
@@ -514,11 +483,9 @@ private:
     }
     return nullptr;
   }
-
   static inline void mailboxSetCancel(uint8_t v) {
     g_cancel_flag = v;
   }
-
   static bool parseAsciiInt(const uint8_t* s, size_t n, int32_t& out) {
     if (!s || n == 0) return false;
     const char* p = (const char*)s;
@@ -564,7 +531,6 @@ private:
     out = neg ? -v : v;
     return true;
   }
-
   void freeBlob() {
     if (g_blob) free(g_blob);
     g_blob = nullptr;
@@ -574,7 +540,6 @@ private:
     g_exec_state = CoProc::EXEC_IDLE;
     DBG("[COPROC] blob freed\n");
   }
-
   void freeScript() {
     if (g_script) free(g_script);
     g_script = nullptr;
@@ -583,12 +548,10 @@ private:
     g_script_crc = 0;
     DBG("[COPROC] script freed\n");
   }
-
   static int32_t writeStatus(uint8_t* out, size_t cap, size_t& off, int32_t st) {
     CoProc::writePOD(out, cap, off, st);
     return st;
   }
-
   static int32_t writeStatus2(uint8_t* out, size_t cap, size_t& off, int32_t st, int32_t v) {
     CoProc::writePOD(out, cap, off, st);
     CoProc::writePOD(out, cap, off, v);

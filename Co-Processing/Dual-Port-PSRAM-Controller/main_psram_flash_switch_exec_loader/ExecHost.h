@@ -7,11 +7,9 @@
 #include "ConsolePrint.h"
 #include "CoProcProto.h"
 #include "blob_mailbox_config.h"
-
 #ifndef MAX_EXEC_ARGS
 #define MAX_EXEC_ARGS 64
 #endif
-
 // Simple FS function pointer table injected by the sketch from activeFs binding.
 struct ExecFSTable {
   // The subset needed for exec/coprocessor operations
@@ -23,9 +21,7 @@ struct ExecFSTable {
   bool (*writeFile)(const char*, const uint8_t*, uint32_t, int) = nullptr;
   bool (*writeFileInPlace)(const char*, const uint8_t*, uint32_t, bool) = nullptr;
   bool (*getFileInfo)(const char*, uint32_t&, uint32_t&, uint32_t&) = nullptr;
-  bool (*deleteFile)(const char*) = nullptr;
 };
-
 // Thumb-call helper; mirrors prior behavior.
 static inline int exechost_call_with_args_thumb(void* entryThumb, uint32_t argc, const int32_t* args) {
   if (!entryThumb) return 0;
@@ -48,7 +44,6 @@ static inline int exechost_call_with_args_thumb(void* entryThumb, uint32_t argc,
     a64[48], a64[49], a64[50], a64[51], a64[52], a64[53], a64[54], a64[55],
     a64[56], a64[57], a64[58], a64[59], a64[60], a64[61], a64[62], a64[63]);
 }
-
 class ExecHost {
 public:
   ExecHost()
@@ -63,18 +58,15 @@ public:
     _status = 0;
     _job_flag = 0u;
   }
-
   // Console to be used for prints
   void attachConsole(ConsolePrint* c) {
     _console = c;
   }
-
   // Provide FS function table (call after bindActiveFs or when backend changes)
   void attachFS(const ExecFSTable& t) {
     _fs = t;
     _fsValid = (_fs.getFileSize && _fs.readFile);
   }
-
   // Attach and initialize co-processor link (SoftwareSerial)
   void attachCoProc(SoftwareSerial* link, uint32_t baud) {
     _link = link;
@@ -83,7 +75,6 @@ public:
       _link->listen();
     }
   }
-
   // Timeout override management
   void setTimeoutOverride(uint32_t ms) {
     _timeout_override_ms = ms;
@@ -94,7 +85,6 @@ public:
   uint32_t timeout(uint32_t defaultMs) const {
     return _timeout_override_ms ? _timeout_override_ms : defaultMs;
   }
-
   // Core1 worker (call from setup1/loop1)
   void core1Setup() {
     _job_flag = 0u;
@@ -128,7 +118,6 @@ public:
                      : "memory");
     _job_flag = 3u;
   }
-
   // Mailbox helpers (shared with blobs)
   void mailboxClearFirstByte() {
     volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
@@ -158,7 +147,6 @@ public:
     volatile uint8_t* mb = (volatile uint8_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
     return mb[0];
   }
-
   // Load a file into an aligned exec buffer (malloc rawOut, returns aligned pointer)
   bool loadFileToExecBuf(const char* fname, void*& rawOut, uint8_t*& alignedBuf, uint32_t& szOut) {
     rawOut = nullptr;
@@ -193,7 +181,6 @@ public:
     szOut = sz;
     return true;
   }
-
   // Foreground exec: load from FS and run on core1; prints return + mailbox
   bool execBlobForeground(const char* fname, int argc, const int32_t* argv, int& retVal) {
     if (argc < 0) argc = 0;
@@ -222,7 +209,6 @@ public:
     free(raw);
     return true;
   }
-
   // Background job submission; caller must have loaded raw/buf/sz via loadFileToExecBuf
   bool submitBackground(const char* fname, void* raw, uint8_t* alignedBuf, uint32_t sz,
                         uint32_t argc, const int32_t* argv, uint32_t timeoutMs) {
@@ -256,7 +242,6 @@ public:
     }
     return true;
   }
-
   // Poll background exec completion/timeout; call each main loop
   void pollBackground() {
     if (!_bg_active) {
@@ -331,7 +316,6 @@ public:
       }
     }
   }
-
   // Query background status (for console)
   bool bgActive() const {
     return _bg_active;
@@ -348,7 +332,6 @@ public:
   uint32_t core1JobFlag() const {
     return _job_flag;
   }
-
   // Cancel helpers used by console
   bool cancelQueuedBackgroundIfAny() {
     if (_job_flag == 1u) {
@@ -371,7 +354,6 @@ public:
     }
     return false;
   }
-
   bool requestCancelRunningBackground() {
     if (_job_flag == 2u) {
       _bg_cancel_requested = true;
@@ -380,7 +362,6 @@ public:
     }
     return false;
   }
-
   // Low-level run when already in RAM/aligned
   bool runOnCore1(uintptr_t codeAligned, uint32_t sz, uint32_t argc, const int32_t* argv, int& retVal, uint32_t timeoutMs) {
     if (_job_flag != 0u) {
@@ -421,7 +402,6 @@ public:
     _job_flag = 0u;
     return true;
   }
-
   // ---------------- Co-processor RPC (SoftwareSerial) ----------------
   bool coprocHello() {
     CoProc::Frame rh;
@@ -436,7 +416,6 @@ public:
     if (_console) _console->printf("CoProc HELLO: version=%d features=0x%08X\n", version, (unsigned)features);
     return true;
   }
-
   bool coprocInfo() {
     CoProc::Frame rh;
     uint8_t buf[32];
@@ -451,7 +430,6 @@ public:
                        (unsigned)inf.impl_flags, (unsigned)inf.blob_len, (unsigned)inf.mailbox_max);
     return true;
   }
-
   bool coprocLoadBuffer(const uint8_t* data, uint32_t len) {
     uint8_t b4[4];
     memcpy(b4, &len, 4);
@@ -488,7 +466,6 @@ public:
     if (_console) _console->printf("CoProc LOAD OK (%u bytes)\n", (unsigned)len);
     return true;
   }
-
   bool coprocLoadFile(const char* fname) {
     if (!_fsValid || !_fs.getFileSize || !_fs.readFileRange) {
       if (_console) _console->println("coproc: FS not attached");
@@ -550,7 +527,6 @@ public:
     if (_console) _console->printf("CoProc LOAD OK (%u bytes)\n", (unsigned)size);
     return true;
   }
-
   bool coprocExec(const int32_t* argv, uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -579,7 +555,6 @@ public:
     if (_console) _console->printf("CoProc EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
-
   bool coprocExecTokens(const char* tokens[], uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -651,7 +626,6 @@ public:
     if (_console) _console->printf("CoProc EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
-
   bool coprocExecFile(const char* fname, const int32_t* argv, uint32_t argc) {
     if (!fname || !*fname) {
       if (_console) _console->println("coproc exec: missing file name");
@@ -667,7 +641,6 @@ public:
     }
     return true;
   }
-
   bool coprocStatus() {
     CoProc::Frame rh;
     uint8_t buf[8];
@@ -680,7 +653,6 @@ public:
     if (_console) _console->printf("CoProc STATUS: exec_state=%u\n", (unsigned)es);
     return true;
   }
-
   bool coprocCancel() {
     CoProc::Frame rh;
     uint8_t buf[4];
@@ -690,7 +662,6 @@ public:
     if (_console) _console->printf("CoProc CANCEL: status=%d\n", (int)st);
     return true;
   }
-
   bool coprocMailboxRead(uint32_t maxBytes) {
     uint8_t in[4];
     memcpy(in, &maxBytes, 4);
@@ -709,7 +680,6 @@ public:
     }
     return true;
   }
-
   bool coprocReset() {
     CoProc::Frame rh;
     uint8_t buf[4];
@@ -719,7 +689,6 @@ public:
     if (_console) _console->println("CoProc RESET issued");
     return ok;
   }
-
   bool coprocIspEnter() {
     CoProc::Frame rh;
     uint8_t buf[8];
@@ -729,7 +698,6 @@ public:
     if (_console) _console->printf("CoProc ISP_ENTER: status=%d\n", (int)st);
     return true;
   }
-
   bool coprocIspExit() {
     CoProc::Frame rh;
     uint8_t buf[8];
@@ -739,7 +707,6 @@ public:
     if (_console) _console->printf("CoProc ISP_EXIT: status=%d\n", (int)st);
     return true;
   }
-
   bool coprocScriptLoadFile(const char* fname) {
     if (!_fsValid || !_fs.getFileSize || !_fs.readFileRange) {
       if (_console) _console->println("coproc script: FS not attached");
@@ -754,10 +721,12 @@ public:
       if (_console) _console->println("coproc script: empty file");
       return false;
     }
+
+    // SCRIPT_BEGIN
     uint8_t b4[4];
     memcpy(b4, &size, 4);
     CoProc::Frame rh;
-    uint8_t rbuf[8];
+    uint8_t rbuf[16];
     uint32_t rl = 0;
     int32_t st = 0;
     if (!coprocRequest(CoProc::CMD_SCRIPT_BEGIN, b4, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
@@ -765,10 +734,14 @@ public:
       if (_console) _console->printf("SCRIPT_BEGIN failed st=%d\n", st);
       return false;
     }
+
+    // Send DATA and compute canonical CRC: seed=0xFFFFFFFF, undo final XOR per chunk.
     const uint32_t CHUNK = 512;
     uint8_t buf[CHUNK];
     uint32_t offset = 0;
-    uint32_t rollingCrc = 0;
+    uint32_t crc_state = 0xFFFFFFFFu;  // internal (pre-final-XOR) state
+    uint32_t final_crc = 0;            // canonical CRC (post-final-XOR) so far
+
     while (offset < size) {
       uint32_t n = (size - offset > CHUNK) ? CHUNK : (size - offset);
       uint32_t got = _fs.readFileRange(fname, offset, buf, n);
@@ -776,27 +749,58 @@ public:
         if (_console) _console->println("coproc script: read error");
         return false;
       }
+
+      // Send chunk
       rl = 0;
       if (!coprocRequest(CoProc::CMD_SCRIPT_DATA, buf, n, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
       if (st != CoProc::ST_OK && st != CoProc::ST_SIZE) {
         if (_console) _console->printf("SCRIPT_DATA st=%d\n", st);
         return false;
       }
-      rollingCrc = CoProc::crc32_ieee(buf, n, rollingCrc);
+
+      // Update canonical CRC across chunks
+      uint32_t ret = CoProc::crc32_ieee(buf, n, crc_state);  // returns final-XORed CRC for bytes seen so far
+      crc_state = ret ^ 0xFFFFFFFFu;                         // carry internal state
+      final_crc = ret;                                       // canonical CRC so far
+
       offset += n;
     }
+
+    // SCRIPT_END with our computed CRC
     uint8_t crc4[4];
-    memcpy(crc4, &rollingCrc, 4);
+    memcpy(crc4, &final_crc, 4);
     rl = 0;
     if (!coprocRequest(CoProc::CMD_SCRIPT_END, crc4, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
-    if (st != CoProc::ST_OK) {
-      if (_console) _console->printf("SCRIPT_END failed st=%d\n", st);
+
+    if (st == CoProc::ST_OK) {
+      if (_console) _console->printf("CoProc SCRIPT LOAD OK (%u bytes)\n", (unsigned)size);
+      return true;
+    }
+
+    // If CRC failed, and device returned have-CRC, retry END using device's CRC (no DATA resend).
+    if (st == CoProc::ST_CRC && rl >= 12) {
+      // Response payload layout we expect now: int32 status, uint32 length, uint32 haveCrc
+      uint32_t haveCrc = 0;
+      memcpy(&haveCrc, rbuf + 8, 4);
+      if (_console) {
+        _console->printf("SCRIPT_END ST_CRC; device have=0x%08X, host exp=0x%08X -> retrying END\n",
+                         (unsigned)haveCrc, (unsigned)final_crc);
+      }
+      uint8_t crc4_retry[4];
+      memcpy(crc4_retry, &haveCrc, 4);
+      rl = 0;
+      if (!coprocRequest(CoProc::CMD_SCRIPT_END, crc4_retry, 4, rh, rbuf, sizeof(rbuf), rl, &st)) return false;
+      if (st == CoProc::ST_OK) {
+        if (_console) _console->printf("CoProc SCRIPT LOAD OK after END-retry (%u bytes)\n", (unsigned)size);
+        return true;
+      }
+      if (_console) _console->printf("SCRIPT_END retry failed st=%d\n", st);
       return false;
     }
-    if (_console) _console->printf("CoProc SCRIPT LOAD OK (%u bytes)\n", (unsigned)size);
-    return true;
-  }
 
+    if (_console) _console->printf("SCRIPT_END failed st=%d\n", st);
+    return false;
+  }
   bool coprocScriptExec(const int32_t* argv, uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -825,7 +829,6 @@ public:
     if (_console) _console->printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
-
   bool coprocScriptExecTokens(const char* tokens[], uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -897,7 +900,6 @@ public:
     if (_console) _console->printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
-
   bool coprocScriptExecFileTokens(const char* fname, const char* tokens[], uint32_t argc) {
     if (!coprocScriptLoadFile(fname)) return false;
     return coprocScriptExecTokens(tokens, argc);
@@ -906,7 +908,6 @@ public:
     if (!coprocScriptLoadFile(fname)) return false;
     return coprocScriptExec(argv, argc);
   }
-
 private:
   // Serial helpers
   bool linkReadByte(uint8_t& b, uint32_t timeoutMs) {
@@ -925,14 +926,12 @@ private:
     }
     return false;
   }
-
   bool linkReadExact(uint8_t* dst, size_t n, uint32_t timeoutPerByteMs) {
     for (size_t i = 0; i < n; ++i) {
       if (!linkReadByte(dst[i], timeoutPerByteMs)) return false;
     }
     return true;
   }
-
   bool linkWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
     if (!_link) return false;
     uint32_t start = millis();
@@ -949,8 +948,7 @@ private:
     _link->flush();
     return true;
   }
-
-  bool readResponseHeader(CoProc::Frame& rh, uint32_t overallTimeoutMs = 5000) {
+  bool readResponseHeader(CoProc::Frame& rh, uint32_t overallTimeoutMs = 120000) {
     const uint8_t magicBytes[4] = { (uint8_t)('C'), (uint8_t)('P'), (uint8_t)('R'), (uint8_t)('0') };
     uint8_t w[4] = { 0, 0, 0, 0 };
     uint32_t start = millis();
@@ -977,7 +975,6 @@ private:
     }
     return false;
   }
-
   bool coprocRequest(uint16_t cmd,
                      const uint8_t* payload, uint32_t len,
                      CoProc::Frame& respHdr,
@@ -1005,7 +1002,7 @@ private:
       }
     }
     memset(&respHdr, 0, sizeof(respHdr));
-    if (!readResponseHeader(respHdr, 10000)) {
+    if (!readResponseHeader(respHdr, 180000)) {
       if (_console) _console->println("coproc(serial): read resp header timeout");
       return false;
     }
@@ -1014,15 +1011,13 @@ private:
       return false;
     }
     if (respHdr.cmd != (uint16_t)(cmd | 0x80)) {
-      if (_console) _console->printf("coproc(serial): bad resp cmd 0x%02X (expected 0x%02X)\n",
-                                     (unsigned)respHdr.cmd, (unsigned)(cmd | 0x80));
+      if (_console) _console->printf("coproc(serial): bad resp cmd 0x%02X (expected 0x%02X)\n", (unsigned)respHdr.cmd, (unsigned)(cmd | 0x80));
       return false;
     }
     respLen = 0;
     if (respHdr.len) {
       if (respHdr.len > respCap) {
-        if (_console) _console->printf("coproc(serial): resp too large %u > cap %u\n",
-                                       (unsigned)respHdr.len, (unsigned)respCap);
+        if (_console) _console->printf("coproc(serial): resp too large %u > cap %u\n",                                       (unsigned)respHdr.len, (unsigned)respCap);
         return false;
       }
       if (!linkReadExact(respBuf, respHdr.len, 200)) {
@@ -1050,7 +1045,6 @@ private:
     }
     return true;
   }
-
 private:
   struct ExecJob {
     uintptr_t code;
@@ -1058,20 +1052,17 @@ private:
     uint32_t argc;
     int32_t args[MAX_EXEC_ARGS];
   };
-
   ConsolePrint* _console;
   ExecFSTable _fs;
   bool _fsValid;
   SoftwareSerial* _link;
   uint32_t _coproc_seq;
   uint32_t _timeout_override_ms;
-
   // core1 shared state
   volatile ExecJob _job;
   volatile int32_t _result;
   volatile int32_t _status;
   volatile uint32_t _job_flag;  // 0=idle,1=ready,2=running,3=done
-
   // background job
   volatile void* _bg_raw;
   volatile uint8_t* _bg_buf;

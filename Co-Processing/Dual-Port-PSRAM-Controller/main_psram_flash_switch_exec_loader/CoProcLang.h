@@ -2,7 +2,6 @@
 /*
   CoProcLang.h (safe, no-heap, no-static-init, low-footprint)
   Minimal line-oriented scripting language interpreter for RP2040/RP2350 Arduino builds.
-
   Goals in this revision:
     - Zero global/static constructors. Header declares no globals and does not allocate at include-time.
     - No dynamic allocation during run() by default (operates in-place on a mutable script buffer).
@@ -10,7 +9,6 @@
     - Bounded RAM usage: internal tables are small and configurable at compile time.
     - Robust label handling (LABEL: at start of statement; code may follow ':' on same line).
     - Arduino-native I/O and delays; timeout + cancel-flag honored.
-
   Script features:
     - Registers: R0..R15 (int32). Args preload R0..R(N-1).
     - Labels: "NAME:" at statement start.
@@ -27,32 +25,26 @@
     - Return: RET <expr>
     - Comments: '#' or '//' to end of statement.
     - Statements separated by newline or ';'
-
   Notes:
     - Default parsing operates IN-PLACE: the interpreter writes '\0' to split statements and strip comments.
       Ensure the buffer passed to run() is writable (your pipeline already allocates g_script, so it's fine).
       If you need to keep the input immutable, define COPROCLANG_COPY_INPUT=1 before including this file.
-    - To minimize RAM, defaults use small tables; override before including if needed:
-        #define COPROCLANG_MAX_LINES  512
-        #define COPROCLANG_MAX_LABELS 128
-    - No STL or type_traits. Avoids large headers and static init costs.
+    - To minimize RAM while supporting larger scripts, defaults use increased but fixed tables; override before including if needed:
+        #define COPROCLANG_MAX_LINES  8192
+        #define COPROCLANG_MAX_LABELS 2048
 */
-
 #include <Arduino.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-
 // ---------- Configurable bounds ----------
 #ifndef COPROCLANG_MAX_LINES
-#define COPROCLANG_MAX_LINES 512
+#define COPROCLANG_MAX_LINES 8192
 #endif
 #ifndef COPROCLANG_MAX_LABELS
-#define COPROCLANG_MAX_LABELS 128
+#define COPROCLANG_MAX_LABELS 2048
 #endif
-
 namespace CoProcLang {
-
 // ---------- Small ASCII helpers (no <ctype.h>) ----------
 static inline bool is_ws(char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\n';
@@ -96,7 +88,6 @@ static inline bool strieq_full(const char* a, const char* b) {
   }
   return (*a == 0 && *b == 0);
 }
-
 // ---------- Execution env ----------
 struct Env {
   volatile uint8_t* mailbox;            // optional mailbox (null-terminated), may be nullptr
@@ -105,35 +96,28 @@ struct Env {
   Env()
     : mailbox(nullptr), mailbox_max(0), cancel_flag(nullptr) {}
 };
-
 // ---------- VM ----------
 struct VM {
   // Registers
   int32_t R[16];
-
   // In-place script storage view
   char* base;    // points to mutable script buffer (owned by caller)
   uint32_t len;  // bytes available in base
-
   // Tables (bounded, no heap)
   const char* lines[COPROCLANG_MAX_LINES];
   uint32_t line_count;
-
   struct Label {
     const char* name;  // pointer inside base (null-terminated)
     uint32_t idx;      // line index of first statement following the label
   };
   Label labels[COPROCLANG_MAX_LABELS];
   uint32_t label_count;
-
   // Mailbox and control
   Env env;
   uint32_t mb_w;
-
 #if COPROCLANG_MAX_LINES < 8 || COPROCLANG_MAX_LABELS < 8
 #error "COPROCLANG_MAX_* too small"
 #endif
-
   VM()
     : base(nullptr), len(0), line_count(0), label_count(0), mb_w(0) {
     for (int i = 0; i < 16; ++i) R[i] = 0;
@@ -143,7 +127,6 @@ struct VM {
       labels[i].idx = 0;
     }
   }
-
   // ----- Mailbox -----
   void mbClear() {
     if (!env.mailbox || env.mailbox_max == 0) return;
@@ -159,7 +142,6 @@ struct VM {
     }
     env.mailbox[mb_w] = 0;
   }
-
   // ----- Lex helpers -----
   static bool parseIdent(const char*& p, const char*& outStart, size_t& outLen) {
     skip_ws(p);
@@ -262,7 +244,6 @@ struct VM {
     p = save;
     return false;
   }
-
   enum CmpOp { OP_EQ,
                OP_NE,
                OP_LT,
@@ -309,7 +290,6 @@ struct VM {
       default: return false;
     }
   }
-
   static bool parsePinModeToken(const char*& p, int& modeOut) {
     const char* id;
     size_t n;
@@ -346,7 +326,6 @@ struct VM {
     }
     return false;
   }
-
   // ----- Preprocess: split into statements and collect labels (IN-PLACE) -----
   void stripCommentInPlace(char* s) {
     if (!s) return;
@@ -361,20 +340,16 @@ struct VM {
       }
     }
   }
-
   bool buildTablesInPlace() {
     line_count = 0;
     label_count = 0;
     if (!base || len == 0) return false;
-
     char* cur = base;
     char* end = base + len;
-
     auto trim = [](char*& a) {
       while (*a && is_ws(*a)) ++a;
       // trailing trim after we know endpoint; we will set '\0' already
     };
-
     while (cur < end) {
       // Get one physical line up to '\n' or end
       char* line = cur;
@@ -384,13 +359,11 @@ struct VM {
         *cur = 0;
         ++cur;
       }
-
       // Now split by ';' into statements
       char* stmt = line;
       while (stmt && *stmt) {
         char* semi = strchr(stmt, ';');
         if (semi) *semi = 0;
-
         // Strip comments and trim spaces
         stripCommentInPlace(stmt);
         // trim leading
@@ -400,7 +373,6 @@ struct VM {
         char* t = s + strlen(s);
         while (t > s && is_ws(t[-1])) --t;
         *t = 0;
-
         if (*s) {
           // Label detection: IDENT: at start
           const char* p = s;
@@ -418,7 +390,6 @@ struct VM {
               labels[label_count].name = nameStart;
               labels[label_count].idx = line_count;
               ++label_count;
-
               // any code after ':' becomes a statement
               ++p;  // move past '\0' we just wrote, now points to char after colon in original text
               while (*p && is_ws(*p)) ++p;
@@ -437,16 +408,13 @@ struct VM {
             lines[line_count++] = s;
           }
         }
-
         if (!semi) break;
         stmt = semi + 1;
       }
-
       (void)after;
     }
     return true;
   }
-
   int findLabel(const char* name) const {
     if (!name || !*name) return -1;
     for (uint32_t i = 0; i < label_count; ++i) {
@@ -454,25 +422,21 @@ struct VM {
     }
     return -1;
   }
-
   // ----- Execute one statement -----
   bool execLine(uint32_t idx, int32_t& retVal, bool& didReturn, int& outJumpIdx) {
     outJumpIdx = -1;
     const char* s = lines[idx];
     if (!s || !*s) return true;
     const char* p = s;
-
     // command
     const char* cmd;
     size_t cmdn;
     if (!parseIdent(p, cmd, cmdn)) return true;
-
     // Normalize a short token for branching
     char tok[24];
     size_t L = (cmdn < sizeof(tok) - 1) ? cmdn : (sizeof(tok) - 1);
     for (size_t i = 0; i < L; ++i) tok[i] = to_upper(cmd[i]);
     tok[L] = 0;
-
     // Math/move
     if (!strcmp(tok, "LET")) {
       int r;
@@ -506,7 +470,6 @@ struct VM {
       R[rd] = R[rs];
       return true;
     }
-
     // I/O
     if (!strcmp(tok, "PINMODE")) {
       int32_t pin;
@@ -554,10 +517,8 @@ struct VM {
       if (!parseNumber(p, dataPin)) return true;
       if (!parseNumber(p, clockPin)) return true;
       if (!parseNumber(p, latchPin)) return true;
-
       int32_t val;
       if (!parseExpr(p, val)) return true;
-
       // optional bit count
       const char* save_p = p;
       int bitCount = 8;
@@ -568,7 +529,6 @@ struct VM {
       } else {
         p = save_p;
       }
-
       // Optional bit order token
       const char* id;
       size_t idn;
@@ -579,33 +539,27 @@ struct VM {
         else if (idn == 8 && stricmp_l(id, "MSBFIRST", 8) == 0) msbFirst = true;
         else p = save2;  // unrecognized token; rewind
       }
-
       // Ensure pins are outputs (safe)
       pinMode((uint8_t)dataPin, OUTPUT);
       pinMode((uint8_t)clockPin, OUTPUT);
       pinMode((uint8_t)latchPin, OUTPUT);
-
       // Latch low, shift bits, latch high
       digitalWrite((uint8_t)latchPin, LOW);
-
       // Shift bitCount bits (cap to 32)
       int bits = (bitCount > 32) ? 32 : bitCount;
       for (int i = 0; i < bits; ++i) {
         int bitIndex = msbFirst ? (bits - 1 - i) : i;
         int b = (((uint32_t)val >> bitIndex) & 1) ? HIGH : LOW;
         digitalWrite((uint8_t)dataPin, b);
-
         // Clock pulse
         digitalWrite((uint8_t)clockPin, HIGH);
         delayMicroseconds(1);  // tweak if you need slower/faster
         digitalWrite((uint8_t)clockPin, LOW);
         delayMicroseconds(1);
       }
-
       digitalWrite((uint8_t)latchPin, HIGH);
       return true;
     }
-
     // Timing
     if (!strcmp(tok, "DELAY")) {
       int32_t ms;
@@ -621,7 +575,6 @@ struct VM {
       delayMicroseconds((uint32_t)us);
       return true;
     }
-
     // Mailbox
     if (!strcmp(tok, "MBCLR")) {
       mbClear();
@@ -634,7 +587,6 @@ struct VM {
       mbAppend(t, tn);
       return true;
     }
-
     // Flow
     if (!strcmp(tok, "RET")) {
       int32_t v = 0;
@@ -681,11 +633,9 @@ struct VM {
       }
       return true;
     }
-
     // Unknown token: ignore
     return true;
   }
-
   // ----- Public run API -----
   // By default, operates IN-PLACE: modifies 'buf' by inserting '\0' terminators.
   // Ensure 'buf' is writable. Your transport allocates a script buffer, so this matches well.
@@ -704,7 +654,6 @@ struct VM {
     return runInPlaceInternal((char*)buf, buflen, args, argc, timeout_ms, retVal);
 #endif
   }
-
 private:
   bool runInPlaceInternal(char* buf, uint32_t buflen, const int32_t* args, uint32_t argc, uint32_t timeout_ms, int32_t& retVal) {
     // init
@@ -721,33 +670,25 @@ private:
     mb_w = 0;
     for (uint32_t i = 0; i < argc && i < 16; ++i) R[i] = args[i];
     if (env.mailbox && env.mailbox_max) env.mailbox[0] = 0;
-
     // Build tables
     if (!buildTablesInPlace()) return false;
-
     // Execute
     retVal = 0;
     uint32_t t0 = millis();
     bool didReturn = false;
-
     for (uint32_t pc = 0; pc < line_count;) {
       if (timeout_ms && (millis() - t0) > timeout_ms) return false;
       if (env.cancel_flag && *env.cancel_flag) return false;
-
       int jump = -1;
       if (!execLine(pc, retVal, didReturn, jump)) break;
       if (didReturn) break;
-
       if (jump >= 0 && (uint32_t)jump < line_count) pc = (uint32_t)jump;
       else ++pc;
-
       // lightweight yield
       tight_loop_contents();
       yield();
     }
-
     return true;
   }
 };
-
 }  // namespace CoProcLang
