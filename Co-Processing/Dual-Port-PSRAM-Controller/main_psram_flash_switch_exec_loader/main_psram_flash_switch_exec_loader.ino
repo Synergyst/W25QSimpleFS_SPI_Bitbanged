@@ -1,5 +1,4 @@
 // main_psram_flash_switch_exec_loader.ino
-#define EXECHOST_TRACE 1
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 #include "UnifiedSPIMemSimpleFS.h"
@@ -749,7 +748,7 @@ static const BlobReg g_blobs[] = {
   { FILE_RET42, blob_ret42, blob_ret42_len },
   { FILE_ADD2, blob_add2, blob_add2_len },
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
-  { FILE_PWMC2350, blob_pwmc, blob_pwmc2350_len },
+  { FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len },
   { FILE_RETMIN, blob_retmin, blob_retmin_len },
   { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
@@ -1724,107 +1723,7 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
-    /*} else if (!strcmp(t0, "exec")) {
-    char* fn;
-    if (!nextToken(p, fn)) {
-      Console.println("usage: exec <file> [a0 ... aN] [&]");
-      return;
-    }
-    auto strip_trailing_amp = [](char* s) -> bool {
-      if (!s) return false;
-      size_t L = strlen(s);
-      if (L == 0) return false;
-      if (s[L - 1] == '&') {
-        s[L - 1] = '\0';
-        return true;
-      }
-      return false;
-    };
-    char* toks[MAX_EXEC_ARGS + 2];
-    int tcount = 0;
-    char* tok = nullptr;
-    while (tcount < (int)MAX_EXEC_ARGS + 1 && nextToken(p, tok)) toks[tcount++] = tok;
-    bool background = false;
-    if (tcount > 0 && strcmp(toks[tcount - 1], "&") == 0) {
-      background = true;
-      --tcount;
-    } else if (tcount == 0) {
-      if (strip_trailing_amp(fn)) background = true;
-    } else {
-      if (strip_trailing_amp(toks[tcount - 1])) {
-        background = true;
-        if (toks[tcount - 1][0] == '\0') --tcount;
-      }
-    }
-    static int32_t argvN[MAX_EXEC_ARGS];
-    int argc = 0;
-    for (int i = 0; i < tcount && argc < (int)MAX_EXEC_ARGS; ++i) argvN[argc++] = (int32_t)strtol(toks[i], nullptr, 0);
-    if (!background) {
-      int rv = 0;
-      if (!Exec.execBlobForeground(fn, argc, argvN, rv)) { Console.println("exec failed"); }
-    } else {
-      void* raw = nullptr;
-      uint8_t* buf = nullptr;
-      uint32_t sz = 0;
-      if (!Exec.loadFileToExecBuf(fn, raw, buf, sz)) {
-        Console.println("exec: load failed");
-        return;
-      }
-      uint32_t timeout = Exec.timeout(100000);
-      if (!Exec.submitBackground(fn, raw, buf, sz, (uint32_t)argc, (const int32_t*)argvN, timeout)) {
-        free(raw);
-      }
-    }
-  } else if (!strcmp(t0, "bg")) {
-    char* tok;
-    if (!nextToken(p, tok)) {
-      if (!Exec.bgActive()) Console.println("No active background job");
-      else {
-        uint32_t elapsed = Exec.bgElapsedMs();
-        Console.printf("BG job: '%s'\n", Exec.bgName());
-        Console.printf("  elapsed=%u ms  timeout=%u ms  job_flag=%u\n", (unsigned)elapsed, (unsigned)Exec.bgTimeoutMs(), (unsigned)Exec.core1JobFlag());
-      }
-      return;
-    }
-    if (!strcmp(tok, "status") || !strcmp(tok, "query")) {
-      if (!Exec.bgActive()) Console.println("No active background job");
-      else {
-        uint32_t elapsed = Exec.bgElapsedMs();
-        Console.printf("BG job: '%s'  elapsed=%u ms  timeout=%u ms  job_flag=%u\n",
-                       Exec.bgName(), (unsigned)elapsed, (unsigned)Exec.bgTimeoutMs(), (unsigned)Exec.core1JobFlag());
-      }
-    } else if (!strcmp(tok, "kill") || !strcmp(tok, "cancel")) {
-      char* sub = nullptr;
-      nextToken(p, sub);
-      if (!Exec.bgActive()) {
-        if (Exec.core1JobFlag() == 1u) {
-          if (Exec.cancelQueuedBackgroundIfAny()) {
-            Console.println("Cleared queued core1 job");
-          } else {
-            Console.println("No active background job to cancel");
-          }
-        } else {
-          Console.println("No active background job to cancel");
-        }
-        return;
-      }
-      if (Exec.core1JobFlag() == 1u) {
-        if (Exec.cancelQueuedBackgroundIfAny()) Console.println("Background job canceled (was queued)");
-        else Console.println("No queued job to cancel");
-        return;
-      }
-      if (Exec.core1JobFlag() == 2u) {
-        if (Exec.requestCancelRunningBackground()) {
-          Console.println("Cancellation requested (mailbox flag set). If blob cooperates, it will stop shortly.");
-        } else {
-          Console.println("No running BG job to cancel");
-        }
-        return;
-      }
-      Console.println("Cancellation requested (best-effort).");
-    } else {
-      Console.println("bg: usage: bg [status|query] | bg kill|cancel [force]");
-    }*/
+
   } else if (!strcmp(t0, "coproc")) {
     char* sub;
     if (!nextToken(p, sub)) {
@@ -2345,14 +2244,7 @@ static void handleCommand(char* line) {
   }
 }
 // ========== Setup and main loops ==========
-const uint8_t LED_PIN = 2;  // LED on GP2
-// Reserve a small area in the mailbox to dump core1 Exec addresses (5 x uint32_t)
-//static constexpr uint32_t MBOX_OFF_CORE1_DBG = 16;  // word index (uint32_t) inside mailbox
-//static bool g_printedCore1Probe = false;
 void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
@@ -2372,18 +2264,17 @@ void setup() {
     Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
 
-  // Open both handles (reservations handled internally)
-  bool flashOk = fsFlash.begin(uniMem);  // or MX35UnifiedSimpleFS if using SPI-NAND
+  // Open FS handles (reservations handled internally)
+  bool nandOk = fsNAND.begin(uniMem);
+  bool flashOk = fsFlash.begin(uniMem);
   bool psramOk = fsPSRAM.begin(uniMem);
+  if (!nandOk) Console.println("NAND FS: no suitable device found or open failed");
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
 
-  // IMPORTANT: Bind activeFs before using it anywhere
-  bindActiveFs(g_storage);
-  updateExecFsTable();
+  bindActiveFs(g_storage);  // IMPORTANT: Bind activeFs before using it anywhere
 
-  // Mount through activeFs (keeps table + handle consistent)
-  bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
+  bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);  // Mount through activeFs (keeps table + handle consistent)
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
@@ -2391,116 +2282,25 @@ void setup() {
   // Clear mailbox (also clears any stale core1 probe)
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
 
-  //Exec.attachConsole(&Console);
+  Exec.attachConsole(&Console);
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
+  updateExecFsTable();
 
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
-
-  // Core0: print Exec addresses (as seen on core0)
-  /*Console.printf("Core0: Exec@0x%08lX job_flag@0x%08lX job@0x%08lX result@0x%08lX status@0x%08lX\n",
-                 (unsigned long)Exec.dbg_addr_this(), (unsigned long)Exec.dbg_addr_job_flag(), (unsigned long)Exec.dbg_addr_job(), (unsigned long)Exec.dbg_addr_result(), (unsigned long)Exec.dbg_addr_status());
-
-  // Give core1 longer to run setup1 and write its probe; then we’ll also re-check later
-  volatile uint32_t* m32 = (volatile uint32_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
-  uint32_t c1_this = 0;
-  uint32_t waitMs = 0;
-  while (waitMs < 10000) {  // wait up to 1 s
-    c1_this = m32[MBOX_OFF_CORE1_DBG + 0];
-    if (c1_this != 0) break;
-    delay(10);
-    waitMs += 10;
-  }
-  if (c1_this != 0) {
-    uint32_t c1_flag = m32[MBOX_OFF_CORE1_DBG + 1];
-    uint32_t c1_job = m32[MBOX_OFF_CORE1_DBG + 2];
-    uint32_t c1_result = m32[MBOX_OFF_CORE1_DBG + 3];
-    uint32_t c1_status = m32[MBOX_OFF_CORE1_DBG + 4];
-    Console.printf("Core1 (probe): Exec@0x%08lX job_flag@0x%08lX job@0x%08lX result@0x%08lX status@0x%08lX\n",
-                   (unsigned long)c1_this, (unsigned long)c1_flag, (unsigned long)c1_job, (unsigned long)c1_result, (unsigned long)c1_status);
-    g_printedCore1Probe = true;
-  } else {
-    Console.println("Core1 (probe): not populated yet");
-    g_printedCore1Probe = false;  // we’ll print it later when it appears
-  }*/
 
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
-  /*Exec.core1Setup();
-  // Do NOT print to Console/Serial from core1. Store a probe into the mailbox instead.
-  volatile uint32_t* m32 = (volatile uint32_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
-  m32[MBOX_OFF_CORE1_DBG + 0] = (uint32_t)Exec.dbg_addr_this();
-  m32[MBOX_OFF_CORE1_DBG + 1] = (uint32_t)Exec.dbg_addr_job_flag();
-  m32[MBOX_OFF_CORE1_DBG + 2] = (uint32_t)Exec.dbg_addr_job();
-  m32[MBOX_OFF_CORE1_DBG + 3] = (uint32_t)Exec.dbg_addr_result();
-  m32[MBOX_OFF_CORE1_DBG + 4] = (uint32_t)Exec.dbg_addr_status();*/
+  Exec.core1Setup();
 }
 void loop1() {
-  // Core1 job state LED:
-  // 0=idle: off
-  // 1=queued: fast blink
-  // 2=running: solid on
-  // 3=done (waiting for core0): slow blink
-  /*static uint32_t lastBlink = 0;
-  static bool ledState = false;
-
-  uint32_t flag = Exec.core1JobFlag();
-  uint32_t now = millis();
-
-  switch (flag) {
-    case 0u:  // idle
-      digitalWrite(LED_PIN, LOW);
-      break;
-    case 1u:                           // queued (fast blink)
-      if ((now - lastBlink) >= 100) {  // ~10 Hz
-        ledState = !ledState;
-        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-        lastBlink = now;
-      }
-      break;
-    case 2u:  // running
-      digitalWrite(LED_PIN, HIGH);
-      break;
-    case 3u:                           // done (slow blink)
-      if ((now - lastBlink) >= 400) {  // ~1.25 Hz
-        ledState = !ledState;
-        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-        lastBlink = now;
-      }
-      break;
-  }
-
-  Exec.core1Poll();*/
+  Exec.core1Poll();
   tight_loop_contents();
 }
 void loop() {
-  /*Exec.pollBackground();  // handle any background job completions/timeouts
-
-  // If we didn’t get the core1 probe at boot, try to print it once when it appears
-  if (!g_printedCore1Probe) {
-    volatile uint32_t* m32 = (volatile uint32_t*)(uintptr_t)BLOB_MAILBOX_ADDR;
-    uint32_t c1_this = m32[MBOX_OFF_CORE1_DBG + 0];
-    if (c1_this != 0) {
-      uint32_t c1_flag = m32[MBOX_OFF_CORE1_DBG + 1];
-      uint32_t c1_job = m32[MBOX_OFF_CORE1_DBG + 2];
-      uint32_t c1_result = m32[MBOX_OFF_CORE1_DBG + 3];
-      uint32_t c1_status = m32[MBOX_OFF_CORE1_DBG + 4];
-      Console.printf("\nCore1 (probe late): Exec@0x%08lX job_flag@0x%08lX job@0x%08lX result@0x%08lX status@0x%08lX\n> ",
-                     (unsigned long)c1_this,
-                     (unsigned long)c1_flag,
-                     (unsigned long)c1_job,
-                     (unsigned long)c1_result,
-                     (unsigned long)c1_status);
-      g_printedCore1Probe = true;
-    }
-  }*/
-
+  Exec.pollBackground();  // handle any background job completions/timeouts
   if (readLine()) {
     handleCommand(lineBuf);
-
-    // Breadcrumbs: Core1 phase (mailbox[1]), Core0 phase (mailbox[2]), flag mirror (mailbox[3])
-    /*Console.printf("DBG phases: c1=0x%02X c0=0x%02X fl=0x%02X\n",
-                   (unsigned)((volatile uint8_t*)BLOB_MAILBOX_ADDR)[1], (unsigned)((volatile uint8_t*)BLOB_MAILBOX_ADDR)[2], (unsigned)((volatile uint8_t*)BLOB_MAILBOX_ADDR)[3]);*/
     Console.print("> ");
   }
 }

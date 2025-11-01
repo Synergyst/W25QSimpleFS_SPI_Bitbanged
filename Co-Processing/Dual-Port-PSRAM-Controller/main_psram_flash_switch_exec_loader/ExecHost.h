@@ -12,43 +12,9 @@
 #define MAX_EXEC_ARGS 64
 #endif
 
-// Toggle trace breadcrumbs into BLOB_MAILBOX[1..3] (cheap, safe)
-#ifndef EXECHOST_TRACE
-#define EXECHOST_TRACE 1
-#endif
-
-// Memory barrier + event helpers (we do not rely on WFE for waits)
-static inline void exechost_dmb() {
-  __asm volatile("dmb" ::
-                   : "memory");
-}
-#ifdef ARDUINO_ARCH_RP2040
-static inline void exechost_sev() {
-  __asm volatile("sev");
-}
-#else
-static inline void exechost_sev() {}
-#endif
-
-// Helpers to write small breadcrumbs into the mailbox (master side)
-#if EXECHOST_TRACE
-static inline void exechost_trace_set_c1(uint8_t v) {
-  ((volatile uint8_t*)BLOB_MAILBOX_ADDR)[1] = v;
-}
-static inline void exechost_trace_set_c0(uint8_t v) {
-  ((volatile uint8_t*)BLOB_MAILBOX_ADDR)[2] = v;
-}
-static inline void exechost_trace_mirror_flag(uint8_t v) {
-  ((volatile uint8_t*)BLOB_MAILBOX_ADDR)[3] = v;
-}
-#else
-static inline void exechost_trace_set_c1(uint8_t) {}
-static inline void exechost_trace_set_c0(uint8_t) {}
-static inline void exechost_trace_mirror_flag(uint8_t) {}
-#endif
-
 // Simple FS function pointer table injected by the sketch from activeFs binding.
 struct ExecFSTable {
+  // The subset needed for exec/coprocessor operations
   bool (*exists)(const char*) = nullptr;
   bool (*getFileSize)(const char*, uint32_t&) = nullptr;
   uint32_t (*readFile)(const char*, uint8_t*, uint32_t) = nullptr;
@@ -98,42 +64,17 @@ public:
     _job_flag = 0u;
   }
 
-  // Debug helpers (print addresses from setup/setup1 to confirm both cores share the same instance)
-  uintptr_t dbg_addr_this() const {
-    return (uintptr_t)this;
-  }
-  uintptr_t dbg_addr_job_flag() const {
-    return (uintptr_t)&_job_flag;
-  }
-  uintptr_t dbg_addr_job() const {
-    return (uintptr_t)&_job;
-  }
-  uintptr_t dbg_addr_result() const {
-    return (uintptr_t)&_result;
-  }
-  uintptr_t dbg_addr_status() const {
-    return (uintptr_t)&_status;
-  }
-  // Read current trace breadcrumbs (optional)
-  uint8_t dbg_phase_core1() const {
-    return ((volatile uint8_t*)BLOB_MAILBOX_ADDR)[1];
-  }
-  uint8_t dbg_phase_core0() const {
-    return ((volatile uint8_t*)BLOB_MAILBOX_ADDR)[2];
-  }
-  uint8_t dbg_flag_mirror() const {
-    return ((volatile uint8_t*)BLOB_MAILBOX_ADDR)[3];
-  }
-
   // Console to be used for prints
   void attachConsole(ConsolePrint* c) {
     _console = c;
   }
+
   // Provide FS function table (call after bindActiveFs or when backend changes)
   void attachFS(const ExecFSTable& t) {
     _fs = t;
     _fsValid = (_fs.getFileSize && _fs.readFile);
   }
+
   // Attach and initialize co-processor link (SoftwareSerial)
   void attachCoProc(SoftwareSerial* link, uint32_t baud) {
     _link = link;
@@ -142,6 +83,7 @@ public:
       _link->listen();
     }
   }
+
   // Timeout override management
   void setTimeoutOverride(uint32_t ms) {
     _timeout_override_ms = ms;
@@ -156,63 +98,35 @@ public:
   // Core1 worker (call from setup1/loop1)
   void core1Setup() {
     _job_flag = 0u;
-    exechost_trace_mirror_flag((uint8_t)_job_flag);
   }
-
   void core1Poll() {
     if (_job_flag != 1u) return;
-
-    // Ensure we see producer's job fields before running
-    exechost_dmb();
     __asm volatile("dsb" ::
                      : "memory");
     __asm volatile("isb" ::
                      : "memory");
-
-    // Core1 saw ready
-    exechost_trace_set_c1(0x11);
-
-    _job_flag = 2u;  // running
-    exechost_trace_mirror_flag(2);
-    exechost_sev();  // wake any waiter (harmless)
-    exechost_trace_set_c1(0x12);
-
+    _job_flag = 2u;
     ExecJob local{};
     local.code = _job.code;
     local.size = _job.size;
     local.argc = _job.argc;
     if (local.argc > MAX_EXEC_ARGS) local.argc = MAX_EXEC_ARGS;
     for (uint32_t i = 0; i < local.argc; ++i) local.args[i] = _job.args[i];
-
     int32_t rv = 0;
     int32_t st = 0;
-
-    // About to call blob
-    exechost_trace_set_c1(0x13);
-
     if (local.code == 0 || (local.size & 1u)) {
       st = -1;
     } else {
       void* entryThumb = (void*)(local.code | 1u);  // set Thumb bit
       rv = exechost_call_with_args_thumb(entryThumb, local.argc, local.args);
     }
-
-    // Returned from blob call
-    exechost_trace_set_c1(0x14);
-
     _result = rv;
     _status = st;
-
-    // Publish results before signaling done
-    exechost_dmb();
     __asm volatile("dsb" ::
                      : "memory");
     __asm volatile("isb" ::
                      : "memory");
-    _job_flag = 3u;  // done
-    exechost_trace_mirror_flag(3);
-    exechost_sev();  // poke core0
-    exechost_trace_set_c1(0x15);
+    _job_flag = 3u;
   }
 
   // Mailbox helpers (shared with blobs)
@@ -289,11 +203,12 @@ public:
     uint32_t sz = 0;
     if (!loadFileToExecBuf(fname, raw, buf, sz)) return false;
     mailboxClearFirstByte();
+    uintptr_t code = (uintptr_t)buf;
     if (_console) {
       _console->print("Calling entry on core1 at 0x");
       _console->println((uintptr_t)buf, HEX);
     }
-    bool ok = runOnCore1((uintptr_t)buf, sz, (uint32_t)argc, argv, retVal, timeout(100000));
+    bool ok = runOnCore1(code, sz, (uint32_t)argc, argv, retVal, timeout(100000));
     if (!ok) {
       if (_console) _console->println("exec: core1 run failed");
       free(raw);
@@ -325,24 +240,16 @@ public:
     _bg_timeout_ms = timeoutMs;
     strncpy(_bg_fname, fname, sizeof(_bg_fname) - 1);
     _bg_fname[sizeof(_bg_fname) - 1] = '\0';
-
     _job.code = (uintptr_t)alignedBuf;
     _job.size = sz;
     _job.argc = (argc > MAX_EXEC_ARGS) ? MAX_EXEC_ARGS : argc;
     for (uint32_t i = 0; i < (uint32_t)_job.argc; ++i) _job.args[i] = (int32_t)argv[i];
-
     mailboxClearCancelFlag();
-
-    // Publish job fields before signaling ready
-    exechost_dmb();
     __asm volatile("dsb" ::
                      : "memory");
     __asm volatile("isb" ::
                      : "memory");
     _job_flag = 1u;
-    exechost_trace_mirror_flag(1);
-    exechost_sev();  // wake core1
-
     if (_console) {
       _console->printf("Background job '%s' started on core1 at 0x%08X (sz=%u)\n",
                        _bg_fname, (unsigned)_job.code, (unsigned)_job.size);
@@ -354,19 +261,15 @@ public:
   void pollBackground() {
     if (!_bg_active) {
       if (_job_flag == 3u) {
-        exechost_dmb();
         __asm volatile("dsb" ::
                          : "memory");
         __asm volatile("isb" ::
                          : "memory");
         _job_flag = 0u;
-        exechost_trace_mirror_flag(0);
-        exechost_sev();
       }
       return;
     }
     if (_job_flag == 3u) {
-      exechost_dmb();
       int32_t result = (int32_t)_result;
       int32_t status = (int32_t)_status;
       if (_bg_cancel_requested) {
@@ -388,14 +291,11 @@ public:
       _bg_timeout_ms = 0;
       _bg_fname[0] = '\0';
       _bg_cancel_requested = false;
-
       __asm volatile("dsb" ::
                        : "memory");
       __asm volatile("isb" ::
                        : "memory");
       _job_flag = 0u;
-      exechost_trace_mirror_flag(0);
-      exechost_sev();
       return;
     }
     uint32_t timeoutMs = _bg_timeout_ms ? _bg_timeout_ms : 0;
@@ -427,8 +327,6 @@ public:
         __asm volatile("isb" ::
                          : "memory");
         _job_flag = 0u;
-        exechost_trace_mirror_flag(0);
-        exechost_sev();
         return;
       }
     }
@@ -459,8 +357,6 @@ public:
       __asm volatile("isb" ::
                        : "memory");
       _job_flag = 0u;
-      exechost_trace_mirror_flag(0);
-      exechost_sev();
       void* raw = (void*)_bg_raw;
       if (raw) free(raw);
       _bg_raw = nullptr;
@@ -492,62 +388,37 @@ public:
       return false;
     }
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
-
     _job.code = codeAligned;
     _job.size = sz;
     _job.argc = argc;
     for (uint32_t i = 0; i < argc; ++i) _job.args[i] = argv[i];
-
     _status = 0;
     _result = 0;
-
-    // Publish job fields before signaling ready
-    exechost_dmb();
     __asm volatile("dsb" ::
                      : "memory");
     __asm volatile("isb" ::
                      : "memory");
-    _job_flag = 1u;  // ready
-    exechost_trace_mirror_flag(1);
-    exechost_sev();  // poke core1
-    exechost_trace_set_c0(0x21);
-
+    _job_flag = 1u;
     uint32_t start = millis();
     while (_job_flag != 3u) {
+      tight_loop_contents();
       if ((millis() - start) > timeoutMs) {
         if (_job_flag == 3u) break;
         if (_console) _console->println("core1 timeout");
         _job_flag = 0u;
-        exechost_trace_mirror_flag(0);
-        exechost_sev();
         return false;
       }
-      yield();
     }
-
-    // About to read results
-    exechost_trace_set_c0(0x24);
-
-    // Ensure we see result/status written by core1
-    exechost_dmb();
-
     if (_status != 0) {
       if (_console) {
         _console->print("core1 error status=");
         _console->println((int)_status);
       }
       _job_flag = 0u;
-      exechost_trace_mirror_flag(0);
-      exechost_sev();
       return false;
     }
-
     retVal = (int)_result;
-
     _job_flag = 0u;
-    exechost_trace_mirror_flag(0);
-    exechost_trace_set_c0(0x25);
-    exechost_sev();
     return true;
   }
 
@@ -565,6 +436,7 @@ public:
     if (_console) _console->printf("CoProc HELLO: version=%d features=0x%08X\n", version, (unsigned)features);
     return true;
   }
+
   bool coprocInfo() {
     CoProc::Frame rh;
     uint8_t buf[32];
@@ -579,6 +451,7 @@ public:
                        (unsigned)inf.impl_flags, (unsigned)inf.blob_len, (unsigned)inf.mailbox_max);
     return true;
   }
+
   bool coprocLoadBuffer(const uint8_t* data, uint32_t len) {
     uint8_t b4[4];
     memcpy(b4, &len, 4);
@@ -615,6 +488,7 @@ public:
     if (_console) _console->printf("CoProc LOAD OK (%u bytes)\n", (unsigned)len);
     return true;
   }
+
   bool coprocLoadFile(const char* fname) {
     if (!_fsValid || !_fs.getFileSize || !_fs.readFileRange) {
       if (_console) _console->println("coproc: FS not attached");
@@ -676,6 +550,7 @@ public:
     if (_console) _console->printf("CoProc LOAD OK (%u bytes)\n", (unsigned)size);
     return true;
   }
+
   bool coprocExec(const int32_t* argv, uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -704,6 +579,7 @@ public:
     if (_console) _console->printf("CoProc EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
+
   bool coprocExecTokens(const char* tokens[], uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -775,6 +651,7 @@ public:
     if (_console) _console->printf("CoProc EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
+
   bool coprocExecFile(const char* fname, const int32_t* argv, uint32_t argc) {
     if (!fname || !*fname) {
       if (_console) _console->println("coproc exec: missing file name");
@@ -790,6 +667,7 @@ public:
     }
     return true;
   }
+
   bool coprocStatus() {
     CoProc::Frame rh;
     uint8_t buf[8];
@@ -802,6 +680,7 @@ public:
     if (_console) _console->printf("CoProc STATUS: exec_state=%u\n", (unsigned)es);
     return true;
   }
+
   bool coprocCancel() {
     CoProc::Frame rh;
     uint8_t buf[4];
@@ -811,6 +690,7 @@ public:
     if (_console) _console->printf("CoProc CANCEL: status=%d\n", (int)st);
     return true;
   }
+
   bool coprocMailboxRead(uint32_t maxBytes) {
     uint8_t in[4];
     memcpy(in, &maxBytes, 4);
@@ -829,6 +709,7 @@ public:
     }
     return true;
   }
+
   bool coprocReset() {
     CoProc::Frame rh;
     uint8_t buf[4];
@@ -838,6 +719,7 @@ public:
     if (_console) _console->println("CoProc RESET issued");
     return ok;
   }
+
   bool coprocIspEnter() {
     CoProc::Frame rh;
     uint8_t buf[8];
@@ -847,6 +729,7 @@ public:
     if (_console) _console->printf("CoProc ISP_ENTER: status=%d\n", (int)st);
     return true;
   }
+
   bool coprocIspExit() {
     CoProc::Frame rh;
     uint8_t buf[8];
@@ -856,6 +739,7 @@ public:
     if (_console) _console->printf("CoProc ISP_EXIT: status=%d\n", (int)st);
     return true;
   }
+
   bool coprocScriptLoadFile(const char* fname) {
     if (!_fsValid || !_fs.getFileSize || !_fs.readFileRange) {
       if (_console) _console->println("coproc script: FS not attached");
@@ -912,6 +796,7 @@ public:
     if (_console) _console->printf("CoProc SCRIPT LOAD OK (%u bytes)\n", (unsigned)size);
     return true;
   }
+
   bool coprocScriptExec(const int32_t* argv, uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -940,6 +825,7 @@ public:
     if (_console) _console->printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
+
   bool coprocScriptExecTokens(const char* tokens[], uint32_t argc) {
     if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
     uint32_t timeoutMs = timeout(100000);
@@ -1011,6 +897,7 @@ public:
     if (_console) _console->printf("CoProc SCRIPT EXEC: status=%d return=%d\n", (int)st, (int)retCode);
     return true;
   }
+
   bool coprocScriptExecFileTokens(const char* fname, const char* tokens[], uint32_t argc) {
     if (!coprocScriptLoadFile(fname)) return false;
     return coprocScriptExecTokens(tokens, argc);
@@ -1038,12 +925,14 @@ private:
     }
     return false;
   }
+
   bool linkReadExact(uint8_t* dst, size_t n, uint32_t timeoutPerByteMs) {
     for (size_t i = 0; i < n; ++i) {
       if (!linkReadByte(dst[i], timeoutPerByteMs)) return false;
     }
     return true;
   }
+
   bool linkWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
     if (!_link) return false;
     uint32_t start = millis();
@@ -1060,6 +949,7 @@ private:
     _link->flush();
     return true;
   }
+
   bool readResponseHeader(CoProc::Frame& rh, uint32_t overallTimeoutMs = 5000) {
     const uint8_t magicBytes[4] = { (uint8_t)('C'), (uint8_t)('P'), (uint8_t)('R'), (uint8_t)('0') };
     uint8_t w[4] = { 0, 0, 0, 0 };
@@ -1087,6 +977,7 @@ private:
     }
     return false;
   }
+
   bool coprocRequest(uint16_t cmd,
                      const uint8_t* payload, uint32_t len,
                      CoProc::Frame& respHdr,
